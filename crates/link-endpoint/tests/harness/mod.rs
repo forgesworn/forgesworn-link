@@ -237,6 +237,9 @@ pub fn describe(history: &[PathReport]) -> String {
 }
 
 /// Peak resident set size in bytes.  A high-water mark, so it never decreases.
+/// Uses `getrusage`, so it is available on Unix only; the memory test that
+/// consumes it is gated to Unix as well.
+#[cfg(unix)]
 pub fn peak_rss_bytes() -> u64 {
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     // SAFETY: getrusage fills a caller-owned struct and touches nothing else.

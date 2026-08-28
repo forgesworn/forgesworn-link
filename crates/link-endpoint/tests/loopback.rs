@@ -343,7 +343,10 @@ async fn relay_loss_reconnects_to_the_second_relay() {
     second.shutdown();
 }
 
-/// Peak RSS must not track transfer size.
+/// Peak RSS must not track transfer size.  The measurement uses `getrusage`,
+/// so this runs on Unix; the bounded-buffer property it checks is platform
+/// independent.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn memory_stays_flat_between_8_and_64_mib() {
     init_tracing();
