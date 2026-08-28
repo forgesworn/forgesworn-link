@@ -282,7 +282,9 @@ fn parse_candidates(body: &[u8]) -> Option<Vec<SocketAddr>> {
         return None;
     }
     let mut out = Vec::with_capacity(count as usize);
-    for chunk in rest.chunks_exact(18) {
+    // The length was checked above, so every 18-byte candidate is whole.
+    let (chunks, _remainder) = rest.as_chunks::<18>();
+    for chunk in chunks {
         let hint = Hint {
             kind: link_core::card::HINT_UDP,
             value: chunk.to_vec(),
