@@ -1,0 +1,5 @@
+2026-08-27T21:13:10.300985Z  INFO link_endpoint::relay_client: relay session up relay=ws://<pub-host>:7445
+2026-08-27T21:13:10.820359Z  INFO link_endpoint::session: path transition peer=txsbvkzqcucidkt5wvwpiik6wogrfyqrzdckz25xje37sk44flna from=rendezvous to=relayed cause=QUIC handshake over relay ok relay="ws://<pub-host>:7445" direct="none"
+{"event":"connected","path":{"cause":"QUIC handshake over relay ok","direct":null,"relay":"ws://<pub-host>:7445","since_ms":0,"status":"relayed"},"peer":"txsbvkzqcucidkt5wvwpiik6wogrfyqrzdckz25xje37sk44flna"}
+{"status":"relayed","relay":"ws://<pub-host>:7445","direct":null,"since_ms":0,"cause":"QUIC handshake over relay ok"}
+{"bytes":16777216,"digest_match":true,"event":"final","path":{"cause":"QUIC handshake over relay ok","direct":null,"relay":"ws://<pub-host>:7445","since_ms":19222,"status":"relayed"}}

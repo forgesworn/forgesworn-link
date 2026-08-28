@@ -1,0 +1,32 @@
+[package]
+name = "link-blossom"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+link-core = { path = "../link-core" }
+link-endpoint = { path = "../link-endpoint" }
+anyhow = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+shelter-kit = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+
+[features]
+# The client fetcher implements shelter-kit's BlobFetcher, so it lives behind a
+# feature.  The base crate carries the wire codec and the serving side, and does
+# not force a shelter-kit dependency on a node that only wants to serve.
+shelter-kit = ["dep:shelter-kit", "dep:url"]
+
+[dev-dependencies]
+link-relay = { path = "../link-relay" }
+rustls = { workspace = true }
+sha2 = { workspace = true }
+tracing-subscriber = { workspace = true }

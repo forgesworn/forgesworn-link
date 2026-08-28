@@ -1,0 +1,8 @@
+{
+  "node_id_hex": "498cffd210e789fecc54aba16ef9b81745812c119e23ca17d6a2b9dc21f0e026",
+  "spki_der_hex": "302a300506032b6570032100498cffd210e789fecc54aba16ef9b81745812c119e23ca17d6a2b9dc21f0e026",
+  "key_offset": 12,
+  "key_length": 32,
+  "synthetic_ipv6": "fd00:2aa1:5589:d536:bcf8:7fd3:e94b:acda",
+  "synthetic_port": 7
+}

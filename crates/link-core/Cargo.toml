@@ -1,0 +1,20 @@
+[package]
+name = "link-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ed25519-dalek.workspace = true
+hex.workspace = true
+rand.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+serde.workspace = true
+sha2.workspace = true
+x509-parser.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

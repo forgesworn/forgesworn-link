@@ -1,0 +1,8 @@
+2026-08-27T21:15:40.213350Z  INFO link_endpoint::relay_client: relay session up relay=wss://<pub-host>:7443
+2026-08-27T21:15:40.411662Z  INFO link_endpoint::session: path transition peer=i6uj4stexvedqqbjjvh5o6ry4o7bwexyb5eyopxtpqy2q7lueu7q from=rendezvous to=relayed cause=QUIC handshake over relay ok relay="wss://<pub-host>:7443" direct="none"
+{"event":"connected","path":{"cause":"QUIC handshake over relay ok","direct":null,"relay":"wss://<pub-host>:7443","since_ms":0,"status":"relayed"},"peer":"i6uj4stexvedqqbjjvh5o6ry4o7bwexyb5eyopxtpqy2q7lueu7q"}
+{"status":"relayed","relay":"wss://<pub-host>:7443","direct":null,"since_ms":0,"cause":"QUIC handshake over relay ok"}
+2026-08-27T21:15:41.022573Z  INFO link_endpoint::session: path transition peer=i6uj4stexvedqqbjjvh5o6ry4o7bwexyb5eyopxtpqy2q7lueu7q from=relayed to=probing cause=3 peer candidates exchanged relay="wss://<pub-host>:7443" direct="none"
+2026-08-27T21:15:41.123867Z  INFO link_endpoint::session: path transition peer=i6uj4stexvedqqbjjvh5o6ry4o7bwexyb5eyopxtpqy2q7lueu7q from=probing to=direct cause=signed pong proved <pi-lan>:7470 relay="wss://<pub-host>:7443" direct="<pi-lan>:7470"
+{"status":"direct","relay":"wss://<pub-host>:7443","direct":"<pi-lan>:7470","since_ms":0,"cause":"signed pong proved <pi-lan>:7470"}
+{"bytes":33554432,"digest_match":true,"event":"final","path":{"cause":"signed pong proved <pi-lan>:7470","direct":"<pi-lan>:7470","relay":"wss://<pub-host>:7443","since_ms":18056,"status":"direct"}}

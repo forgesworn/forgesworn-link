@@ -1,0 +1,6 @@
+2026-08-27T21:22:33.078691Z  INFO link_endpoint::endpoint: endpoint open node=i6uj4stexvedqqbjjvh5o6ry4o7bwexyb5eyopxtpqy2q7lueu7q synthetic=[fd00:1060:e062:4a79:e5c9:8349:3f6c:6704]:7 udp=0.0.0.0:7470 allow_direct=true
+2026-08-27T21:22:33.100752Z  INFO link_endpoint::session: path transition peer=d3yosrgj7tfrc7j62colmhokhv5wsyra3la36vmp5swu7tgnqtxq from=rendezvous to=relayed cause=QUIC handshake over relay ok relay="wss://<pub-host>:7443" direct="none"
+{"event":"connected","path":{"cause":"QUIC handshake over relay ok","direct":null,"relay":"wss://<pub-host>:7443","since_ms":0,"status":"relayed"},"peer":"d3yosrgj7tfrc7j62colmhokhv5wsyra3la36vmp5swu7tgnqtxq"}
+2026-08-27T21:22:33.100845Z  INFO link_endpoint::session: sending candidates on the control stream peer=d3yosrgj7tfrc7j62colmhokhv5wsyra3la36vmp5swu7tgnqtxq count=2 allow_direct=true
+{"status":"relayed","relay":"wss://<pub-host>:7443","direct":null,"since_ms":0,"cause":"QUIC handshake over relay ok"}
+{"bytes":25165824,"digest_match":true,"event":"final","path":{"cause":"QUIC handshake over relay ok","direct":null,"relay":"wss://<pub-host>:7443","since_ms":6868,"status":"relayed"}}

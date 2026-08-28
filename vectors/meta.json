@@ -1,0 +1,26 @@
+{
+  "version": "FSL-CARD-1",
+  "generated_for": "forgesworn-link phase 0 spike",
+  "domains": {
+    "card": "666f72676573776f726e2d6c696e6b2f636172642f763100",
+    "addr": "666f72676573776f726e2d6c696e6b2f616464722f763100",
+    "relay_auth": "666f72676573776f726e2d6c696e6b2f72656c61792d617574682f763100",
+    "probe": "666f72676573776f726e2d6c696e6b2f70726f62652f763100"
+  },
+  "keys": {
+    "node_a": {
+      "seed_hex": "ed4dc20b0285785f8b52f76eadf03b178ecd53abd9c6c24ecba177f2cd629001",
+      "node_id_hex": "498cffd210e789fecc54aba16ef9b81745812c119e23ca17d6a2b9dc21f0e026",
+      "node_id_base32": "jggp7uqq46e75tcuvoqw56nyc5cyclartyr4uf6wuk45yipq4ata"
+    },
+    "node_b": {
+      "seed_hex": "341e0ca30b3d2eb70cd915a3a472406a044f0c83fd73c5f6cbae4b188777f030",
+      "node_id_hex": "54f63ca007a32d34b0ceb6069cfb7da0f6466701f5fb29e379086b8a49e6e2af",
+      "node_id_base32": "kt3dziahumwtjmgowydjz635ud3emzyb6x5sty3zbbvyuspg4kxq"
+    }
+  },
+  "clock_skew_seconds": 300,
+  "max_lifetime_seconds": 604800,
+  "max_card_bytes": 4096,
+  "min_card_bytes": 126
+}

@@ -1,0 +1,30 @@
+[package]
+name = "link-relay"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "link_relay"
+path = "src/lib.rs"
+
+[[bin]]
+name = "link-relay"
+path = "src/main.rs"
+
+[dependencies]
+link-core = { path = "../link-core" }
+anyhow.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+rand.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

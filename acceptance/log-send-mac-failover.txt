@@ -1,0 +1,11 @@
+2026-08-27T21:20:22.001341Z  INFO link_endpoint::relay_client: relay session up relay=wss://<pub-host>:7444
+2026-08-27T21:20:22.161078Z  INFO link_endpoint::session: path transition peer=u5zp45cobyvmyvycr4oxkrcpe2nunp77ugp6qkbce2h2aul3beqa from=rendezvous to=relayed cause=QUIC handshake over relay ok relay="wss://<pub-host>:7444" direct="none"
+{"event":"connected","path":{"cause":"QUIC handshake over relay ok","direct":null,"relay":"wss://<pub-host>:7444","since_ms":0,"status":"relayed"},"peer":"u5zp45cobyvmyvycr4oxkrcpe2nunp77ugp6qkbce2h2aul3beqa"}
+{"status":"relayed","relay":"wss://<pub-host>:7444","direct":null,"since_ms":5,"cause":"QUIC handshake over relay ok"}
+2026-08-27T21:20:31.848194Z  WARN link_endpoint::relay_client: relay session lost relay=wss://<pub-host>:7444
+2026-08-27T21:20:31.856482Z  INFO link_endpoint::session: path transition peer=u5zp45cobyvmyvycr4oxkrcpe2nunp77ugp6qkbce2h2aul3beqa from=relayed to=reconnecting cause=relay session lost relay="none" direct="none"
+{"status":"reconnecting","relay":null,"direct":null,"since_ms":16,"cause":"relay session lost"}
+2026-08-27T21:20:32.114038Z  INFO link_endpoint::relay_client: relay session up relay=ws://<pub-host>:7445
+2026-08-27T21:20:32.114663Z  INFO link_endpoint::session: path transition peer=u5zp45cobyvmyvycr4oxkrcpe2nunp77ugp6qkbce2h2aul3beqa from=reconnecting to=relayed cause=new relay welcome after 258 ms relay="ws://<pub-host>:7445" direct="none"
+{"status":"relayed","relay":"ws://<pub-host>:7445","direct":null,"since_ms":83,"cause":"new relay welcome after 258 ms"}
+{"bytes":100663296,"digest_match":true,"event":"final","path":{"cause":"new relay welcome after 258 ms","direct":null,"relay":"ws://<pub-host>:7445","since_ms":90856,"status":"relayed"}}
