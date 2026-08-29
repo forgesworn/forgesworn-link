@@ -21,10 +21,18 @@ working exploit or a step-by-step extraction path.
   presents any other key fails closed.
 - A relay may learn routing tokens, source addresses, timing and byte counts. It
   must not learn Nostr keys, application authorisation, blob plaintext, retention
-  tier, content hashes the application did not deliberately expose, or the
-  long-term identity behind a transport token. Relay frames are bounded,
-  authenticated and opaque; the payload is QUIC, encrypted end to end between the
-  two endpoints.
+  tier, or content hashes the application did not deliberately expose. Relay
+  frames are bounded, authenticated and opaque; the payload is QUIC, encrypted
+  end to end between the two endpoints.
+- **Known gap (metadata).** The intended boundary also forbids the relay from
+  learning the long-term identity behind a transport token, but the current
+  relay routes by the persistent node ID, so while a session is live it does
+  learn that one node ID is talking to another. This is a metadata leak, not a
+  content or impersonation one: the payload stays opaque and TLS identity is
+  unaffected. Closing it is designed in
+  [`docs/relay-identity-privacy.md`](docs/relay-identity-privacy.md) and is an
+  open owner decision. Until it lands, treat the transport-identity graph of the
+  pairs a relay carries as visible to that relay.
 - The lane moves an authorised byte stream. It never promotes a storage claim,
   and relay success is never proof of durable custody.
 
