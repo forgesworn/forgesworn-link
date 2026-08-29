@@ -400,7 +400,6 @@ restated here so they cannot drift.
 ## 8. Explicitly not decided here
 
 - Nostr event kinds for card delivery and endorsement.
-- Whether node IDs are blinded from relays.
 - Probe encryption.
 - Multipath or simultaneous relay plus direct sending.
 - Anything about tiers, claims, quotas or repair.  The lane moves bytes.
@@ -420,3 +419,18 @@ Open problems the spike surfaced, to settle before Phase 1:
   highest issued serial or a clock step can reissue a stale one.
 - `wss://` relay TLS in the spike pins a leaf fingerprint because it ships no
   root store; production relays use ordinary WebPKI certificates.
+
+## 9. Rendezvous-tag routing
+
+Whether node IDs are blinded from relays is decided: they are, always.
+[`docs/RENDEZVOUS.md`](docs/RENDEZVOUS.md) is the normative rendezvous
+section of this specification, accepted by both owners and frozen at that
+acceptance. In summary, and normatively: a relay MUST route by the pair-scoped,
+per-epoch rendezvous tag and MUST NOT receive a node ID, a Nostr key, or a
+signature on the relay wire; a card MAY carry the ephemeral hint `0x04`
+(secp256k1, 33 bytes) for forward-secret tags; the tag derivation, its case
+byte, the epoch and erasure rules, and the six frozen known-answer vectors
+(`vectors/rendezvous.json`) are as that document states. The identity-
+authenticated relay protocol of §3.1 is superseded by tag registration when
+the rendezvous wire change lands behind its version bump; until then §3.1
+remains the deployed behaviour and `SECURITY.md` states the gap.

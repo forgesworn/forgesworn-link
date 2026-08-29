@@ -1,9 +1,12 @@
-# Rendezvous-tag routing (draft)
+# Rendezvous-tag routing
 
-**Status:** Draft for joint review. Nothing on the wire changes until both the
-ForgeSworn and Bothy owners accept this document; it is then folded into
-`SPEC.md` as a numbered section and the vectors freeze. The design it
-implements, and the decision behind it, are in
+**Status:** ACCEPTED and frozen. Both owners accepted this text: the Bothy
+owner (decented, his direct word, verified against this text by Quill,
+2026-08-29) and the ForgeSworn owner (TheCryptoDonkey, his direct word,
+2026-08-30). The vectors are frozen at this acceptance; `SPEC.md` §9
+incorporates this document normatively. A change from here needs both owners,
+as the contract does. The design it implements, and the decision behind it,
+are in
 [`relay-identity-privacy.md`](./relay-identity-privacy.md): the relay MUST
 learn neither node identity nor any stable pseudonym — only that two endpoints
 share a per-epoch tag it cannot link across relays or epochs.
@@ -147,7 +150,12 @@ an epoch boundary. A conformant implementation reproduces all six.
 
 ## 6. Acceptance
 
-Both owners accept this document (the Bothy owner's three conditions from the
-design discussion are §1.1, §1.2 and the one-sided statement in §2). On
-acceptance: the vectors freeze, the relay wire changes land behind a version
-bump, and this text moves into `SPEC.md`.
+Accepted by both owners at this text (the Bothy owner's review conditions are
+§1.1, §1.2 and the one-sided statement in §2; his eight doc notes are folded
+throughout):
+
+- Bothy owner: **decented**, direct word verified against this text, 2026-08-29.
+- ForgeSworn owner: **TheCryptoDonkey**, direct word, 2026-08-30.
+
+The vectors are frozen. The relay wire changes land behind a version bump, and
+`SPEC.md` §9 carries this document as its normative rendezvous section.

@@ -124,7 +124,7 @@ const cases = [
 
 const out = {
   format: 'forgesworn-link-rendezvous-known-answer-v1',
-  status: 'draft, pending both owners accepting docs/RENDEZVOUS.md',
+  status: 'frozen: docs/RENDEZVOUS.md accepted by both owners (Bothy 2026-08-29, ForgeSworn 2026-08-30)',
   saltUtf8: 'forgesworn-link/rendezvous/v1',
   ikm: 'case_byte || static_x || eph_x (65 bytes)',
   caseBytes: { none: CASE_NONE, one: CASE_ONE, both: CASE_BOTH },
