@@ -1,0 +1,57 @@
+{
+  "format": "forgesworn-link-rendezvous-known-answer-v1",
+  "status": "draft, pending both owners accepting docs/RENDEZVOUS.md",
+  "saltUtf8": "forgesworn-link/rendezvous/v1",
+  "epochSeconds": 3600,
+  "tagBytes": 16,
+  "relayHost": "relay.example.org",
+  "epochUnix": 1793577600,
+  "epochIndex": 498216,
+  "testOnlyKeys": {
+    "nostrAPrivHex": "4873374aacd9fbbdf073a29078b6cf9f27c137107530c521458d5d83118ae733",
+    "nostrAPubCompressedHex": "033e0b147852ddd35607a06b4bb56ffc102e4d7b3ece162042c3f32f96a49c4613",
+    "nostrBPrivHex": "d1be49b906d68d1228f291fec7f9e373e7fc282605ed63763ad03cd53aa853f0",
+    "nostrBPubCompressedHex": "023e27f135286b183bb5dbc6e59a0ccc4a10750302b6ab68ac7495b3c5193012ec",
+    "ephAPrivHex": "daced59710de58fd5864e6821629414261d33addd59ceff45ffd2fba37dc5f4d",
+    "ephAPubCompressedHex": "02d6bd3b313d2cbc4f0b2355179911bd45747e6bd1024b9fead9a72e914a28e827",
+    "ephBPrivHex": "8f2b5a94f17bec15e6da441bad23accd776e67d408fdc1683f41e91596c5c42f",
+    "ephBPubCompressedHex": "03cb6a2c0dc18f820df7a46e59cfe510dc19a0494c7b47d04ba3065a68a921af19"
+  },
+  "intermediates": {
+    "staticXHex": "c72057e75e1141b61b80f222d78f17a312d1950da578bae510a28c0f53780177",
+    "ephBothXHex": "3e0a7579af406dcd49cf4e477abeef28e52c9ac35c68e81c55ff3d6aad359aba",
+    "ephOneXHex": "2456c0cdf38cd038890194e740b12b7dff52b59ca56ee2421120d0aa49fb177c"
+  },
+  "cases": [
+    {
+      "name": "both-ephemeral",
+      "note": "both cards carry hint 0x04; full forward secrecy",
+      "ephemeralMix": "ECDH(ephA, ephB).x",
+      "tagHex": "6d9a6a1a1aa9b10d93419db0aa47ce40"
+    },
+    {
+      "name": "one-ephemeral",
+      "note": "only node A carries hint 0x04; forward-secret only against compromise of A",
+      "ephemeralMix": "ECDH(ephA, nostrB).x",
+      "tagHex": "27e43f3df17474d4a8212b37a3b16529"
+    },
+    {
+      "name": "no-ephemeral",
+      "note": "neither card carries hint 0x04; no forward secrecy, eph_x is 32 zero bytes",
+      "ephemeralMix": "32 zero bytes",
+      "tagHex": "5ecc2172a5e5445b6b2b1a2313422626"
+    },
+    {
+      "name": "next-epoch-differs",
+      "note": "same pair, next epoch index; proves per-epoch rotation",
+      "ephemeralMix": "ECDH(ephA, ephB).x",
+      "tagHex": "66e802651439290d2541cde41cef25e2"
+    },
+    {
+      "name": "other-relay-differs",
+      "note": "same pair and epoch, different relay host; proves per-relay unlinkability",
+      "ephemeralMix": "ECDH(ephA, ephB).x",
+      "tagHex": "0b7070849138419fed099d9dc943a975"
+    }
+  ]
+}
