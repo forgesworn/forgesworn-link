@@ -97,23 +97,43 @@ node ID.
   pair. It fits the existing model where Link is used between paired peers, not
   as an open address book.
 
-## Recommendation and the decision
+## The decision
 
-For the paired-peer case Link actually serves, **C** is the design that meets the
-T5 promise; **B** is a cheap partial mitigation that could ship first (bounded,
-per-epoch, per-relay pseudonyms) while C is specified. **A** alone does not
-close the bootstrap leak.
+For the paired-peer case Link serves, only **C** actually meets the T5 promise:
+**A** does not close the bootstrap leak, and **B** leaves a per-epoch per-relay
+pseudonym the relay can still graph within an epoch.
 
-This is an owner/architecture decision because it changes pairing and the relay
-protocol, and because it trades implementation cost against how completely the
-metadata promise is kept:
+**Decided by the ForgeSworn owner, 2026-08-29: maximum anonymity — approach C.**
+The interim **B** is not shipped as a stepping stone. We implement the full
+rendezvous-tag design so a relay learns neither node identity nor any stable
+pseudonym, only that two endpoints share a per-epoch tag it cannot link across
+relays or epochs. The directive also sets the default posture wherever the
+choice recurs: prefer the anonymity-maximising option.
 
-- Ship **B** now as a bounded mitigation and correct `SECURITY.md`/T5 to state
-  the residual (per-epoch per-relay pseudonym), then specify **C**; or
-- hold for **C** directly and, until then, state honestly in `SECURITY.md` that
-  the relay currently learns the transport-identity graph of the pairs it
-  carries.
+What follows from "as anonymous as possible":
 
-Either way, `SECURITY.md` and T5 must be corrected now to match the code:
-the relay **does** currently learn the identity pairing, and the claim otherwise
-is aspirational until one of these lands.
+- **Relay routing is by rendezvous tag, never by node ID.** The `Send` frame's
+  destination and the relay registry key become the tag; a node ID never reaches
+  a relay. Specified next as a normative addition to `SPEC.md`.
+- **The rendezvous secret is derived, not newly exchanged.** It is the ECDH
+  shared secret over the two owners' Nostr keys, which both sides already hold
+  from the claim, status and invite exchange (the same key agreement NIP-44
+  uses). Each epoch tag is `HKDF(ECDH(nostr_a, nostr_b), relay_epoch)`. Pairing,
+  the invite and the address card do not change; only the relay routing and the
+  endpoint's tag derivation do. The one trade is that the rendezvous layer is
+  derived from the Nostr identity rather than the transport key, re-coupling them
+  internally; the relay still sees only the opaque tag, so no identity reaches
+  it, and this is an accepted trade for leaving pairing untouched. (Agreed
+  direction with the Bothy owner, 2026-08-29.)
+- **Direct paths and UDP candidates stay opt-in and off by default.** A direct
+  path reveals peer IPs to each other, so the anonymous default is relay-only or
+  Tor; a card carries UDP candidates only on explicit consent (already the rule
+  in §2.2).
+- **Tor is the strongest posture.** A relay reached over Tor sees no source IP,
+  and with rendezvous tags it also sees no identity, so a Tor-fronted relay
+  learns only tag, timing and byte counts. Timing and volume correlation remain
+  a residual that only cover traffic would close; that is out of scope for now
+  and stated as a residual.
+
+`SECURITY.md` states the current gap honestly until rendezvous-tag routing
+lands; this document is the design it points to.
