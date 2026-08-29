@@ -27,9 +27,14 @@ Conditions, without which the forward-secrecy claim is not true:
 1. The ephemeral MUST be freshly generated for every card and MUST NOT be
    reused across cards.
 2. The ephemeral private key MUST be erased when the card expires or is
-   rotated. That erasure **is** the forward secrecy.
+   rotated. That erasure **is** the forward secrecy. The derived tags and
+   `eph_x` values computed from it MUST be erased at the same moment, so a
+   device dump after expiry yields neither the key nor anything derived from
+   it.
 3. A card MUST NOT carry more than one `0x04` hint; a verifier treats a second
-   as a malformed hint (card rule 3).
+   as a malformed hint (card rule 3). A `0x04` value that does not decompress
+   to a valid secp256k1 curve point is likewise a malformed hint and fails the
+   whole card (card rule 3).
 
 ## 2. Tag derivation
 
@@ -52,16 +57,23 @@ Definitions:
 - `relay_host` — the lowercase hostname without port, exactly as in relay
   authentication today.
 
-The tag is 16 bytes:
+The tag is 16 bytes. The ikm leads with a domain-separating case byte naming
+which ephemeral mix the pair used — `0x00` no-ephemeral, `0x01` one-sided,
+`0x02` both — so the three modes can never be cross-interpreted:
 
 ```
 tag = HKDF-SHA256(
-  ikm  = static_x || eph_x,                       // 64 bytes
+  ikm  = case_byte || static_x || eph_x,          // 65 bytes
   salt = "forgesworn-link/rendezvous/v1",         // 29 UTF-8 bytes
   info = relay_host || 0x00 || u64be(epoch_index),
   L    = 16,
 )
 ```
+
+Implementer warning: `static_x` and `eph_x` are the **raw x-coordinate** of the
+shared point (bytes 1..33 of the compressed shared-secret output), NOT the
+output of a library's hashed `ecdh()` convenience — the obvious call silently
+fails every known-answer vector.
 
 Every input is symmetric, so both ends derive the same tag with no ordering
 rule. Including `relay_host` makes tags unlinkable across relays; including
@@ -85,9 +97,20 @@ unstable, which is correct for a pair with no prior relationship.
   with that tag (in practice one). A tag nobody has registered is dropped
   silently, exactly as unknown destinations are today, so the relay never
   amplifies.
-- An endpoint SHOULD register each pair's tag for the current **and previous**
-  epoch, and SHOULD retain the peer's previous card's tag during rotation, so
-  an epoch boundary or a card rotation does not drop the pair.
+- An endpoint SHOULD register each pair's tag for the previous, current **and
+  next** epoch, so clock skew in either direction cannot drop the pair at an
+  epoch boundary.
+- During a card transition — either side rotating, including a peer carrying
+  `0x04` for the first time — the tag set for a pair is the cross-product of
+  the endpoint's current and previous card, the peer's current and previous
+  known card, and the three-epoch window. At most twelve tags per pair, only
+  while both a rotation and an epoch boundary are in flight; it collapses back
+  to three once the old cards expire.
+- A tag is a **delivery capability, not trust**. The relayed path is end to end
+  encrypted and authenticated by the Link session itself (TLS 1.3 between the
+  two pinned node keys), so a stolen tag yields at most ciphertext delivery and
+  junk injection, which QUIC discards; it never yields plaintext, identity, or
+  an authenticated session.
 - The relay MUST NOT log tags, and drops every registration with the session.
 
 What the relay now learns: source addresses, timing, byte counts, and that two
@@ -109,16 +132,18 @@ strongest posture: tag, timing and byte counts, nothing else.
 Deterministic test keys only. Fixed inputs: `relay_host =
 "relay.example.org"`, `epoch_unix = 1793577600`, `epoch_index = 498216`.
 
-| Case | Ephemeral mix | Tag |
-| --- | --- | --- |
-| both-ephemeral | `x(ECDH(eph_a, eph_b))` | `6d9a6a1a1aa9b10d93419db0aa47ce40` |
-| one-ephemeral | `x(ECDH(eph_a, nostr_b))` | `27e43f3df17474d4a8212b37a3b16529` |
-| no-ephemeral | 32 zero bytes | `5ecc2172a5e5445b6b2b1a2313422626` |
-| next-epoch-differs | same pair, epoch + 1 | `66e802651439290d2541cde41cef25e2` |
-| other-relay-differs | same pair, `relay2.example.net` | `0b7070849138419fed099d9dc943a975` |
+| Case | Case byte | Ephemeral mix | Tag |
+| --- | --- | --- | --- |
+| both-ephemeral | `0x02` | `x(ECDH(eph_a, eph_b))` | `434d2af3867652e3f9eec438f01a0ac3` |
+| one-ephemeral | `0x01` | `x(ECDH(eph_a, nostr_b))` | `204e7f15c9049e3cf4d7a5983e2d25be` |
+| no-ephemeral | `0x00` | 32 zero bytes | `1b78382c9b87f46497488f137c74a623` |
+| next-epoch-differs | `0x02` | same pair, epoch + 1 | `6a04b785feab57237749f9ff053a51af` |
+| other-relay-differs | `0x02` | same pair, `relay2.example.net` | `63d494da7cceea9f38e3c73aae42ea32` |
+| non-boundary-floor | `0x02` | same pair, `unix 1793588888 -> epoch 498219` | `abf108b545b091a3474a6571f3c7502b` |
 
-The last two cases exist to prove rotation and per-relay unlinkability: same
-pair, different tag. A conformant implementation reproduces all five.
+The fourth and fifth cases prove rotation and per-relay unlinkability: same
+pair, different tag. The sixth exercises `floor()` on a timestamp that is not
+an epoch boundary. A conformant implementation reproduces all six.
 
 ## 6. Acceptance
 

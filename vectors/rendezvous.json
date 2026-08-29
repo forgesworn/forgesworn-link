@@ -2,6 +2,12 @@
   "format": "forgesworn-link-rendezvous-known-answer-v1",
   "status": "draft, pending both owners accepting docs/RENDEZVOUS.md",
   "saltUtf8": "forgesworn-link/rendezvous/v1",
+  "ikm": "case_byte || static_x || eph_x (65 bytes)",
+  "caseBytes": {
+    "none": 0,
+    "one": 1,
+    "both": 2
+  },
   "epochSeconds": 3600,
   "tagBytes": 16,
   "relayHost": "relay.example.org",
@@ -25,33 +31,53 @@
   "cases": [
     {
       "name": "both-ephemeral",
+      "caseByte": 2,
       "note": "both cards carry hint 0x04; full forward secrecy",
       "ephemeralMix": "ECDH(ephA, ephB).x",
-      "tagHex": "6d9a6a1a1aa9b10d93419db0aa47ce40"
+      "epochIndex": 498216,
+      "tagHex": "434d2af3867652e3f9eec438f01a0ac3"
     },
     {
       "name": "one-ephemeral",
+      "caseByte": 1,
       "note": "only node A carries hint 0x04; forward-secret only against compromise of A",
       "ephemeralMix": "ECDH(ephA, nostrB).x",
-      "tagHex": "27e43f3df17474d4a8212b37a3b16529"
+      "epochIndex": 498216,
+      "tagHex": "204e7f15c9049e3cf4d7a5983e2d25be"
     },
     {
       "name": "no-ephemeral",
+      "caseByte": 0,
       "note": "neither card carries hint 0x04; no forward secrecy, eph_x is 32 zero bytes",
       "ephemeralMix": "32 zero bytes",
-      "tagHex": "5ecc2172a5e5445b6b2b1a2313422626"
+      "epochIndex": 498216,
+      "tagHex": "1b78382c9b87f46497488f137c74a623"
     },
     {
       "name": "next-epoch-differs",
+      "caseByte": 2,
       "note": "same pair, next epoch index; proves per-epoch rotation",
       "ephemeralMix": "ECDH(ephA, ephB).x",
-      "tagHex": "66e802651439290d2541cde41cef25e2"
+      "epochIndex": 498217,
+      "tagHex": "6a04b785feab57237749f9ff053a51af"
     },
     {
       "name": "other-relay-differs",
+      "caseByte": 2,
       "note": "same pair and epoch, different relay host; proves per-relay unlinkability",
       "ephemeralMix": "ECDH(ephA, ephB).x",
-      "tagHex": "0b7070849138419fed099d9dc943a975"
+      "epochIndex": 498216,
+      "relayHost": "relay2.example.net",
+      "tagHex": "63d494da7cceea9f38e3c73aae42ea32"
+    },
+    {
+      "name": "non-boundary-floor",
+      "caseByte": 2,
+      "note": "unix 1793588888 floors to epoch 498219; exercises floor()",
+      "ephemeralMix": "ECDH(ephA, ephB).x",
+      "epochUnix": 1793588888,
+      "epochIndex": 498219,
+      "tagHex": "abf108b545b091a3474a6571f3c7502b"
     }
   ]
 }
