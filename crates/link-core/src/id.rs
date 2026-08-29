@@ -67,6 +67,14 @@ impl NodeId {
     }
 
     pub fn from_base32(text: &str) -> Option<Self> {
+        // Canonical form only. 52 lowercase base32 characters encode 260 bits;
+        // the low 4 bits of the final character are padding and MUST be zero, or
+        // 16 distinct spellings would name the same node and any allowlist, cache
+        // or dedup keyed on the text could be bypassed. Enforce it by length and
+        // by requiring the value to re-encode to exactly this input.
+        if text.len() != 52 {
+            return None;
+        }
         let mut bits = 0u32;
         let mut acc = 0u32;
         let mut out = Vec::with_capacity(32);
@@ -79,7 +87,11 @@ impl NodeId {
                 bits -= 8;
             }
         }
-        Self::from_slice(&out)
+        let id = Self::from_slice(&out)?;
+        if id.to_base32() != text {
+            return None;
+        }
+        Some(id)
     }
 
     pub fn verifying_key(&self) -> Option<VerifyingKey> {
@@ -186,5 +198,60 @@ impl TransportKey {
         out[..16].copy_from_slice(&PKCS8_ED25519_PREFIX);
         out[16..].copy_from_slice(&self.seed());
         out
+    }
+}
+
+#[cfg(test)]
+mod base32_tests {
+    use super::*;
+
+    fn sample_id() -> NodeId {
+        let mut bytes = [0u8; 32];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        NodeId(bytes)
+    }
+
+    #[test]
+    fn round_trips_canonical() {
+        let id = sample_id();
+        let text = id.to_base32();
+        assert_eq!(text.len(), 52);
+        assert_eq!(NodeId::from_base32(&text), Some(id));
+    }
+
+    #[test]
+    fn rejects_non_canonical_pad_bits() {
+        // 52 base32 characters carry 260 bits; the low 4 bits of the final
+        // character are padding and are zero in canonical form. A spelling that
+        // sets one of those bits decodes to the same 32 bytes but is not
+        // canonical, and must be rejected so the fsl:// text is a unique name.
+        let id = sample_id();
+        let text = id.to_base32();
+        let last = *text.as_bytes().last().unwrap();
+        let value = BASE32_ALPHABET.iter().position(|c| *c == last).unwrap();
+        assert_eq!(
+            value & 0x0f,
+            0,
+            "canonical final character has zero pad bits"
+        );
+        let sibling = BASE32_ALPHABET[value | 1] as char;
+        let mut mutant = text[..text.len() - 1].to_string();
+        mutant.push(sibling);
+        assert_ne!(mutant, text);
+        assert_eq!(
+            NodeId::from_base32(&mutant),
+            None,
+            "a non-canonical spelling must not decode",
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_length_and_case() {
+        let text = sample_id().to_base32();
+        assert_eq!(NodeId::from_base32(&text[..text.len() - 1]), None);
+        assert_eq!(NodeId::from_base32(&format!("{text}a")), None);
+        assert_eq!(NodeId::from_base32(&text.to_uppercase()), None);
     }
 }
