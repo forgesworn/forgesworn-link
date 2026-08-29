@@ -231,7 +231,11 @@ mod base32_tests {
         let text = id.to_base32();
         let last = *text.as_bytes().last().unwrap();
         let value = BASE32_ALPHABET.iter().position(|c| *c == last).unwrap();
-        assert_eq!(value & 0x0f, 0, "canonical final character has zero pad bits");
+        assert_eq!(
+            value & 0x0f,
+            0,
+            "canonical final character has zero pad bits"
+        );
         let sibling = BASE32_ALPHABET[value | 1] as char;
         let mut mutant = text[..text.len() - 1].to_string();
         mutant.push(sibling);
