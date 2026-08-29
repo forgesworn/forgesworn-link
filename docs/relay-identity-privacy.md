@@ -125,6 +125,18 @@ What follows from "as anonymous as possible":
   internally; the relay still sees only the opaque tag, so no identity reaches
   it, and this is an accepted trade for leaving pairing untouched. (Agreed
   direction with the Bothy owner, 2026-08-29.)
+- **Forward secrecy for the tags.** ECDH over long-term Nostr keys alone gives
+  the tags no forward secrecy: a later compromise of either long-term key reveals
+  every past and future tag for that pair, so an adversary who also logged the
+  relay's tag traffic could retroactively link past sessions to the pair. Because
+  the directive is maximum anonymity and the card is not yet shipped, we take the
+  stronger option rather than accept the residual: the card carries a per-card
+  ephemeral X25519 public key, and the tag mixes `ECDH(ephemeral_a, ephemeral_b)`
+  into the HKDF, so the tags of an expired card cannot be re-derived from a
+  long-term key compromise. This is a small addition to the shared card format,
+  pinned byte-exactly in the SPEC.md rendezvous section and agreed with the Bothy
+  owner. Tags route rather than protect content, so this is defence in depth, not
+  a load-bearing secret.
 - **Direct paths and UDP candidates stay opt-in and off by default.** A direct
   path reveals peer IPs to each other, so the anonymous default is relay-only or
   Tor; a card carries UDP candidates only on explicit consent (already the rule
