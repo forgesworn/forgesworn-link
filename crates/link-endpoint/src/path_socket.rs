@@ -21,7 +21,7 @@ use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, UdpPoller};
 use rand::RngCore;
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, trace};
 
 use crate::relay_client::QueueOutcome;
@@ -50,6 +50,9 @@ pub struct Proven {
 #[derive(Default)]
 struct Peer {
     candidates: Vec<SocketAddr>,
+    /// How many candidate lists the peer has sent: one for the initial
+    /// exchange, one more per re-announcement.
+    updates: u32,
     /// Nonces this side issued, with the address probed and when.
     pending: HashMap<[u8; 16], (SocketAddr, Instant)>,
     /// When this side last pinged each address.
@@ -74,6 +77,10 @@ pub struct Paths {
     reflexive: Mutex<Option<SocketAddr>>,
     /// The nonce of the outstanding reflector request; a reply must echo it.
     reflector_nonce: Mutex<Option<[u8; 16]>>,
+    /// The reflector to ask again after an interface change, spec 3.2.
+    reflector: Option<SocketAddr>,
+    /// The interface monitor's generation, spec 4.2; sessions subscribe.
+    net: watch::Receiver<u64>,
     local_synthetic: SocketAddr,
     udp_local: SocketAddr,
 }
@@ -122,7 +129,21 @@ impl Paths {
             .filter(|addr| self.can_reach(*addr))
             .collect();
         let mut inner = self.inner.lock().expect("paths");
-        inner.peers.entry(peer).or_default().candidates = usable;
+        let entry = inner.peers.entry(peer).or_default();
+        entry.candidates = usable;
+        entry.updates += 1;
+    }
+
+    /// How many candidate lists `peer` has sent this endpoint: one for the
+    /// initial exchange and one per re-announcement.
+    pub fn candidate_updates(&self, peer: NodeId) -> u32 {
+        self.inner
+            .lock()
+            .expect("paths")
+            .peers
+            .get(&peer)
+            .map(|p| p.updates)
+            .unwrap_or(0)
     }
 
     pub fn peer_candidates(&self, peer: NodeId) -> Vec<SocketAddr> {
@@ -212,6 +233,21 @@ impl Paths {
         let _ = self.udp.try_send_to(&reflect_request(&nonce), reflector);
     }
 
+    /// Ask the configured reflector again, after an interface change.  The
+    /// old reflexive result is kept until the reply replaces it, so a
+    /// candidate list sent in the meantime is stale rather than empty.
+    pub fn requery_reflector(&self) {
+        if let Some(reflector) = self.reflector {
+            self.query_reflector(reflector);
+        }
+    }
+
+    /// The interface monitor's generation counter, spec 4.2.  It advances
+    /// whenever the host's address set changes.
+    pub fn net_generation(&self) -> watch::Receiver<u64> {
+        self.net.clone()
+    }
+
     pub fn reflexive(&self) -> Option<SocketAddr> {
         *self.reflexive.lock().expect("reflexive")
     }
@@ -220,10 +256,8 @@ impl Paths {
     pub fn local_candidates(&self) -> Vec<SocketAddr> {
         let mut out = Vec::new();
         if self.udp_local.ip().is_unspecified() {
-            for ip in primary_local_addresses() {
-                if ip.is_ipv4() == self.udp_local.is_ipv4() {
-                    out.push(SocketAddr::new(ip, self.udp_local.port()));
-                }
+            for ip in local_addresses(self.udp_local.is_ipv4()) {
+                out.push(SocketAddr::new(ip, self.udp_local.port()));
             }
         } else {
             out.push(self.udp_local);
@@ -312,30 +346,71 @@ impl Paths {
     }
 }
 
-/// Addresses of the interfaces that would carry traffic off this host.
-fn primary_local_addresses() -> Vec<IpAddr> {
-    let mut out = Vec::new();
-    // Connecting a UDP socket performs no traffic but makes the OS choose a route.
-    for probe in ["192.0.2.1:9", "[2001:db8::1]:9"] {
-        let Ok(target) = probe.parse::<SocketAddr>() else {
-            continue;
-        };
-        let bind: SocketAddr = if target.is_ipv4() {
-            "0.0.0.0:0"
-        } else {
-            "[::]:0"
+/// At most this many local addresses are offered.  A card has 16 hint slots
+/// and relay hints take some of them; a control-stream list allows 255 but a
+/// peer probes every entry, so the list stays short.
+pub const MAX_LOCAL_CANDIDATES: usize = 8;
+
+/// The address the default route would use for the given family, learnt by
+/// connecting a UDP socket to a documentation address: no traffic is sent,
+/// but the OS chooses a route and reports the source it would use.
+fn default_route_address(v4: bool) -> Option<IpAddr> {
+    let (target, bind) = if v4 {
+        ("192.0.2.1:9", "0.0.0.0:0")
+    } else {
+        ("[2001:db8::1]:9", "[::]:0")
+    };
+    let target: SocketAddr = target.parse().ok()?;
+    let bind: SocketAddr = bind.parse().ok()?;
+    let socket = std::net::UdpSocket::bind(bind).ok()?;
+    socket.connect(target).ok()?;
+    let local = socket.local_addr().ok()?;
+    (!local.ip().is_unspecified()).then_some(local.ip())
+}
+
+/// Link-local addresses are never useful to a peer: an IPv6 one needs a
+/// scope the wire cannot carry, and an IPv4 one means no address was
+/// assigned at all.
+fn is_link_local(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+    }
+}
+
+/// Every address a peer might reach this host on, spec 4.2: the address the
+/// default route would use first, then every other interface of the same
+/// family, loopback last so a same-host peer still works.  A default-route
+/// only list was the recorded cause of a LAN pair falling back to the relay
+/// whenever a VPN held the default route (acceptance record, 27 August 2026):
+/// the tunnel address was the only candidate, and the LAN address that would
+/// have worked was never offered.
+pub fn local_addresses(v4: bool) -> Vec<IpAddr> {
+    let mut out: Vec<IpAddr> = Vec::new();
+    let offer = |ip: IpAddr, out: &mut Vec<IpAddr>| {
+        if ip.is_ipv4() == v4 && !out.contains(&ip) {
+            out.push(ip);
         }
-        .parse()
-        .expect("literal");
-        if let Ok(socket) = std::net::UdpSocket::bind(bind)
-            && socket.connect(target).is_ok()
-            && let Ok(local) = socket.local_addr()
-            && !local.ip().is_unspecified()
-        {
-            out.push(local.ip());
+    };
+    if let Some(routed) = default_route_address(v4) {
+        offer(routed, &mut out);
+    }
+    if let Ok(interfaces) = if_addrs::get_if_addrs() {
+        for interface in interfaces {
+            let ip = interface.ip();
+            if ip.is_loopback() || ip.is_unspecified() || is_link_local(ip) {
+                continue;
+            }
+            offer(ip, &mut out);
         }
     }
-    out.push(IpAddr::from([127, 0, 0, 1]));
+    out.truncate(MAX_LOCAL_CANDIDATES - 1);
+    let loopback = if v4 {
+        IpAddr::from([127, 0, 0, 1])
+    } else {
+        IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+    };
+    offer(loopback, &mut out);
     out
 }
 
@@ -357,6 +432,8 @@ pub async fn build(
     bind: SocketAddr,
     relays: Vec<crate::relay_client::RelaySpec>,
     book: Option<Arc<crate::rendezvous_book::TagBook>>,
+    reflector: Option<SocketAddr>,
+    net: watch::Receiver<u64>,
 ) -> io::Result<(Arc<PathSocket>, Arc<Paths>)> {
     let udp = Arc::new(UdpSocket::bind(bind).await?);
     let udp_local = udp.local_addr()?;
@@ -374,6 +451,8 @@ pub async fn build(
         inbound_tx,
         reflexive: Mutex::new(None),
         reflector_nonce: Mutex::new(None),
+        reflector,
+        net,
         local_synthetic,
         udp_local,
     });
@@ -585,5 +664,49 @@ impl AsyncUdpSocket for PathSocket {
 
     fn may_fragment(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod candidates {
+    use super::*;
+
+    /// Every routable interface address is offered, not only the one the
+    /// default route would use.  A default-route-only list was the recorded
+    /// cause of a LAN pair falling back to the relay whenever a VPN held the
+    /// default route (acceptance record, 27 August 2026).
+    #[test]
+    fn every_routable_interface_address_is_offered() {
+        let offered = local_addresses(true);
+        let expected: Vec<IpAddr> = if_addrs::get_if_addrs()
+            .expect("interfaces")
+            .into_iter()
+            .map(|interface| interface.ip())
+            .filter(|ip| ip.is_ipv4() && !ip.is_loopback() && !is_link_local(*ip))
+            .collect();
+        for ip in &expected {
+            assert!(offered.contains(ip), "{ip} is missing from {offered:?}");
+        }
+        assert_eq!(
+            offered.last().copied(),
+            Some(IpAddr::from([127, 0, 0, 1])),
+            "loopback is offered last so a same-host peer still works"
+        );
+        assert!(offered.len() <= MAX_LOCAL_CANDIDATES);
+        assert!(
+            offered.iter().all(|ip| ip.is_ipv4()),
+            "one family per socket"
+        );
+    }
+
+    #[test]
+    fn link_local_and_the_wrong_family_are_never_offered() {
+        for ip in local_addresses(false) {
+            assert!(ip.is_ipv6(), "{ip} is not IPv6");
+            assert!(!is_link_local(ip), "{ip} is link-local");
+        }
+        assert!(is_link_local("169.254.1.1".parse::<IpAddr>().unwrap()));
+        assert!(is_link_local("fe80::1".parse::<IpAddr>().unwrap()));
+        assert!(!is_link_local("fd00::1".parse::<IpAddr>().unwrap()));
     }
 }

@@ -29,6 +29,9 @@ struct Args {
     /// Cap on concurrent authenticated sessions.
     #[arg(long, default_value_t = 1024)]
     max_sessions: usize,
+    /// Cap on concurrent sessions from one source address.  Zero means none.
+    #[arg(long, default_value_t = 16)]
+    sessions_per_source: usize,
     /// Reflector replies per source address per second.
     #[arg(long, default_value_t = 20.0)]
     reflector_per_second: f64,
@@ -55,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
         tls,
         bytes_per_second: args.bytes_per_second,
         max_sessions: args.max_sessions,
+        max_sessions_per_source: args.sessions_per_source,
         reflector_per_second: args.reflector_per_second,
     };
 

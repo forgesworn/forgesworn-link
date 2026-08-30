@@ -7,7 +7,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use link_core::TransportKey;
 use link_core::rendezvous::Tag;
-use link_core::wire::{Frame, sign_relay_auth};
+use link_core::wire::{CLOSE_REASON_SUPERSEDED, Frame, sign_relay_auth};
 use link_relay::{RelayConfig, RelayHandle};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -22,6 +22,7 @@ async fn start_relay() -> RelayHandle {
         tls: None,
         bytes_per_second: 0,
         max_sessions: 16,
+        max_sessions_per_source: 16,
         reflector_per_second: 100.0,
     })
     .await
@@ -261,6 +262,55 @@ async fn mode_mixing_is_malformed() {
         Some(Frame::Close(reason)) => assert_eq!(reason, 1),
         None => {}
         other => panic!("expected a malformed close, got {other:?}"),
+    }
+    relay.shutdown();
+}
+
+/// A second identity session for the same node ID wins, and the first is told
+/// with `Close(2)` so it can reconnect rather than sit on a dead route.
+#[tokio::test]
+async fn a_second_identity_session_supersedes_the_first_with_a_close() {
+    let relay = start_relay().await;
+    let url = relay.url("127.0.0.1");
+    let key = TransportKey::generate();
+    let mut first = open_identity(&url, &key).await;
+    let _second = open_identity(&url, &key).await;
+    match next_frame(&mut first).await {
+        Some(Frame::Close(reason)) => assert_eq!(reason, CLOSE_REASON_SUPERSEDED),
+        other => panic!("expected Close(2) on the superseded session, got {other:?}"),
+    }
+    relay.shutdown();
+}
+
+/// A tag has two ends.  A third registrant evicts the oldest with `Close(2)`,
+/// and delivery continues between the two that remain.
+#[tokio::test]
+async fn a_third_tag_registrant_evicts_the_oldest() {
+    let relay = start_relay().await;
+    let url = relay.url("127.0.0.1");
+    let t = tag(0x42);
+    let mut a = open_tags(&url, vec![t]).await;
+    let mut b = open_tags(&url, vec![t]).await;
+    let mut c = open_tags(&url, vec![t]).await;
+    match next_frame(&mut a).await {
+        Some(Frame::Close(reason)) => assert_eq!(reason, CLOSE_REASON_SUPERSEDED),
+        other => panic!("expected the oldest registrant to be evicted, got {other:?}"),
+    }
+    c.send(Message::Binary(
+        Frame::SendTag {
+            tag: t,
+            datagram: vec![1, 2, 3],
+        }
+        .encode(),
+    ))
+    .await
+    .unwrap();
+    match next_frame(&mut b).await {
+        Some(Frame::RecvTag { tag, datagram }) => {
+            assert_eq!(tag, t);
+            assert_eq!(datagram, vec![1, 2, 3]);
+        }
+        other => panic!("b should still receive on the tag, got {other:?}"),
     }
     relay.shutdown();
 }

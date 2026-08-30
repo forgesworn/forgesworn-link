@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use link_core::id::{NodeId, TransportKey};
-use link_core::wire::{Frame, MAX_QUEUED_FRAMES};
+use link_core::wire::{CLOSE_REASON_SUPERSEDED, Frame, MAX_QUEUED_FRAMES};
 use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -145,6 +145,9 @@ pub struct RelayClient {
     /// `Some` switches the session to tag mode, spec 9: registration instead
     /// of identity auth, and sends translated to the pair's current tag.
     book: Option<Arc<TagBook>>,
+    /// The lowercase host of the relay the session is on, memoised against
+    /// its URL, so a tag-mode datagram costs no URL parse.
+    host_memo: Arc<std::sync::Mutex<Option<(String, String)>>>,
 }
 
 /// What the path socket should do with a datagram it could not queue.
@@ -160,10 +163,7 @@ impl RelayClient {
     /// Queue a datagram for the relay.  Never blocks, so it is safe to call
     /// from quinn's driver.
     pub fn try_send(&self, destination: NodeId, datagram: &[u8]) -> QueueOutcome {
-        let (up, host) = match &*self.status.borrow() {
-            RelayStatus::Up(url) => (true, RelaySpec::plain(url.clone()).host().ok()),
-            _ => (false, None),
-        };
+        let up = matches!(&*self.status.borrow(), RelayStatus::Up(_));
         let frame = match &self.book {
             None => Frame::Send {
                 destination,
@@ -173,10 +173,9 @@ impl RelayClient {
                 // Tag mode: the peer's identity never goes to the relay.  The
                 // tag depends on which relay this session is on, so nothing is
                 // sendable before the welcome names it.
-                let Some(host) = host else {
-                    return QueueOutcome::Dropped;
-                };
-                let Some(tag) = book.tag_for_send(destination, &host, now_unix()) else {
+                let Some(tag) =
+                    self.with_current_host(|host| book.tag_for_send(destination, host, now_unix()))
+                else {
                     return QueueOutcome::Dropped;
                 };
                 Frame::SendTag {
@@ -190,6 +189,23 @@ impl RelayClient {
             Err(mpsc::error::TrySendError::Full(_)) if up => QueueOutcome::WouldBlock,
             Err(_) => QueueOutcome::Dropped,
         }
+    }
+
+    /// Run `f` with the lowercase host of the relay the session is on, or
+    /// return `None` when no session is up.  The host is parsed once per
+    /// relay URL and memoised, so this is a string compare per call.
+    fn with_current_host<T>(&self, f: impl FnOnce(&str) -> Option<T>) -> Option<T> {
+        let status = self.status.borrow();
+        let RelayStatus::Up(url) = &*status else {
+            return None;
+        };
+        let mut memo = self.host_memo.lock().expect("host memo");
+        if memo.as_ref().is_none_or(|(memo_url, _)| memo_url != url) {
+            let host = RelaySpec::plain(url.clone()).host().ok()?;
+            *memo = Some((url.clone(), host));
+        }
+        let (_, host) = memo.as_ref().expect("memoised above");
+        f(host)
     }
 
     pub fn has_capacity(&self) -> bool {
@@ -258,6 +274,7 @@ pub fn spawn(
         events: events_tx,
         readiness,
         book,
+        host_memo: Arc::new(std::sync::Mutex::new(None)),
     }
 }
 
@@ -307,7 +324,7 @@ async fn driver(
                 readiness.wake_all();
                 info!(relay = %spec.url, "relay session up");
                 let host = spec.host().unwrap_or_default();
-                pump(
+                let end = pump(
                     ws,
                     &mut outbound,
                     &inbound,
@@ -316,12 +333,23 @@ async fn driver(
                     &host,
                 )
                 .await;
-                warn!(relay = %spec.url, "relay session lost");
+                match end {
+                    PumpEnd::Lost => warn!(relay = %spec.url, "relay session lost"),
+                    PumpEnd::Superseded => warn!(
+                        relay = %spec.url,
+                        "a newer session registered this node ID or tag; backing off before reconnecting"
+                    ),
+                }
                 set_status(&status, &events, RelayStatus::Reconnecting);
                 down_since = Some(std::time::Instant::now());
                 readiness.wake_all();
                 // Spec 4.3: next configured relay, then the same one.
                 index += 1;
+                if end == PumpEnd::Superseded {
+                    // Spec 3.1: a superseded client waits the full interval,
+                    // so two live instances of one identity do not fight.
+                    tokio::time::sleep(BACKOFF_MAX).await;
+                }
                 continue;
             }
             Err(e) => {
@@ -342,6 +370,18 @@ async fn driver(
 }
 
 type Socket = tokio_tungstenite::WebSocketStream<Box<dyn Duplex>>;
+
+/// Why a relay session ended, as far as the pump can tell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PumpEnd {
+    /// The socket failed, the relay closed for any other reason, or a frame
+    /// was malformed: reconnect on the usual backoff.
+    Lost,
+    /// The relay said a newer session registered this node ID or tag (spec
+    /// 3.1, close reason 2): back off for the full interval first, or two
+    /// live instances of one identity would supersede each other in a loop.
+    Superseded,
+}
 
 pub trait Duplex: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Duplex for T {}
@@ -422,7 +462,7 @@ async fn pump(
     readiness: &WriteReadiness,
     book: Option<&TagBook>,
     host: &str,
-) {
+) -> PumpEnd {
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Tag mode re-registers when the epoch turns or the book changes (a card
@@ -438,7 +478,7 @@ async fn pump(
             _ = ping.tick() => {
                 rand::rngs::OsRng.fill_bytes(&mut nonce);
                 if ws.send(Message::Binary(Frame::Ping(nonce).encode())).await.is_err() {
-                    return;
+                    return PumpEnd::Lost;
                 }
             }
             _ = refresh.tick(), if book.is_some() => {
@@ -454,14 +494,14 @@ async fn pump(
                     if !tags.is_empty()
                         && ws.send(Message::Binary(Frame::Register { tags }.encode())).await.is_err()
                     {
-                        return;
+                        return PumpEnd::Lost;
                     }
                 }
             }
             frame = outbound.recv() => {
-                let Some(frame) = frame else { return };
+                let Some(frame) = frame else { return PumpEnd::Lost };
                 if ws.send(Message::Binary(frame.encode())).await.is_err() {
-                    return;
+                    return PumpEnd::Lost;
                 }
                 // Hysteresis: wake a stalled sender once the queue is half empty.
                 if outbound.capacity() >= MAX_QUEUED_FRAMES / 2 {
@@ -469,19 +509,19 @@ async fn pump(
                 }
             }
             message = ws.next() => {
-                let Some(Ok(message)) = message else { return };
+                let Some(Ok(message)) = message else { return PumpEnd::Lost };
                 match message {
                     Message::Binary(bytes) => match Frame::decode(&bytes) {
                         Some(Frame::Recv { source, datagram }) => {
                             // Identity deliveries belong to identity sessions.
                             if book.is_some() {
-                                return;
+                                return PumpEnd::Lost;
                             }
                             // A full inbound queue is loss, not backpressure.
                             let _ = inbound.try_send((source, datagram));
                         }
                         Some(Frame::RecvTag { tag, datagram }) => {
-                            let Some(book) = book else { return };
+                            let Some(book) = book else { return PumpEnd::Lost };
                             // Attribute by this endpoint's own book; a tag it
                             // cannot resolve (a stale epoch, a removed pair) is
                             // dropped, which QUIC treats as loss.
@@ -492,17 +532,21 @@ async fn pump(
                         Some(Frame::Pong(_)) => {}
                         Some(Frame::Close(reason)) => {
                             debug!(reason, "relay closed the session");
-                            return;
+                            return if reason == CLOSE_REASON_SUPERSEDED {
+                                PumpEnd::Superseded
+                            } else {
+                                PumpEnd::Lost
+                            };
                         }
-                        _ => return,
+                        _ => return PumpEnd::Lost,
                     },
                     Message::Ping(payload) => {
                         if ws.send(Message::Pong(payload)).await.is_err() {
-                            return;
+                            return PumpEnd::Lost;
                         }
                     }
                     Message::Pong(_) => {}
-                    _ => return,
+                    _ => return PumpEnd::Lost,
                 }
             }
         }

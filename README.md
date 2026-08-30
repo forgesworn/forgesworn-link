@@ -1,6 +1,6 @@
 # ForgeSworn Link
 
-A wide-area transport lane for ForgeSworn storage: two authorised nodes find a
+A wide-area transport lane for ForgeSworn storage: two nodes find a
 route, attempt a direct QUIC path, and fall back to an opaque relay, without
 renting one company's endpoint IDs, DNS service or public relay estate.  It is
 the native lane a Bothy box or a Tor-less Wildbloom node uses to mirror and
@@ -100,9 +100,13 @@ To watch relay failover, start a second relay and pass `--relay` twice in the
 same order on both sides, then kill the first relay mid-transfer.
 
 Useful flags on `link-relay`: `--bytes-per-second` for the operator's per-session
-budget, `--max-sessions`, `--reflector-per-second`.  Without `--insecure-ws` the
+budget, `--max-sessions`, `--sessions-per-source` (default 16; a tag session
+presents no identity, so this is what stops one address holding every slot),
+`--reflector-per-second`.  Without `--insecure-ws` the
 relay generates a self-signed leaf and prints its SHA-256; a client then needs
 `--relay-cert-sha256 <hex>` or, for development only, `--relay-insecure-tls`.
+A relay behind an ordinary WebPKI certificate needs neither: the client
+verifies it against the bundled Mozilla roots.
 
 ## Tests
 
@@ -176,8 +180,11 @@ acceptance record of spec section 7, a person has to do the following by hand.
    background service keeps the WebSocket session alive across doze, what the
    carrier does to a long-lived outbound WSS connection, and whether the direct
    path survives a Wi-Fi to mobile handover.  Nothing in this spike answers any
-   of them, and the state machine has no handling for an interface change: see
-   the second open problem below.
+   of them.  The endpoint polls the interface set every five seconds and, on a
+   change, re-queries the reflector, re-announces its candidates and starts a
+   probing round (`EndpointConfig.net_poll`); a service with a
+   `ConnectivityManager` callback should call `Session::reannounce` from it
+   and set the poll to zero.
 
 Record every row against the table in spec section 7 and treat any missing row
 as a no-go, not as a pass.
@@ -202,6 +209,12 @@ They do not cover:
 - **A full security review.**  The identity rule is implemented and tested for
   the positive case and by unit assertions; there is no adversarial TLS test
   that drives a full handshake with a mismatched key.
+- **The VPN-default-route LAN row, re-run.**  That row fell back to the relay
+  because only the address on the default route was offered as a candidate,
+  so the LAN address that would have worked never reached the peer.  Every
+  interface of the socket's family is offered now (`local_addresses`,
+  loopback last, at most eight), and the row has not been re-run on a real
+  VPN since.
 
 ## Deviations from the spec
 
@@ -261,11 +274,13 @@ convenience alone.
    last 32 ms, so anything that samples `path()` will miss it.  The spec should
    say that the transition record is part of the interface, not only of the log.
 
-9. **Client-side relay TLS pins a fingerprint.**  The spike ships no root
-   certificate store, so a `wss://` relay is either pinned by the SHA-256 of
-   its DER leaf or accepted unchecked behind an explicit development flag.  A
-   deployed relay presents an ordinary WebPKI leaf and a product build would use
-   the platform trust store.
+9. **Client-side relay TLS, now closed.**  The spike originally shipped no root
+   store and pinned a `wss://` relay by the SHA-256 of its DER leaf.  A relay
+   behind an ordinary WebPKI certificate is now verified against the bundled
+   Mozilla roots with no pin at all, which is the deployed default; the pin
+   remains for a relay that has no WebPKI name, and the unchecked mode remains
+   for development only.  The platform trust store is the planned upgrade when
+   Android system roots and revocation matter.
 
 10. **`Failed(Timeout)` is reachable from QUIC, not only from the relay.**
     Spec 4.3 only produces `Failed(relay)` and `Failed(identity)`, yet spec 5
@@ -315,13 +330,6 @@ the suite ran at once.  Both are spec lessons, not only code fixes.
   they converge.  Nothing forces that.  A real deployment needs per-peer relay
   selection from the peer's card hints, or endpoints registered on several
   relays at once.  The spec does not decide this.
-- **Candidates are exchanged once.**  A new interface or a new reflexive result
-  after the handshake is never announced.  A long-lived session on a device that
-  changes network will not re-offer candidates.
-- **The reflector result is a single value with no source check.**  Anything
-  that can reach the direct socket can set it by sending a well-formed reply.
-  It only ever becomes a candidate the peer is asked to probe, so the cost of a
-  lie is a wasted probe, but it should be nonce-matched.
 - **No adversarial TLS handshake test.**  The one identity rule is exercised in
   the positive direction end to end and asserted directly on the verifier.  A
   test that drives a handshake where the presented key differs from the pin
@@ -330,9 +338,6 @@ the suite ran at once.  Both are spec lessons, not only code fixes.
 - **Inbound queue overflow is silent.**  The path socket's inbound queue is 512
   datagrams; a full queue drops, which QUIC treats as loss.  There is no counter
   for it, so a saturated receiver looks like a lossy network.
-- **The relay replaces a duplicate registration silently.**  Two sessions
-  authenticating as the same node ID leave the newest registered and the oldest
-  with a dead route.  The spec does not say what should happen.
 - **Card serials come from the wall clock.**  `Endpoint::card` seeds the serial
   from Unix seconds and increments.  A clock that goes backwards across a
   restart produces a card that a verifier will reject under rule 8, correctly

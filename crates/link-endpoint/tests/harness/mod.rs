@@ -35,6 +35,8 @@ pub async fn start_relay() -> RelayHandle {
         tls: None,
         bytes_per_second: 0,
         max_sessions: 64,
+        // Every endpoint in a test comes from loopback; no per-source cap.
+        max_sessions_per_source: 0,
         reflector_per_second: 100.0,
     })
     .await

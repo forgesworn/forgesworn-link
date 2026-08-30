@@ -19,8 +19,8 @@ use futures_util::{SinkExt, StreamExt};
 use link_core::id::NodeId;
 use link_core::rendezvous::Tag;
 use link_core::wire::{
-    CLOSE_REASON_MALFORMED, Frame, IDLE_CLOSE_SECONDS, MAX_QUEUED_FRAMES, REFLECT_REQUEST_BYTES,
-    parse_reflect_request, reflect_reply, verify_relay_auth,
+    CLOSE_REASON_MALFORMED, CLOSE_REASON_SUPERSEDED, Frame, IDLE_CLOSE_SECONDS, MAX_QUEUED_FRAMES,
+    REFLECT_REQUEST_BYTES, parse_reflect_request, reflect_reply, verify_relay_auth,
 };
 use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -48,6 +48,11 @@ pub struct RelayConfig {
     /// Cap on concurrent sessions, counted from accept so unauthenticated
     /// handshakes cannot slip under it.
     pub max_sessions: usize,
+    /// Cap on concurrent sessions from one source address, counted the same
+    /// way.  Zero means no per-source cap.  A tag session presents no identity
+    /// (spec 9), so without this one address could hold every slot; the
+    /// rendezvous section makes the cap a MUST.
+    pub max_sessions_per_source: usize,
     /// Reflector replies per source address per second.
     pub reflector_per_second: f64,
 }
@@ -95,6 +100,7 @@ impl Default for RelayConfig {
             tls: None,
             bytes_per_second: 0,
             max_sessions: 1024,
+            max_sessions_per_source: 16,
             reflector_per_second: 20.0,
         }
     }
@@ -136,6 +142,10 @@ struct Registry {
     /// Connections currently inside `serve_session`, both modes, counted from
     /// accept so unauthenticated handshakes cannot slip under the cap.
     live: usize,
+    /// Live connections per source address, for the per-source cap.  An
+    /// entry leaves the map when its count reaches zero, so the map never
+    /// grows with the history of addresses seen.
+    by_source: HashMap<IpAddr, usize>,
 }
 
 type Shared = Arc<Mutex<Registry>>;
@@ -178,6 +188,7 @@ pub async fn start(config: RelayConfig) -> anyhow::Result<RelayHandle> {
                         continue;
                     }
                 };
+                let source_ip = peer.ip();
                 {
                     let mut guard = registry.lock().expect("registry");
                     if guard.live >= config.max_sessions {
@@ -187,6 +198,20 @@ pub async fn start(config: RelayConfig) -> anyhow::Result<RelayHandle> {
                         );
                         continue;
                     }
+                    let from_source = guard.by_source.get(&source_ip).copied().unwrap_or(0);
+                    if config.max_sessions_per_source > 0
+                        && from_source >= config.max_sessions_per_source
+                    {
+                        // Refused before any frame, so it costs the relay a
+                        // TCP accept and nothing else.  The address is not
+                        // logged: it is the one thing a tag-mode relay holds.
+                        debug!(
+                            from_source,
+                            "relay at per-source session cap, dropping connection"
+                        );
+                        continue;
+                    }
+                    *guard.by_source.entry(source_ip).or_insert(0) += 1;
                     guard.live += 1;
                 }
                 let registry = registry.clone();
@@ -200,7 +225,14 @@ pub async fn start(config: RelayConfig) -> anyhow::Result<RelayHandle> {
                     {
                         debug!(error = %e, "relay session ended");
                     }
-                    registry.lock().expect("registry").live -= 1;
+                    let mut guard = registry.lock().expect("registry");
+                    guard.live -= 1;
+                    if let Some(count) = guard.by_source.get_mut(&source_ip) {
+                        *count -= 1;
+                        if *count == 0 {
+                            guard.by_source.remove(&source_ip);
+                        }
+                    }
                 });
             }
         });
@@ -330,9 +362,26 @@ fn register_tags(
         let entries = guard.tags.entry(*tag).or_default();
         if !entries.iter().any(|(id, _)| *id == session_id) {
             entries.push((session_id, tx.clone()));
+            // A tag has two ends.  A third registrant is either an end that
+            // reconnected before its old session died, or someone else who
+            // holds the tag; in both cases the oldest session is the one to
+            // go, and it is told why.
+            while entries.len() > TAG_ENDS {
+                let oldest = entries
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, (id, _))| *id)
+                    .map(|(index, _)| index)
+                    .expect("more than two entries");
+                let (_, evicted) = entries.remove(oldest);
+                let _ = evicted.try_send(Frame::Close(CLOSE_REASON_SUPERSEDED));
+            }
         }
     }
 }
+
+/// A rendezvous tag names one pair, so at most two sessions hold it.
+const TAG_ENDS: usize = 2;
 
 async fn serve_session(
     stream: TcpStream,
@@ -376,11 +425,18 @@ async fn serve_session(
                 let _ = ws.send(binary(Frame::Close(CLOSE_REASON_MALFORMED))).await;
                 anyhow::bail!("auth signature refused");
             }
-            registry
+            if let Some(previous) = registry
                 .lock()
                 .expect("registry")
                 .sessions
-                .insert(node_id, tx.clone());
+                .insert(node_id, tx.clone())
+            {
+                // Newest wins.  The old session is told why, so a node that
+                // reconnected before its old session died does not leave a
+                // dead route behind, and a node that was replaced knows to
+                // back off rather than fight for the slot.
+                let _ = previous.try_send(Frame::Close(CLOSE_REASON_SUPERSEDED));
+            }
             Mode::Identity(node_id)
         }
         Some(Frame::Register { tags }) => {
@@ -428,7 +484,14 @@ async fn serve_session(
                 match outbound {
                     Some(frame) => {
                         frames_out += 1;
+                        let closing = matches!(frame, Frame::Close(_));
                         ws.send(binary(frame)).await?;
+                        if closing {
+                            // A queued Close means a newer registration
+                            // superseded this session; the frame said why and
+                            // there is nothing left to route.
+                            break Err(anyhow::anyhow!("superseded"));
+                        }
                     }
                     None => break Ok(()),
                 }

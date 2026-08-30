@@ -2,7 +2,7 @@
 
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -31,6 +31,15 @@ const STREAM_QUEUE: usize = 16;
 /// Bounded transition history, so a test or an operator can read what happened
 /// rather than try to catch a state in flight.
 const HISTORY_CAP: usize = 256;
+/// Bounded queue of requests to the control-stream writer.
+const CONTROL_QUEUE: usize = 8;
+
+/// Nobody has asked for a probing round.
+const PROBE_IDLE: u8 = 0;
+/// This side asked: `request_direct`, `reannounce`, or the network monitor.
+const PROBE_LOCAL: u8 = 1;
+/// The peer asked with a `punch-now` control message.
+const PROBE_PEER: u8 = 2;
 
 /// One bidirectional QUIC stream, a plain read and write pair.
 pub struct Stream {
@@ -80,7 +89,13 @@ pub(crate) struct SessionInner {
     allow_direct: bool,
     report: Mutex<PathReport>,
     history: Mutex<Vec<PathReport>>,
-    probe_now: AtomicBool,
+    /// `PROBE_IDLE`, `PROBE_LOCAL` or `PROBE_PEER`: who asked for a probing
+    /// round, consumed by the state machine on its next tick.
+    probe_now: AtomicU8,
+    /// Requests to the control-stream writer: re-send candidates, punch now.
+    control_tx: mpsc::Sender<ControlSend>,
+    /// How many `punch-now` messages the peer has sent this session.
+    punch_requests: AtomicU32,
 }
 
 impl SessionInner {
@@ -161,12 +176,15 @@ impl Session {
             since: Instant::now(),
             cause: "connect".into(),
         };
+        let (control_tx, control_rx) = mpsc::channel::<ControlSend>(CONTROL_QUEUE);
         let inner = Arc::new(SessionInner {
             peer,
             conn,
             paths,
             allow_direct,
-            probe_now: AtomicBool::new(false),
+            probe_now: AtomicU8::new(PROBE_IDLE),
+            control_tx,
+            punch_requests: AtomicU32::new(0),
             report: Mutex::new(initial.clone()),
             history: Mutex::new(vec![initial]),
         });
@@ -182,7 +200,7 @@ impl Session {
         let (tx, rx) = mpsc::channel(STREAM_QUEUE);
         tokio::spawn(accept_loop(inner.clone(), tx));
         if let Some((send, recv)) = control {
-            tokio::spawn(control_initiator(inner.clone(), send, recv));
+            tokio::spawn(control_initiator(inner.clone(), send, recv, control_rx));
         }
         tokio::spawn(drive(inner.clone(), probe_delay));
 
@@ -209,9 +227,28 @@ impl Session {
     }
 
     /// Ask for a direct-path attempt now rather than waiting out the settle
-    /// delay or the cooldown.  Not in the spec: an application-level hint.
+    /// delay or the cooldown, and tell the peer to do the same (`punch-now`,
+    /// spec 4.2), so both ends probe in the same round.
     pub fn request_direct(&self) {
-        self.inner.probe_now.store(true, Ordering::SeqCst);
+        self.inner.probe_now.store(PROBE_LOCAL, Ordering::SeqCst);
+        let _ = self.inner.control_tx.try_send(ControlSend::PunchNow);
+    }
+
+    /// Tell the peer this side's addresses may have changed: re-send the
+    /// candidate list, ask for a punching round, and start one here.  The
+    /// endpoint's network monitor calls this on an interface change; an
+    /// application with a platform connectivity callback calls it itself.
+    pub fn reannounce(&self) {
+        let _ = self.inner.control_tx.try_send(ControlSend::Candidates);
+        self.request_direct();
+    }
+
+    /// How many times the peer has asked this side for a probing round with
+    /// `punch-now`.  An operator reading a session that never left `Relayed`
+    /// can tell "the peer never asked" from "the peer asked and every probe
+    /// was lost".
+    pub fn punch_requests(&self) -> u32 {
+        self.inner.punch_requests.load(Ordering::SeqCst)
     }
 
     pub async fn open_stream(&self) -> anyhow::Result<Stream> {
@@ -255,8 +292,31 @@ async fn accept_loop(inner: Arc<SessionInner>, tx: mpsc::Sender<Stream>) {
 // Control stream, spec 4.2.  Candidates never travel through the relay frames.
 // ---------------------------------------------------------------------------
 
+/// Control message kinds, spec 4.2.  Each message is a `u32` big-endian
+/// length, then the kind byte, then the body.
 const CONTROL_CANDIDATES: u8 = 0x01;
+/// No body: start a probing round now, so both ends punch together.
+const CONTROL_PUNCH_NOW: u8 = 0x02;
 const CONTROL_MAX_BYTES: usize = 4096;
+
+/// A decoded control message.
+enum Control {
+    Candidates(Vec<SocketAddr>),
+    PunchNow,
+    /// A kind this version does not know; ignored, never fatal.
+    Unknown,
+}
+
+/// What the control-stream writer can be asked to send after the initial
+/// candidate list.
+pub(crate) enum ControlSend {
+    Candidates,
+    PunchNow,
+}
+
+fn punch_now_message() -> Vec<u8> {
+    vec![0, 0, 0, 1, CONTROL_PUNCH_NOW]
+}
 
 fn candidates_message(candidates: &[SocketAddr]) -> Vec<u8> {
     let mut body = Vec::with_capacity(2 + candidates.len() * 18);
@@ -272,11 +332,16 @@ fn candidates_message(candidates: &[SocketAddr]) -> Vec<u8> {
     out
 }
 
-fn parse_candidates(body: &[u8]) -> Option<Vec<SocketAddr>> {
+fn parse_control(body: &[u8]) -> Option<Control> {
     let (&kind, rest) = body.split_first()?;
-    if kind != CONTROL_CANDIDATES {
-        return Some(Vec::new());
+    match kind {
+        CONTROL_CANDIDATES => parse_candidates(rest).map(Control::Candidates),
+        CONTROL_PUNCH_NOW => Some(Control::PunchNow),
+        _ => Some(Control::Unknown),
     }
+}
+
+fn parse_candidates(rest: &[u8]) -> Option<Vec<SocketAddr>> {
     let (&count, rest) = rest.split_first()?;
     if rest.len() != count as usize * 18 {
         return None;
@@ -298,28 +363,48 @@ async fn control_initiator(
     inner: Arc<SessionInner>,
     mut send: quinn::SendStream,
     recv: quinn::RecvStream,
+    mut requests: mpsc::Receiver<ControlSend>,
 ) {
     // With direct paths declined the peer is told so by an empty candidate list.
-    let candidates = if inner.allow_direct {
-        inner.paths.local_candidates()
-    } else {
-        Vec::new()
+    let candidates = |inner: &SessionInner| {
+        if inner.allow_direct {
+            inner.paths.local_candidates()
+        } else {
+            Vec::new()
+        }
     };
+    let first = candidates(&inner);
     info!(
         peer = %inner.peer,
-        count = candidates.len(),
+        count = first.len(),
         allow_direct = inner.allow_direct,
         "sending candidates on the control stream"
     );
-    if send
-        .write_all(&candidates_message(&candidates))
-        .await
-        .is_err()
-    {
+    if send.write_all(&candidates_message(&first)).await.is_err() {
         return;
     }
     let _ = send.flush().await;
-    // Hold both halves so neither direction is reset while the session lives.
+    // Stay on the stream for the life of the session: a re-announcement or a
+    // punch-now can be asked for at any time, and holding both halves means
+    // neither direction is reset while the session lives.
+    loop {
+        let message = tokio::select! {
+            request = requests.recv() => match request {
+                Some(ControlSend::Candidates) => {
+                    let fresh = candidates(&inner);
+                    info!(peer = %inner.peer, count = fresh.len(), "re-announcing candidates");
+                    candidates_message(&fresh)
+                }
+                Some(ControlSend::PunchNow) => punch_now_message(),
+                None => break,
+            },
+            _ = inner.conn.closed() => break,
+        };
+        if send.write_all(&message).await.is_err() {
+            break;
+        }
+        let _ = send.flush().await;
+    }
     inner.conn.closed().await;
     drop((send, recv));
 }
@@ -342,11 +427,18 @@ async fn control_acceptor(
         if recv.read_exact(&mut body).await.is_err() {
             break;
         }
-        match parse_candidates(&body) {
-            Some(candidates) => {
+        match parse_control(&body) {
+            Some(Control::Candidates(candidates)) => {
                 info!(peer = %inner.peer, count = candidates.len(), "peer candidates received");
                 inner.paths.set_peer_candidates(inner.peer, candidates);
             }
+            Some(Control::PunchNow) => {
+                // The peer is probing now; probe back in the same instant so
+                // both NATs see outbound traffic at once, spec 4.2.
+                inner.punch_requests.fetch_add(1, Ordering::SeqCst);
+                inner.probe_now.store(PROBE_PEER, Ordering::SeqCst);
+            }
+            Some(Control::Unknown) => {}
             None => break,
         }
     }
@@ -368,6 +460,16 @@ async fn drive(inner: Arc<SessionInner>, probe_delay: Duration) {
     let mut next_probe_attempt = Instant::now() + probe_delay;
     let mut last_probe_sent = Instant::now() - REPROVE_INTERVAL;
     let mut candidates_announced = false;
+    // Why the next probing round starts, for the transition record.
+    let mut round_cause = "settle delay elapsed";
+    // The interface monitor, spec 4.2.  On a change the reflector is asked
+    // again first, and the re-announcement follows once its reply has had a
+    // moment to arrive.
+    let mut net = inner.paths.net_generation();
+    net.borrow_and_update();
+    let mut net_alive = true;
+    let mut reannounce_at: Option<Instant> = None;
+    const REFLECTOR_GRACE: Duration = Duration::from_millis(300);
 
     // Relay state is consumed as an ordered event stream, never sampled.  A
     // failover can complete in tens of milliseconds, which a tick would step
@@ -399,6 +501,14 @@ async fn drive(inner: Arc<SessionInner>, probe_delay: Duration) {
                 return;
             }
             event = events.recv() => relay_event = Some(event),
+            changed = net.changed(), if net_alive => match changed {
+                Ok(()) => {
+                    info!(peer = %inner.peer, "interface change: re-querying the reflector");
+                    inner.paths.requery_reflector();
+                    reannounce_at = Some(Instant::now() + REFLECTOR_GRACE);
+                }
+                Err(_) => net_alive = false,
+            },
             _ = tokio::time::sleep(TICK) => {}
         }
 
@@ -460,10 +570,27 @@ async fn drive(inner: Arc<SessionInner>, probe_delay: Duration) {
             continue;
         }
 
+        if reannounce_at.is_some_and(|at| Instant::now() >= at) {
+            reannounce_at = None;
+            info!(peer = %inner.peer, "interface change: re-announcing candidates");
+            let _ = inner.control_tx.try_send(ControlSend::Candidates);
+            let _ = inner.control_tx.try_send(ControlSend::PunchNow);
+            inner.probe_now.store(PROBE_LOCAL, Ordering::SeqCst);
+        }
+
         let peer_candidates = inner.paths.peer_candidates(inner.peer);
         let proven = inner.paths.proven_direct(inner.peer);
-        if inner.probe_now.swap(false, Ordering::SeqCst) {
+        let asked = inner.probe_now.swap(PROBE_IDLE, Ordering::SeqCst);
+        if asked != PROBE_IDLE {
             next_probe_attempt = Instant::now();
+            round_cause = if asked == PROBE_PEER {
+                "punch-now from peer"
+            } else {
+                "requested here"
+            };
+            // While Direct, a request re-proves at once rather than waiting
+            // for the next re-prove interval.
+            last_probe_sent = Instant::now() - REPROVE_INTERVAL;
         }
 
         match status {
@@ -491,8 +618,9 @@ async fn drive(inner: Arc<SessionInner>, probe_delay: Duration) {
                 }
                 inner.transition(
                     PathStatus::Probing,
-                    format!("{} peer candidates exchanged", peer_candidates.len()),
+                    format!("{} peer candidates, {round_cause}", peer_candidates.len()),
                 );
+                round_cause = "cooldown elapsed";
                 probe_round_ends = Some(Instant::now() + PROBE_ROUND);
                 inner.paths.send_probes(inner.peer);
                 last_probe_sent = Instant::now();

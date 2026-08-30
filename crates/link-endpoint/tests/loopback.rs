@@ -102,9 +102,13 @@ async fn relayed_transfer_then_direct_upgrade() {
         "direct upgrade on loopback, history: {}",
         describe(&history)
     );
+    // The report follows the socket (spec 5): if bob's punch-now round proves
+    // alice's path before her own tick starts a round, her history goes
+    // straight from Relayed to Direct, which is honest.  What must hold is
+    // that Direct came only after the request, never before it.
     assert!(
-        saw_after(&history, PathStatus::Relayed, PathStatus::Probing),
-        "the upgrade went through Probing, history: {}",
+        saw_after(&history, PathStatus::Relayed, PathStatus::Direct),
+        "Direct came after Relayed, history: {}",
         describe(&history)
     );
 
@@ -459,5 +463,135 @@ async fn unproven_addresses_and_forged_probes_are_dropped() {
         describe(&history)
     );
     assert_eq!(sink.await.expect("sink"), 1);
+    relay.shutdown();
+}
+
+/// A `request_direct` on one side makes the *other* side start its own
+/// probing round at once (the `punch-now` control message, spec 4.2), rather
+/// than only answering pings.  Both ends punching in the same instant is what
+/// a NAT mapping needs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn punch_now_starts_a_round_on_the_peer() {
+    init_tracing();
+    let relay = start_relay().await;
+    let url = relay.url("127.0.0.1");
+    let options = || EndpointOptions {
+        relays: vec![RelaySpec::plain(url.clone())],
+        allow_direct: true,
+        probe_delay: NEVER,
+        reflector: Some(relay.udp_addr),
+    };
+    let alice = start_endpoint(options()).await;
+    let bob = Arc::new(start_endpoint(options()).await);
+    let card = exchange_card(&bob);
+    let accepting = {
+        let bob = bob.clone();
+        tokio::spawn(async move { bob.accept().await })
+    };
+    let session = alice.connect(&card).await.expect("alice connects");
+    let bob_session = Arc::new(accepting.await.unwrap().expect("bob accepts"));
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        bob_session.punch_requests(),
+        0,
+        "nobody has asked bob for a round yet, history: {}",
+        describe(&bob_session.history())
+    );
+    assert!(
+        !saw(&session.history(), PathStatus::Probing),
+        "alice is idle until asked, history: {}",
+        describe(&session.history())
+    );
+
+    session.request_direct();
+    assert!(
+        wait_until(Duration::from_secs(5), || bob_session.punch_requests() >= 1).await,
+        "bob received alice's punch-now on the control stream, history: {}",
+        describe(&bob_session.history())
+    );
+    // Alice's own round is recorded when it happens.  If bob's punch-now
+    // round proves alice's path before her tick starts one, her history goes
+    // straight from Relayed to Direct: the report follows the socket (spec 5).
+    let history = wait_for_history(&session, Duration::from_secs(10), |h| {
+        saw(h, PathStatus::Direct)
+    })
+    .await;
+    assert!(
+        saw_after(&history, PathStatus::Relayed, PathStatus::Direct),
+        "alice reached Direct after the request, history: {}",
+        describe(&history)
+    );
+    if let Some(probing) = history
+        .iter()
+        .find(|report| report.status == PathStatus::Probing)
+    {
+        assert!(
+            probing.cause.contains("requested here"),
+            "alice's round records who asked, cause: {}",
+            probing.cause
+        );
+    }
+    // Both sides reach Direct: bob by answering alice's pings and, had a NAT
+    // eaten those, by the round the punch-now started.
+    let bob_history = wait_for_history(&bob_session, Duration::from_secs(10), |h| {
+        saw(h, PathStatus::Direct)
+    })
+    .await;
+    assert!(
+        saw(&bob_history, PathStatus::Direct),
+        "bob: {}",
+        describe(&bob_history)
+    );
+    relay.shutdown();
+}
+
+/// `reannounce` re-sends this side's candidates on the control stream and
+/// the peer records the update, spec 4.2.  This is what the network monitor
+/// does on an interface change, and what an application does from a
+/// connectivity callback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reannounce_resends_candidates() {
+    init_tracing();
+    let relay = start_relay().await;
+    let url = relay.url("127.0.0.1");
+    let options = || EndpointOptions {
+        relays: vec![RelaySpec::plain(url.clone())],
+        allow_direct: true,
+        probe_delay: NEVER,
+        reflector: Some(relay.udp_addr),
+    };
+    let alice = start_endpoint(options()).await;
+    let bob = Arc::new(start_endpoint(options()).await);
+    let card = exchange_card(&bob);
+    let accepting = {
+        let bob = bob.clone();
+        tokio::spawn(async move { bob.accept().await })
+    };
+    let session = alice.connect(&card).await.expect("alice connects");
+    let bob_session = Arc::new(accepting.await.unwrap().expect("bob accepts"));
+
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            bob.paths().candidate_updates(alice.node_id()) == 1
+        })
+        .await,
+        "the initial exchange is one update, saw {}",
+        bob.paths().candidate_updates(alice.node_id())
+    );
+
+    session.reannounce();
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            bob.paths().candidate_updates(alice.node_id()) == 2
+        })
+        .await,
+        "bob received the re-announcement, saw {}",
+        bob.paths().candidate_updates(alice.node_id())
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || bob_session.punch_requests() >= 1).await,
+        "a re-announcement is followed by a punch-now"
+    );
     relay.shutdown();
 }

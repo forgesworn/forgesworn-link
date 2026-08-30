@@ -11,6 +11,7 @@ link-core = { path = "../link-core" }
 anyhow.workspace = true
 futures-io = "0.3"
 futures-util.workspace = true
+if-addrs.workspace = true
 quinn.workspace = true
 rand.workspace = true
 rustls.workspace = true

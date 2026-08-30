@@ -1,6 +1,8 @@
 # ForgeSworn Link specification
 
-**Version:** 1 (`FSL1` cards, ALPN `fsl/0`).
+**Version:** card format 1 (`FSL1`); ALPN `fsl/0`.  The ALPN counts from
+zero and changes only on an incompatible change at the QUIC level; the card
+version byte changes only on an incompatible change to the card.
 **Status:** Normative.
 
 This document specifies the ForgeSworn Link transport: the endpoint address
@@ -179,8 +181,19 @@ ForgeSworn-operated instance and still work.
   with no session is dropped silently, which QUIC treats as loss.
 - **Bounds.**  Per session: at most 64 queued outbound frames, a per-second
   byte budget the operator sets, and idle close after 90 seconds without a
-  ping.  Per relay: a cap on concurrent sessions.  Oversize or malformed frames
-  close the session with reason `1`.
+  ping.  Per relay: a cap on concurrent sessions, and a cap on concurrent
+  sessions per source address, both counted from accept so an unauthenticated
+  handshake cannot slip under them; a tag session (section 9) presents no
+  identity, so the per-source cap is what stops one address holding every
+  slot.  Oversize or malformed frames close the session with reason `1`.
+- **Superseded sessions.**  A node ID is registered by at most one identity
+  session and a tag by at most two tag sessions (the two ends of one pair).
+  A newer registration wins: the relay sends the oldest holder `close` with
+  reason `2` and ends that session, so a node that reconnected before its
+  previous session died is not left with a dead route, and nothing is
+  silently replaced.  A client that receives reason `2` waits 30 seconds
+  before it reconnects, because two live instances of one node ID would
+  otherwise supersede each other in a loop.
 - **What the relay learns.**  Node IDs of registered endpoints and who they
   talk to, source IP addresses of WSS sessions, timing and byte counts.  It
   must log only routing tokens and counters, and must not persist node IDs past
@@ -241,8 +254,13 @@ for.  A session is handed to the application only after its control stream
 has been opened; otherwise an application stream can win the lower stream ID
 under load, be mistaken for the control stream and reset mid-transfer.  A
 control stream that goes quiet is held open, never dropped.  Each side sends
-its candidate list: local interface addresses and the reflector result.  Each
-side then sends signed probes over UDP to every candidate of the other side:
+its candidate list: every interface address of the socket's family that is
+neither loopback nor link-local, the default route's address first and at
+most eight, then loopback, then the reflector result.  *Spike finding:* a
+list holding only the default route's address made a LAN pair fall back to
+the relay whenever a VPN held the default route, because the LAN address was
+never offered.  Each side then sends signed probes over UDP to every
+candidate of the other side:
 
 - `FSLP` || `0x01` || 32-byte sender node ID || 32-byte receiver node ID ||
   16-byte nonce || Ed25519 signature over `forgesworn-link/probe/v1\0` and
@@ -257,6 +275,29 @@ side then sends signed probes over UDP to every candidate of the other side:
   address at once, rate-limited to one per address per second.  Without this a
   peer that answers pings but never issues its own is proved by nobody, and
   every direct datagram it sends is dropped under 4.1.
+
+The control stream carries two message kinds, each a `u32` big-endian length
+followed by a kind byte and a body: `0x01 candidates` (a `u8` count, then
+18-byte address entries as in the `udp` hint) and `0x02 punch-now` (no body).
+A side MAY re-send `candidates` whenever its addresses change and SHOULD
+follow it with `punch-now`.  On receiving `punch-now` a side starts a probing
+round at once, so both ends punch in the same instant, which is what a NAT
+mapping needs: a round started by one side's timer alone reaches a peer whose
+own round is on a different timer only if the peer's NAT happens to be open,
+and after one failed round the two cooldowns drift apart.  A side counts the
+`punch-now` messages it receives, so an operator can tell "the peer never
+asked" from "the peer asked and every probe was lost".  Unknown kinds are
+ignored.
+
+A side re-sends `candidates` and `punch-now` when its interface set changes.
+The reference implementation polls the set every 5 seconds
+(`EndpointConfig.net_poll`), asks the reflector again first, and re-announces
+300 ms later so the fresh reflexive address is in the list;
+`Session::reannounce` does the same on demand, for a platform connectivity
+callback, and a shell that has one may set the poll to zero.  A proof on an
+interface that has gone is not dropped early: it ages out under the 15 second
+rule of 4.1 while the new round proves the new path, so a report never says
+`Relayed` while a still-working direct path carries bytes.
 
 Probes carry node IDs in clear, which an on-path observer can read.  They
 never carry anything else.  Encrypting them is future work.
@@ -409,16 +450,8 @@ Open problems the spike surfaced, to settle before Phase 1:
 - Relay convergence is by convention: both sides walk the same relay list in
   the same order.  Nothing enforces it, and per-peer relay selection from a
   card's hints is undecided.
-- Candidates are exchanged once and never re-announced.  An interface change
-  (Wi-Fi to mobile on a phone) is the first real-network case expected to
-  break; the state machine needs a re-announce and re-probe rule.
-- The reflector reply is unauthenticated and not matched to its nonce.
-- Duplicate relay registration for a node ID silently replaces the earlier
-  session; decide whether that is the rule.
 - Card serials come from the wall clock in the spike; a node must persist its
   highest issued serial or a clock step can reissue a stale one.
-- `wss://` relay TLS in the spike pins a leaf fingerprint because it ships no
-  root store; production relays use ordinary WebPKI certificates.
 
 ## 9. Rendezvous-tag routing
 

@@ -23,6 +23,7 @@ clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 hex = "0.4"
+if-addrs = "0.15"
 hkdf = "0.12"
 k256 = { version = "0.13", default-features = false, features = ["ecdh", "arithmetic", "std"] }
 libc = "0.2"

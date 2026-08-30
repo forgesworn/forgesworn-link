@@ -15,6 +15,7 @@ use link_core::tls::{
 use quinn::VarInt;
 use tracing::{info, warn};
 
+use crate::netmon::{NetMonitor, interface_snapshot};
 use crate::path_socket::{Paths, build};
 use crate::relay_client::{RelaySpec, RelayStatus};
 use crate::rendezvous_book::{RendezvousPeer, TagBook};
@@ -36,8 +37,15 @@ pub struct EndpointConfig {
     pub allow_direct: bool,
     /// Real UDP bind for direct paths and probes.
     pub bind: SocketAddr,
-    /// Optional reflector for the reflexive candidate, spec 3.2.
+    /// Optional reflector for the reflexive candidate, spec 3.2.  Asked at
+    /// open and again after every interface change.
     pub reflector: Option<SocketAddr>,
+    /// How often the interface set is polled for a change, spec 4.2.  On a
+    /// change every session re-queries the reflector, re-announces its
+    /// candidates and starts a probing round.  Zero disables the poll; an
+    /// application with a platform connectivity callback then calls
+    /// `Session::reannounce` itself.
+    pub net_poll: Duration,
     /// Settle on the relay for this long before the first probing round.  Not in
     /// the spec: it exists so a test can prove the relay carried a transfer
     /// before the upgrade, and so a product can defer probing.
@@ -58,6 +66,7 @@ impl EndpointConfig {
             allow_direct: true,
             bind: "0.0.0.0:0".parse().expect("literal"),
             reflector: None,
+            net_poll: Duration::from_secs(5),
             probe_delay: Duration::ZERO,
             rendezvous: None,
         }
@@ -80,11 +89,14 @@ impl Endpoint {
             .rendezvous
             .clone()
             .map(|peers| Arc::new(TagBook::new(peers)));
+        let net = NetMonitor::spawn(config.net_poll, interface_snapshot);
         let (socket, paths) = build(
             config.key.clone(),
             config.bind,
             config.relays.clone(),
             book.clone(),
+            config.reflector,
+            net,
         )
         .await?;
 
