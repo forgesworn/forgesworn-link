@@ -425,11 +425,13 @@ async fn pump(
 ) {
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Tag mode re-registers when the epoch turns, so the relay always holds the
-    // previous, current and next epoch's tags for every pair.
+    // Tag mode re-registers when the epoch turns or the book changes (a card
+    // rotation upsert), so the relay always holds the previous, current and
+    // next epoch's tags for the current pair set.
     let mut refresh = tokio::time::interval(Duration::from_secs(60));
     refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_epoch = link_core::rendezvous::epoch_index(now_unix());
+    let mut last_version = book.map(TagBook::version).unwrap_or(0);
     let mut nonce = [0u8; 8];
     loop {
         tokio::select! {
@@ -440,16 +442,19 @@ async fn pump(
                 }
             }
             _ = refresh.tick(), if book.is_some() => {
+                let Some(book) = book else { continue };
                 let current = link_core::rendezvous::epoch_index(now_unix());
-                if current != last_epoch {
+                let version = book.version();
+                if current != last_epoch || version != last_version {
                     last_epoch = current;
-                    if let Some(book) = book {
-                        let tags = book.registration(host, now_unix());
-                        if !tags.is_empty()
-                            && ws.send(Message::Binary(Frame::Register { tags }.encode())).await.is_err()
-                        {
-                            return;
-                        }
+                    last_version = version;
+                    let tags = book.registration(host, now_unix());
+                    // A book emptied at runtime has nothing to register; the
+                    // old tags age out with the epoch window.
+                    if !tags.is_empty()
+                        && ws.send(Message::Binary(Frame::Register { tags }.encode())).await.is_err()
+                    {
+                        return;
                     }
                 }
             }

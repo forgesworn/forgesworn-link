@@ -70,6 +70,7 @@ pub struct Endpoint {
     quic: quinn::Endpoint,
     config: EndpointConfig,
     serial: AtomicU64,
+    book: Option<Arc<TagBook>>,
 }
 
 impl Endpoint {
@@ -79,8 +80,13 @@ impl Endpoint {
             .rendezvous
             .clone()
             .map(|peers| Arc::new(TagBook::new(peers)));
-        let (socket, paths) =
-            build(config.key.clone(), config.bind, config.relays.clone(), book).await?;
+        let (socket, paths) = build(
+            config.key.clone(),
+            config.bind,
+            config.relays.clone(),
+            book.clone(),
+        )
+        .await?;
 
         let mut endpoint_config = quinn::EndpointConfig::default();
         endpoint_config.max_udp_payload_size(MAX_MTU)?;
@@ -118,6 +124,7 @@ impl Endpoint {
             quic,
             config,
             serial: AtomicU64::new(serial_seed),
+            book,
         };
 
         if let Some(reflector) = endpoint.config.reflector {
@@ -146,6 +153,14 @@ impl Endpoint {
 
     pub fn allow_direct(&self) -> bool {
         self.config.allow_direct
+    }
+
+    /// The live rendezvous book when this endpoint runs tag mode.  An upsert
+    /// after a peer's card rotation, or a removal, takes effect at the relay
+    /// within a minute (the pump re-registers on change), and the three-epoch
+    /// window covers the seam -- no endpoint restart.
+    pub fn rendezvous_book(&self) -> Option<&Arc<TagBook>> {
+        self.book.as_ref()
     }
 
     /// Sign a fresh `FSL-CARD-1`.  UDP hints appear only with owner consent.

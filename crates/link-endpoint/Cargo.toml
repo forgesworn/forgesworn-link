@@ -20,6 +20,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-tungstenite.workspace = true
+webpki-roots.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
