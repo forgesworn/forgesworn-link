@@ -1,0 +1,65 @@
+# Deploys link-relay to the founders' relay box — the estate's shared
+# Hetzner "routing" box, same host and rsync pattern as the joystick broker
+# and cambium site deploys. See deploy/founders/README.md for the topology
+# and the five review points.
+#
+# Requires the HETZNER_SSH_KEY repository secret (the deploy@95.217.39.110
+# private key, as used by joystick's and cambium's deploy workflows) and the
+# box's own sudoers lines for the deploy user (install the unit, reload,
+# enable/restart link-relay). Both belong to the box owner, already handled;
+# this workflow only assumes they exist.
+name: Deploy founders' relay
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "deploy/founders/**"
+      - "crates/link-relay/**"
+      - ".github/workflows/deploy-founders-relay.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-founders-relay
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.1"
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build static release binary
+        run: cargo build -p link-relay --release --target x86_64-unknown-linux-musl
+
+      - name: Strip binary
+        run: strip target/x86_64-unknown-linux-musl/release/link-relay
+
+      - name: Deploy to Hetzner
+        env:
+          HETZNER_SSH_KEY: ${{ secrets.HETZNER_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$HETZNER_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H 95.217.39.110 >> ~/.ssh/known_hosts
+          rsync -avz \
+            -e "ssh -i ~/.ssh/deploy_key" \
+            target/x86_64-unknown-linux-musl/release/link-relay \
+            deploy/founders/link-relay.service \
+            deploy@95.217.39.110:/opt/link-relay/
+          ssh -i ~/.ssh/deploy_key deploy@95.217.39.110 \
+            'sudo install -m 644 /opt/link-relay/link-relay.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now link-relay && sudo systemctl restart link-relay'

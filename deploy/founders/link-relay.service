@@ -1,0 +1,30 @@
+# The founders' relay unit — see deploy/founders/README.md for the topology,
+# the five review points and what the box owner does by hand.
+#
+# Installed by the deploy workflow at /etc/systemd/system/link-relay.service.
+# The binary is a static x86_64-unknown-linux-musl release build, rsynced to
+# /opt/link-relay/link-relay by deploy-founders-relay.yml.
+
+[Unit]
+Description=ForgeSworn Link founders' relay (link-relay)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=link-relay
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+CapabilityBoundingSet=
+MemoryMax=512M
+Restart=always
+RestartSec=5
+Environment=RUST_LOG=info
+ExecStart=/opt/link-relay/link-relay --ws-bind 127.0.0.1:7443 --insecure-ws --host link1.forgesworn.dev --udp-bind 0.0.0.0:7450 --bytes-per-second 5000000 --max-sessions 2000 --sessions-per-source 16 --reflector-per-second 20
+
+[Install]
+WantedBy=multi-user.target
