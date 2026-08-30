@@ -12,8 +12,7 @@ nodes discover a route, how they attempt a direct connection, how they fall back
 to a relay, and how a transport plugs into the same Blossom store -- and nothing
 beneath the socket.  Every cryptographic primitive, the TLS stack and the QUIC
 stack come from standard, independently maintained crates: `quinn`, `rustls`,
-`rcgen`, `ed25519-dalek`, `sha2`, `x509-parser`, `tokio`, `tokio-tungstenite`.
-Licensed MIT.
+`ed25519-dalek`, `sha2`, `hkdf`, `tokio`, `tokio-tungstenite`.  Licensed MIT.
 
 The design is the Phase 0 specification: the `FSL-CARD-1` address card, the
 WebSocket relay and UDP reflector, the path socket with its synthetic addressing
@@ -303,6 +302,12 @@ convenience alone.
     peers whose card names no relay.  Per-peer sessions are bounded at sixteen.
     A hint is a URL only, so a hinted `wss://` relay is verified against the
     WebPKI roots; a relay that needs a pin is reachable only from configuration.
+13. **Raw public keys, not certificates.**  The spike presented a self-signed
+    X.509 leaf whose SPKI was the node key and ignored everything else in it.
+    The endpoint now presents the SPKI itself (RFC 7250, 44 bytes), which is
+    the same rule with nothing to ignore, needs no certificate generation per
+    connection, and drops `rcgen` and `x509-parser` from the identity path.
+    Any other key, or an X.509 certificate, fails closed.
 
 ## Defects the spike found in itself
 
