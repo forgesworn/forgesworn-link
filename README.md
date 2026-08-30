@@ -25,12 +25,13 @@ it uses for Tor and HTTPS.
 ## Status
 
 The Phase 0 contract passed on loopback and on the open internet.  The
-real-network acceptance record is in [`acceptance/`](acceptance/): direct-path
-upgrades from a home NAT and from a commercial VPN egress to a public host, a
-direct LAN path, relay-only by choice, relay failover killed mid-transfer and
-recovered on the second relay in 258 ms, a UDP-blocked network falling back to
-the relay, flat memory across a four-times-larger transfer, and zero plaintext
-in a capture of a deliberately unencrypted relay hop.  What is still not proven
+real-network acceptance records are in [`acceptance/`](acceptance/): direct-path
+upgrades from a home NAT, from a venue NAT and from a commercial VPN egress to a
+public host, a direct LAN path, relay-only by choice, relay failover killed
+mid-transfer and recovered on the second relay in 258 ms (27 Aug) and 239 ms
+(30 Aug), a UDP-blocked network falling back to the relay, a same-key reconnect
+with no stall, flat memory across a four-times-larger transfer, and zero
+plaintext in two captures of a deliberately unencrypted relay hop.  What is still not proven
 is listed under [What this does NOT prove](#what-this-does-not-prove).
 
 ## Crates
@@ -193,9 +194,12 @@ as a no-go, not as a pass.
 
 ## What this does NOT prove
 
-The `acceptance/` runs cover a home NAT, a commercial VPN egress, a LAN pair, a
-UDP-blocked host and a mid-transfer relay failover, across macOS and Linux.
-They do not cover:
+The `acceptance/` runs cover a home NAT, a venue NAT, a commercial VPN egress,
+a LAN pair, a UDP-blocked host, a same-key reconnect and a mid-transfer relay
+failover, across macOS and Linux; the 30 August record re-ran the public-host
+rows on the current design (session-keyed probes, relay hints, raw public
+keys, one session per peer) and added the venue-NAT and reconnect rows.  They
+do not cover:
 
 - **Two hostile NATs at once.**  Every direct path proved so far is either
   inside one home LAN or to a host with a public address.  A direct hole-punch
@@ -216,7 +220,7 @@ They do not cover:
   so the LAN address that would have worked never reached the peer.  Every
   interface of the socket's family is offered now (`local_addresses`,
   loopback last, at most eight), and the row has not been re-run on a real
-  VPN since.
+  VPN since; the 30 August run had no VPN and no LAN peer to hand.
 
 ## Deviations from the spec
 
