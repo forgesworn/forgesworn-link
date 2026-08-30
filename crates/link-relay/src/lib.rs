@@ -397,10 +397,11 @@ async fn serve_session(
     rand::rngs::OsRng.fill_bytes(&mut token);
     let token_hex = hex_lower(&token);
     ws.send(binary(Frame::Welcome(token))).await?;
-    // Only the routing token and counters are logged.  Neither the node ID nor
-    // any tag is ever logged, and both leave memory with the session, spec 3.1
-    // and spec 9.
-    info!(token = %token_hex, source = %peer.ip(), "relay session up");
+    // Tokens and counters only in the journal, spec 3.1: no node ID, no tag,
+    // and no source address at info, so an operator running at info holds no
+    // address ledger.  The source stays visible at debug for local diagnosis.
+    info!(token = %token_hex, "relay session up");
+    debug!(token = %token_hex, source = %peer.ip(), "relay session source");
 
     let mut last_ping = Instant::now();
     let mut idle_check = tokio::time::interval(Duration::from_secs(5));

@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use link_core::id::NodeId;
 use link_core::rendezvous::{Tag, TagCase, derive_tag, epoch_index};
@@ -27,23 +28,35 @@ const EPOCH_WINDOW: [i64; 3] = [-1, 0, 1];
 
 pub struct TagBook {
     peers: Mutex<HashMap<NodeId, RendezvousPeer>>,
+    /// Bumped on every change, so the relay pump re-registers within its next
+    /// refresh tick instead of waiting for the epoch to turn.
+    version: AtomicU64,
 }
 
 impl TagBook {
     pub fn new(peers: HashMap<NodeId, RendezvousPeer>) -> Self {
         TagBook {
             peers: Mutex::new(peers),
+            version: AtomicU64::new(0),
         }
     }
 
-    /// Replace one pair's material, e.g. after a card rotation.  The next
-    /// registration refresh picks it up.
+    /// Replace one pair's material, e.g. after a card rotation.  The relay
+    /// registration follows within a minute; the three-epoch window covers the
+    /// seam.
     pub fn upsert(&self, peer: NodeId, material: RendezvousPeer) {
         self.peers.lock().expect("book").insert(peer, material);
+        self.version.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn remove(&self, peer: NodeId) {
         self.peers.lock().expect("book").remove(&peer);
+        self.version.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Monotone change counter; the relay pump re-registers when it moves.
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Relaxed)
     }
 
     pub fn is_empty(&self) -> bool {

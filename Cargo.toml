@@ -36,6 +36,7 @@ sha2 = "0.10"
 shelter-kit = { git = "https://github.com/forgesworn/shelter-kit", tag = "v0.1.1" }
 thiserror = "2"
 url = "2"
+webpki-roots = "0.26"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
 tokio-tungstenite = "0.24"
 tracing = "0.1"

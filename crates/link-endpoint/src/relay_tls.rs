@@ -1,9 +1,14 @@
-//! Client-side TLS for `wss://` relays.
+//! Client-side TLS for `wss://` relays, three modes by `RelaySpec`:
 //!
-//! The spike does not ship a root certificate store, so a relay leaf is either
-//! pinned by its SHA-256 fingerprint or, with an explicit development flag,
-//! accepted unchecked.  A deployed relay presents an ordinary WebPKI leaf and a
-//! product build would use the platform trust store here instead.
+//! * no pin, no flag -- ordinary WebPKI verification against the bundled
+//!   Mozilla roots (`webpki-roots`), the deployed default: a relay behind an
+//!   ordinary Let's Encrypt certificate just works, and renewal changes
+//!   nothing.  A platform trust store (`rustls-platform-verifier`) is the
+//!   planned upgrade when Android system roots and revocation matter.
+//! * `cert_sha256` -- the leaf pinned by fingerprint, for a relay that ships
+//!   no WebPKI name (the spike's mode).
+//! * `insecure_tls` -- any leaf accepted, development only, and it says so in
+//!   the logs.
 
 use std::sync::Arc;
 
@@ -16,22 +21,36 @@ use sha2::{Digest, Sha256};
 use crate::relay_client::RelaySpec;
 
 pub fn connector(spec: &RelaySpec) -> anyhow::Result<tokio_rustls::TlsConnector> {
-    let expected = match (&spec.cert_sha256, spec.insecure_tls) {
-        (Some(fingerprint), _) => Some(fingerprint.to_lowercase()),
-        (None, true) => {
-            tracing::warn!(relay = %spec.url, "accepting any relay certificate, development only");
-            None
-        }
-        (None, false) => anyhow::bail!(
-            "a wss:// relay needs --relay-cert-sha256 or --relay-insecure-tls in the spike"
-        ),
-    };
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut config = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(PinnedRelayVerifier { expected, provider }))
-        .with_no_client_auth();
+    let mut config = match (&spec.cert_sha256, spec.insecure_tls) {
+        (None, false) => {
+            // The deployed default: ordinary WebPKI verification, so a relay
+            // behind an ordinary renewing certificate needs no pin.
+            let mut roots = rustls::RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()?
+                .with_root_certificates(roots)
+                .with_no_client_auth()
+        }
+        (expected, insecure) => {
+            let expected = match (expected, insecure) {
+                (Some(fingerprint), _) => Some(fingerprint.to_lowercase()),
+                (None, _) => {
+                    tracing::warn!(relay = %spec.url, "accepting any relay certificate, development only");
+                    None
+                }
+            };
+            rustls::ClientConfig::builder_with_provider(provider.clone())
+                .with_safe_default_protocol_versions()?
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(PinnedRelayVerifier {
+                    expected,
+                    provider,
+                }))
+                .with_no_client_auth()
+        }
+    };
     config.alpn_protocols.clear();
     Ok(tokio_rustls::TlsConnector::from(Arc::new(config)))
 }
