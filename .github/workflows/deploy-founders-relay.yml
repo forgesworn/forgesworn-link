@@ -10,13 +10,10 @@
 # this workflow only assumes they exist.
 name: Deploy founders' relay
 
+# Deploys are a deliberate act: this workflow runs only when a person
+# dispatches it. A push trigger on main can be added once the relay has
+# been up for a while and the box owner wants automatic redeploys.
 on:
-  push:
-    branches: [main]
-    paths:
-      - "deploy/founders/**"
-      - "crates/link-relay/**"
-      - ".github/workflows/deploy-founders-relay.yml"
   workflow_dispatch:
 
 concurrency:
