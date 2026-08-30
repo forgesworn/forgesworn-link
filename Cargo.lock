@@ -2208,8 +2208,8 @@ dependencies = [
 
 [[package]]
 name = "shelter-kit"
-version = "0.1.1"
-source = "git+https://github.com/forgesworn/shelter-kit?tag=v0.1.1#8fa14660031215912644a84ad8b07c7349911eea"
+version = "0.1.2"
+source = "git+https://github.com/forgesworn/shelter-kit?tag=v0.1.2#a0dc1c1d4cade5432883cb4c6f95473faa0974f9"
 dependencies = [
  "axum",
  "base64",
