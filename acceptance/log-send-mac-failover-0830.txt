@@ -1,0 +1,17 @@
+2026-08-30T16:43:50.326999Z  INFO link_endpoint::relay_client: relay session up relay=wss://<pub-host>:7443/link
+2026-08-30T16:43:50.362012Z  INFO link_endpoint::endpoint: endpoint open node=ewk5olcuvfg56spxpgzfzsqt4hpamlsi53bda7twegtlqbnp67gq synthetic=[fd00:8822:1f93:f5eb:f967:2882:d0b7:cf46]:7 udp=0.0.0.0:50779 allow_direct=false
+2026-08-30T16:43:50.362091Z  INFO link_endpoint::endpoint: rendezvous ready, starting QUIC over the relay peer=pxiwp3j4nhb72qlyximzjecl3f3jfw7hx3xbivsrvelqeyl37uwa relay=wss://<pub-host>:7443/link
+2026-08-30T16:43:50.386762Z  INFO link_endpoint::session: path transition peer=pxiwp3j4nhb72qlyximzjecl3f3jfw7hx3xbivsrvelqeyl37uwa from=rendezvous to=relayed cause=QUIC handshake over relay ok relay="wss://<pub-host>:7443/link" direct="none"
+2026-08-30T16:43:50.386879Z  INFO link_endpoint::session: sending candidates on the control stream peer=pxiwp3j4nhb72qlyximzjecl3f3jfw7hx3xbivsrvelqeyl37uwa count=0 allow_direct=false
+{"event":"connected","path":{"cause":"QUIC handshake over relay ok","direct":null,"relay":"wss://<pub-host>:7443/link","since_ms":0,"status":"relayed"},"peer":"pxiwp3j4nhb72qlyximzjecl3f3jfw7hx3xbivsrvelqeyl37uwa"}
+{"status":"relayed","relay":"wss://<pub-host>:7443/link","direct":null,"since_ms":0,"cause":"QUIC handshake over relay ok"}
+2026-08-30T16:43:50.409937Z  INFO link_endpoint::session: peer candidates received peer=pxiwp3j4nhb72qlyximzjecl3f3jfw7hx3xbivsrvelqeyl37uwa count=7
+2026-08-30T16:43:55.439866Z  WARN link_endpoint::relay_client: relay session lost relay=wss://<pub-host>:7443/link
+2026-08-30T16:43:55.440073Z  INFO link_endpoint::session: path transition peer=pxiwp3j4nhb72qlyximzjecl3f3jfw7hx3xbivsrvelqeyl37uwa from=relayed to=reconnecting cause=relay session lost relay="none" direct="none"
+{"status":"reconnecting","relay":null,"direct":null,"since_ms":16,"cause":"relay session lost"}
+2026-08-30T16:43:55.679687Z  INFO link_endpoint::relay_client: relay session up relay=wss://<pub-host>:7444/link
+2026-08-30T16:43:55.679724Z  INFO link_endpoint::session: path transition peer=pxiwp3j4nhb72qlyximzjecl3f3jfw7hx3xbivsrvelqeyl37uwa from=reconnecting to=relayed cause=new relay welcome after 239 ms relay="wss://<pub-host>:7444/link" direct="none"
+{"status":"relayed","relay":"wss://<pub-host>:7444/link","direct":null,"since_ms":82,"cause":"new relay welcome after 239 ms"}
+sent_sha256 b6fdaba10b92d101a4906e130a34e51826429f81acf503647b4ea4ad16cbf342
+peer_sha256 b6fdaba10b92d101a4906e130a34e51826429f81acf503647b4ea4ad16cbf342
+{"bytes":100663296,"digest_match":true,"event":"final","path":{"cause":"new relay welcome after 239 ms","direct":null,"relay":"wss://<pub-host>:7444/link","since_ms":8234,"status":"relayed"}}
