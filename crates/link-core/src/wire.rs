@@ -5,6 +5,7 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
 use crate::card::to_ipv6;
 use crate::id::{NodeId, TransportKey};
+use crate::rendezvous::{TAG_BYTES, Tag};
 
 pub const RELAY_AUTH_DOMAIN: &[u8] = b"forgesworn-link/relay-auth/v1\0";
 pub const PROBE_DOMAIN: &[u8] = b"forgesworn-link/probe/v1\0";
@@ -60,6 +61,17 @@ pub const FRAME_PING: u8 = 0x20;
 pub const FRAME_PONG: u8 = 0x21;
 pub const FRAME_CLOSE: u8 = 0x7f;
 
+// Rendezvous-tag routing, spec section 9 / docs/RENDEZVOUS.md.  These frames
+// replace identity authentication and node-ID routing once the relay wire
+// change lands behind its version bump; until then the deployed relay speaks
+// the identity frames above.
+pub const FRAME_REGISTER: u8 = 0x04;
+pub const FRAME_SEND_TAG: u8 = 0x12;
+pub const FRAME_RECV_TAG: u8 = 0x13;
+/// A `Register` carries at most this many tags (a pair needs at most twelve
+/// during a card transition; this bounds a whole roster).
+pub const MAX_TAGS_PER_REGISTER: usize = 256;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Frame {
     Challenge([u8; 32]),
@@ -74,6 +86,22 @@ pub enum Frame {
     },
     Recv {
         source: NodeId,
+        datagram: Vec<u8>,
+    },
+    /// Register the session under pair-scoped rendezvous tags, spec section 9.
+    /// No identity and no signature: a tag is an unguessable capability.
+    Register {
+        tags: Vec<Tag>,
+    },
+    /// Route a datagram to whoever else registered this tag, spec section 9.
+    SendTag {
+        tag: Tag,
+        datagram: Vec<u8>,
+    },
+    /// A datagram delivered by tag, spec section 9.  The source is the tag;
+    /// the relay knows nothing else.
+    RecvTag {
+        tag: Tag,
         datagram: Vec<u8>,
     },
     Ping([u8; 8]),
@@ -98,6 +126,17 @@ impl Frame {
                 datagram,
             } => routed(FRAME_SEND, destination, datagram),
             Frame::Recv { source, datagram } => routed(FRAME_RECV, source, datagram),
+            Frame::Register { tags } => {
+                let mut out = Vec::with_capacity(1 + 2 + tags.len() * TAG_BYTES);
+                out.push(FRAME_REGISTER);
+                out.extend_from_slice(&(tags.len() as u16).to_be_bytes());
+                for tag in tags {
+                    out.extend_from_slice(&tag.0);
+                }
+                out
+            }
+            Frame::SendTag { tag, datagram } => routed_tag(FRAME_SEND_TAG, tag, datagram),
+            Frame::RecvTag { tag, datagram } => routed_tag(FRAME_RECV_TAG, tag, datagram),
             Frame::Ping(opaque) => one(FRAME_PING, opaque),
             Frame::Pong(opaque) => one(FRAME_PONG, opaque),
             Frame::Close(reason) => one(FRAME_CLOSE, &reason.to_be_bytes()),
@@ -132,6 +171,29 @@ impl Frame {
                     source: node_id,
                     datagram,
                 })
+            }
+            FRAME_REGISTER => {
+                if body.len() < 2 {
+                    return None;
+                }
+                let count = u16::from_be_bytes([body[0], body[1]]) as usize;
+                let rest = &body[2..];
+                if count == 0 || count > MAX_TAGS_PER_REGISTER || rest.len() != count * TAG_BYTES {
+                    return None;
+                }
+                // Length was checked above, so every 16-byte tag is whole.
+                let (chunks, _remainder) = rest.as_chunks::<TAG_BYTES>();
+                Some(Frame::Register {
+                    tags: chunks.iter().map(|chunk| Tag(*chunk)).collect(),
+                })
+            }
+            FRAME_SEND_TAG => {
+                let (tag, datagram) = split_routed_tag(body)?;
+                Some(Frame::SendTag { tag, datagram })
+            }
+            FRAME_RECV_TAG => {
+                let (tag, datagram) = split_routed_tag(body)?;
+                Some(Frame::RecvTag { tag, datagram })
             }
             FRAME_PING => Some(Frame::Ping(fixed(body)?)),
             FRAME_PONG => Some(Frame::Pong(fixed(body)?)),
@@ -169,6 +231,27 @@ fn split_routed(body: &[u8]) -> Option<(NodeId, Vec<u8>)> {
         return None;
     }
     Some((NodeId::from_slice(&body[..32])?, datagram.to_vec()))
+}
+
+fn routed_tag(frame: u8, tag: &Tag, datagram: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + TAG_BYTES + datagram.len());
+    out.push(frame);
+    out.extend_from_slice(&tag.0);
+    out.extend_from_slice(datagram);
+    out
+}
+
+fn split_routed_tag(body: &[u8]) -> Option<(Tag, Vec<u8>)> {
+    if body.len() <= TAG_BYTES {
+        return None;
+    }
+    let datagram = &body[TAG_BYTES..];
+    if datagram.len() > MAX_DATAGRAM {
+        return None;
+    }
+    let mut tag = [0u8; TAG_BYTES];
+    tag.copy_from_slice(&body[..TAG_BYTES]);
+    Some((Tag(tag), datagram.to_vec()))
 }
 
 // ---------------------------------------------------------------------------

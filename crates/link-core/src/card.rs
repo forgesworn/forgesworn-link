@@ -20,6 +20,10 @@ pub const HINT_RELAY: u8 = 0x01;
 pub const MAX_RELAY_HINT_BYTES: usize = 255;
 pub const HINT_UDP: u8 = 0x02;
 pub const HINT_ONION: u8 = 0x03;
+/// Ephemeral rendezvous key, spec section 9 / docs/RENDEZVOUS.md: a fresh
+/// 33-byte compressed secp256k1 public key, at most one per card.  Optional;
+/// a card carries it when the owner wants forward-secret rendezvous tags.
+pub const HINT_EPHEMERAL: u8 = 0x04;
 
 const HEADER_BYTES: usize = 62;
 const SIGNATURE_BYTES: usize = 64;
@@ -277,6 +281,17 @@ impl Card {
                 HINT_ONION if length != 58 => {
                     return Err(fail(3, "onion hint is not 58 bytes"));
                 }
+                HINT_EPHEMERAL => {
+                    if length != 33 {
+                        return Err(fail(3, "ephemeral hint is not 33 bytes"));
+                    }
+                    if !crate::rendezvous::valid_compressed_point(&bytes[value_start..value_end]) {
+                        return Err(fail(
+                            3,
+                            "ephemeral hint does not decompress to a curve point",
+                        ));
+                    }
+                }
                 _ => {}
             }
             hints.push(Hint {
@@ -287,6 +302,14 @@ impl Card {
         }
         if offset != hints_end {
             return Err(fail(3, "hints do not end exactly at the signature"));
+        }
+        if hints
+            .iter()
+            .filter(|hint| hint.kind == HINT_EPHEMERAL)
+            .count()
+            > 1
+        {
+            return Err(fail(3, "more than one ephemeral hint"));
         }
 
         // Rule 4: signature over the domain-prefixed body.
