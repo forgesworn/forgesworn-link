@@ -143,6 +143,8 @@ demo.  These are the only runs behind any claim in this repository.
 | Peak RSS, 8 MiB then 64 MiB in one process | 15,400,960 bytes then 17,235,968 bytes, growth 1,835,008 bytes, roughly 1.75 MiB for an eightfold larger transfer |
 | Release CLI, 256 MiB over a proved direct path | 7.1 s, digests matched on both sides |
 | Relay counters, 64 MiB relayed transfer | 58,259 frames in, 78,133,920 bytes, 584 dropped by the relay's 64-frame outbound bound; QUIC recovered all of them |
+| MTU 1452 against 1350, release CLI, 256 MiB direct, five runs each (F11 of the 30 Aug review) | 1452: 181.6 MiB/s mean (1.39-1.44 s); 1350: 173.4 MiB/s mean (1.43-1.52 s).  About 5% on loopback, and getting it means raising the relay frame bound too, with no path MTU discovery to protect a sub-1500 path.  Kept at 1350 |
+| Same key reconnecting, release CLI, 256 MiB, three `send` runs against one server | Before the supersede rule: 1.5 s, 22.5 s, 22.5 s.  After: all three under 3 s |
 | Flake hunt | Five concurrent runs of the whole suite: 5 of 5 passed.  Three serial runs with `--test-threads=1`: 3 of 3 passed.  Before the two defects above were fixed, the same five concurrent runs gave 0 of 5 |
 
 ## Running this on real machines
@@ -309,6 +311,14 @@ convenience alone.
     connection, and drops `rcgen` and `x509-parser` from the identity path.
     Any other key, or an X.509 certificate, fails closed.
 
+14. **A newer session from the same node supersedes the old one.**  Path state
+    is kept per peer, and a session that reconnected within the idle window
+    used to inherit the old session's direct proof, which pointed at the old
+    process's socket.  The slot is now taken at dial or accept time, before
+    the handshake: the old session fails once with `superseded` and is closed,
+    and the new session starts with clean path state.  `FailReason` gains
+    `Superseded`.
+
 ## Defects the spike found in itself
 
 Both were invisible in a quiet single run and showed up only when five copies of
@@ -337,6 +347,18 @@ the suite ran at once.  Both are spec lessons, not only code fixes.
    machine consumes it as an event stream; only the direct-path timers are still
    driven by the tick.  **The spec should say the relay transition is observed,
    not polled.**
+
+3. **Per-peer path state outlived the session that built it.**  Running the
+   release CLI three times with the *same* key against one serving endpoint
+   took 1.5 s, 22.5 s and 22.5 s for 256 MiB: the second and third `send`
+   inherited the first session's direct proof on the server, which pointed
+   at the first process's closed socket, and the server's replies went there
+   until the proof aged out.  With the first process still alive it was worse:
+   the handshake never completed.  The tests never saw it because every test
+   minted a fresh key per endpoint.  **The rule is now in the spec: one
+   session per peer, newest wins, and the slot is taken before the
+   handshake.**  Lesson: run the binary with the keys a real deployment would
+   reuse, not the keys a test finds convenient.
 
 ## Open problems
 

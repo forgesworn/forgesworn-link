@@ -21,7 +21,7 @@ use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, UdpPoller};
 use rand::RngCore;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tracing::{debug, trace};
 
 use crate::relay_client::{QueueOutcome, RelayDriver, RelayInbound, RelaySpec};
@@ -79,9 +79,19 @@ struct Peer {
     driver: Option<u64>,
 }
 
+/// The live session for a peer and the handle that tells it when a newer
+/// session from the same node takes over.
+struct SessionSlot {
+    id: u64,
+    superseded: Arc<Notify>,
+}
+
 #[derive(Default)]
 struct Inner {
     peers: HashMap<NodeId, Peer>,
+    /// One live session per peer, spec 4.3: the newest wins.
+    sessions: HashMap<NodeId, SessionSlot>,
+    next_session: u64,
     by_synthetic: HashMap<SocketAddr, NodeId>,
     by_direct: HashMap<SocketAddr, NodeId>,
     /// Which peer's session a probe key id belongs to.
@@ -187,13 +197,72 @@ impl Paths {
             .and_then(|p| p.direct)
     }
 
-    /// Forget the direct path, which puts the peer back on the relay.
-    pub fn drop_direct(&self, peer: NodeId) {
+    /// Forget the direct path, which puts the peer back on the relay.  Only
+    /// the peer's current session may do this: a superseded session that
+    /// lost its proof must not take the new session's proof with it.
+    pub fn drop_direct(&self, peer: NodeId, session: u64) {
         let mut inner = self.inner.lock().expect("paths");
+        if inner
+            .sessions
+            .get(&peer)
+            .is_none_or(|slot| slot.id != session)
+        {
+            return;
+        }
         if let Some(entry) = inner.peers.get_mut(&peer)
             && let Some(proven) = entry.direct.take()
         {
             inner.by_direct.remove(&proven.addr);
+        }
+    }
+
+    /// Register a new session with `peer` as the one live session, spec 4.3.
+    /// A previous session, if still alive, is told it was superseded; either
+    /// way the peer's path state (candidates, learnt addresses, pending
+    /// probes, the direct proof) starts clean, because a proof an earlier
+    /// session built points at a socket the new one does not own.  Returns the session's id and the
+    /// handle a later takeover will signal.
+    pub fn begin_session(&self, peer: NodeId) -> (u64, Arc<Notify>) {
+        let mut inner = self.inner.lock().expect("paths");
+        let id = inner.next_session;
+        inner.next_session += 1;
+        let superseded = Arc::new(Notify::new());
+        let slot = SessionSlot {
+            id,
+            superseded: superseded.clone(),
+        };
+        if let Some(previous) = inner.sessions.insert(peer, slot) {
+            previous.superseded.notify_one();
+        }
+        // A new session never inherits path state, whether or not an older
+        // session is still alive: after a clean close the proof of the old
+        // socket stays fresh for 15 s, and handshake replies routed by it go
+        // to a socket nobody owns.  Measured with the release CLI: a
+        // reconnect's handshake took 21 s instead of milliseconds.
+        let stale = inner.peers.get_mut(&peer).and_then(|entry| {
+            entry.candidates.clear();
+            entry.learned.clear();
+            entry.pending.clear();
+            entry.last_ping.clear();
+            entry.last_pong.clear();
+            entry.direct.take()
+        });
+        if let Some(proven) = stale {
+            inner.by_direct.remove(&proven.addr);
+        }
+        (id, superseded)
+    }
+
+    /// A session ended on its own; if it was still the live one, the slot is
+    /// freed so nothing is left to supersede.
+    pub fn end_session(&self, peer: NodeId, session: u64) {
+        let mut inner = self.inner.lock().expect("paths");
+        if inner
+            .sessions
+            .get(&peer)
+            .is_some_and(|slot| slot.id == session)
+        {
+            inner.sessions.remove(&peer);
         }
     }
 

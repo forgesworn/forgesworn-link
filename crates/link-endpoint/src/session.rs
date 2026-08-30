@@ -11,9 +11,9 @@ use link_core::card::{Hint, to_ipv6};
 use link_core::id::NodeId;
 use link_core::path::{FailReason, PathReport, PathStatus};
 use link_core::wire::{PROBE_EXPORT_BYTES, PROBE_EXPORT_LABEL, PROBE_ID_BYTES, PROBE_KEY_BYTES};
+use quinn::VarInt;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::broadcast;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, broadcast, mpsc};
 use tracing::{info, warn};
 
 use crate::path_socket::{DIRECT_FRESH, Paths};
@@ -99,6 +99,10 @@ pub(crate) struct SessionInner {
     punch_requests: AtomicU32,
     /// The probe key id this session registered, to forget when it ends.
     probe_key_id: Option<[u8; PROBE_ID_BYTES]>,
+    /// This session's id in the path socket's per-peer slot, spec 4.3.
+    session_id: u64,
+    /// Signalled when a newer session from the same node takes over.
+    superseded: Arc<Notify>,
 }
 
 impl SessionInner {
@@ -167,6 +171,8 @@ impl Session {
         paths: Arc<Paths>,
         allow_direct: bool,
         probe_delay: Duration,
+        session_id: u64,
+        superseded: Arc<Notify>,
     ) -> Session {
         let relay = match paths.relay_for(peer).status() {
             RelayStatus::Up(url) => Some(url),
@@ -210,6 +216,8 @@ impl Session {
             control_tx,
             punch_requests: AtomicU32::new(0),
             probe_key_id,
+            session_id,
+            superseded,
             report: Mutex::new(initial.clone()),
             history: Mutex::new(vec![initial]),
         });
@@ -510,11 +518,26 @@ async fn drive(inner: Arc<SessionInner>, probe_delay: Duration) {
     loop {
         let mut relay_event = None;
         tokio::select! {
+            _ = inner.superseded.notified() => {
+                // A newer session from the same node took the slot, spec 4.3.
+                // Close this one rather than let it linger until the idle
+                // timeout with path state that no longer belongs to it.
+                if let Some(key_id) = inner.probe_key_id {
+                    inner.paths.unregister_probe_key(key_id);
+                }
+                inner.transition(
+                    PathStatus::Failed(FailReason::Superseded),
+                    "superseded by a newer session from the same node",
+                );
+                inner.conn.close(VarInt::from_u32(2), b"superseded");
+                return;
+            }
             reason = inner.conn.closed() => {
                 // The probe key dies with the session, spec 4.2.
                 if let Some(key_id) = inner.probe_key_id {
                     inner.paths.unregister_probe_key(key_id);
                 }
+                inner.paths.end_session(inner.peer, inner.session_id);
                 let status = inner.status();
                 if !matches!(status, PathStatus::Failed(_)) {
                     match reason {
@@ -696,7 +719,7 @@ async fn drive(inner: Arc<SessionInner>, probe_delay: Duration) {
                         }
                     }
                     _ => {
-                        inner.paths.drop_direct(inner.peer);
+                        inner.paths.drop_direct(inner.peer, inner.session_id);
                         next_probe_attempt = Instant::now() + PROBE_COOLDOWN;
                         inner.transition(
                             PathStatus::Relayed,
