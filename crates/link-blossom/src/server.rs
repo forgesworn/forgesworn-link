@@ -12,7 +12,7 @@ use link_endpoint::{Endpoint, Session, Stream};
 use tracing::{debug, warn};
 
 use crate::source::{BlobBytes, BlobSource};
-use crate::wire::{CHUNK, REQUEST_LEN, Request, ResponseHeader};
+use crate::wire::{CHUNK, REQUEST_LEN, Request, ResponseHeader, WireError};
 
 /// Accept sessions on `endpoint` and answer blob requests from `source`.
 ///
@@ -61,7 +61,25 @@ async fn serve_session<S: BlobSource>(session: Arc<Session>, source: Arc<S>) {
 async fn answer<S: BlobSource>(mut stream: Stream, source: &S) -> anyhow::Result<()> {
     let mut request = [0u8; REQUEST_LEN];
     stream.recv.read_exact(&mut request).await?;
-    let request = Request::decode(&request)?;
+    let request = match Request::decode(&request) {
+        Ok(request) => request,
+        Err(WireError::BadVersion(version)) => {
+            // A future-version request gets a defined answer on the wire, not a
+            // silent stream reset, so a newer peer can tell "too new" from
+            // "broken".  Bad magic stays a reset: that is garbage, not a version.
+            stream
+                .send
+                .write_all(&ResponseHeader::UnsupportedVersion.encode())
+                .await?;
+            stream.send.finish()?;
+            debug!(
+                version,
+                "link-blossom refused an unsupported request version"
+            );
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
     let sha256 = hex::encode(request.sha256);
 
     match source.get(&sha256).await {
