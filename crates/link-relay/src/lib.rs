@@ -48,6 +48,11 @@ pub struct RelayConfig {
     /// Cap on concurrent sessions, counted from accept so unauthenticated
     /// handshakes cannot slip under it.
     pub max_sessions: usize,
+    /// Cap on concurrent sessions from one source address, counted the same
+    /// way.  Zero means no per-source cap.  A tag session presents no identity
+    /// (spec 9), so without this one address could hold every slot; the
+    /// rendezvous section makes the cap a MUST.
+    pub max_sessions_per_source: usize,
     /// Reflector replies per source address per second.
     pub reflector_per_second: f64,
 }
@@ -95,6 +100,7 @@ impl Default for RelayConfig {
             tls: None,
             bytes_per_second: 0,
             max_sessions: 1024,
+            max_sessions_per_source: 16,
             reflector_per_second: 20.0,
         }
     }
@@ -136,6 +142,10 @@ struct Registry {
     /// Connections currently inside `serve_session`, both modes, counted from
     /// accept so unauthenticated handshakes cannot slip under the cap.
     live: usize,
+    /// Live connections per source address, for the per-source cap.  An
+    /// entry leaves the map when its count reaches zero, so the map never
+    /// grows with the history of addresses seen.
+    by_source: HashMap<IpAddr, usize>,
 }
 
 type Shared = Arc<Mutex<Registry>>;
@@ -178,6 +188,7 @@ pub async fn start(config: RelayConfig) -> anyhow::Result<RelayHandle> {
                         continue;
                     }
                 };
+                let source_ip = peer.ip();
                 {
                     let mut guard = registry.lock().expect("registry");
                     if guard.live >= config.max_sessions {
@@ -187,6 +198,20 @@ pub async fn start(config: RelayConfig) -> anyhow::Result<RelayHandle> {
                         );
                         continue;
                     }
+                    let from_source = guard.by_source.get(&source_ip).copied().unwrap_or(0);
+                    if config.max_sessions_per_source > 0
+                        && from_source >= config.max_sessions_per_source
+                    {
+                        // Refused before any frame, so it costs the relay a
+                        // TCP accept and nothing else.  The address is not
+                        // logged: it is the one thing a tag-mode relay holds.
+                        debug!(
+                            from_source,
+                            "relay at per-source session cap, dropping connection"
+                        );
+                        continue;
+                    }
+                    *guard.by_source.entry(source_ip).or_insert(0) += 1;
                     guard.live += 1;
                 }
                 let registry = registry.clone();
@@ -200,7 +225,14 @@ pub async fn start(config: RelayConfig) -> anyhow::Result<RelayHandle> {
                     {
                         debug!(error = %e, "relay session ended");
                     }
-                    registry.lock().expect("registry").live -= 1;
+                    let mut guard = registry.lock().expect("registry");
+                    guard.live -= 1;
+                    if let Some(count) = guard.by_source.get_mut(&source_ip) {
+                        *count -= 1;
+                        if *count == 0 {
+                            guard.by_source.remove(&source_ip);
+                        }
+                    }
                 });
             }
         });

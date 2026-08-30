@@ -22,6 +22,7 @@ async fn start_relay() -> RelayHandle {
         tls: None,
         bytes_per_second: 0,
         max_sessions: 16,
+        max_sessions_per_source: 16,
         reflector_per_second: 100.0,
     })
     .await

@@ -100,7 +100,9 @@ To watch relay failover, start a second relay and pass `--relay` twice in the
 same order on both sides, then kill the first relay mid-transfer.
 
 Useful flags on `link-relay`: `--bytes-per-second` for the operator's per-session
-budget, `--max-sessions`, `--reflector-per-second`.  Without `--insecure-ws` the
+budget, `--max-sessions`, `--sessions-per-source` (default 16; a tag session
+presents no identity, so this is what stops one address holding every slot),
+`--reflector-per-second`.  Without `--insecure-ws` the
 relay generates a self-signed leaf and prints its SHA-256; a client then needs
 `--relay-cert-sha256 <hex>` or, for development only, `--relay-insecure-tls`.
 

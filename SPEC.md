@@ -179,8 +179,11 @@ ForgeSworn-operated instance and still work.
   with no session is dropped silently, which QUIC treats as loss.
 - **Bounds.**  Per session: at most 64 queued outbound frames, a per-second
   byte budget the operator sets, and idle close after 90 seconds without a
-  ping.  Per relay: a cap on concurrent sessions.  Oversize or malformed frames
-  close the session with reason `1`.
+  ping.  Per relay: a cap on concurrent sessions, and a cap on concurrent
+  sessions per source address, both counted from accept so an unauthenticated
+  handshake cannot slip under them; a tag session (section 9) presents no
+  identity, so the per-source cap is what stops one address holding every
+  slot.  Oversize or malformed frames close the session with reason `1`.
 - **What the relay learns.**  Node IDs of registered endpoints and who they
   talk to, source IP addresses of WSS sessions, timing and byte counts.  It
   must log only routing tokens and counters, and must not persist node IDs past
