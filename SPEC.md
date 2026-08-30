@@ -184,6 +184,14 @@ ForgeSworn-operated instance and still work.
   handshake cannot slip under them; a tag session (section 9) presents no
   identity, so the per-source cap is what stops one address holding every
   slot.  Oversize or malformed frames close the session with reason `1`.
+- **Superseded sessions.**  A node ID is registered by at most one identity
+  session and a tag by at most two tag sessions (the two ends of one pair).
+  A newer registration wins: the relay sends the oldest holder `close` with
+  reason `2` and ends that session, so a node that reconnected before its
+  previous session died is not left with a dead route, and nothing is
+  silently replaced.  A client that receives reason `2` waits 30 seconds
+  before it reconnects, because two live instances of one node ID would
+  otherwise supersede each other in a loop.
 - **What the relay learns.**  Node IDs of registered endpoints and who they
   talk to, source IP addresses of WSS sessions, timing and byte counts.  It
   must log only routing tokens and counters, and must not persist node IDs past
@@ -416,8 +424,6 @@ Open problems the spike surfaced, to settle before Phase 1:
   (Wi-Fi to mobile on a phone) is the first real-network case expected to
   break; the state machine needs a re-announce and re-probe rule.
 - The reflector reply is unauthenticated and not matched to its nonce.
-- Duplicate relay registration for a node ID silently replaces the earlier
-  session; decide whether that is the rule.
 - Card serials come from the wall clock in the spike; a node must persist its
   highest issued serial or a clock step can reissue a stale one.
 - `wss://` relay TLS in the spike pins a leaf fingerprint because it ships no

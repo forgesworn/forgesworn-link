@@ -18,6 +18,10 @@ pub const MAX_QUEUED_FRAMES: usize = 64;
 pub const IDLE_CLOSE_SECONDS: u64 = 90;
 /// Close reason for an oversize or malformed frame, spec 3.1.
 pub const CLOSE_REASON_MALFORMED: u16 = 1;
+/// Close reason when a newer session registered the same node ID (identity
+/// mode) or a third session registered a tag (tag mode) and this one, the
+/// oldest, was evicted, spec 3.1.  A client backs off before reconnecting.
+pub const CLOSE_REASON_SUPERSEDED: u16 = 2;
 
 // ---------------------------------------------------------------------------
 // Relay auth, spec 3.1

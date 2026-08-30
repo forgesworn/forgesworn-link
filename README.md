@@ -332,9 +332,6 @@ the suite ran at once.  Both are spec lessons, not only code fixes.
 - **Inbound queue overflow is silent.**  The path socket's inbound queue is 512
   datagrams; a full queue drops, which QUIC treats as loss.  There is no counter
   for it, so a saturated receiver looks like a lossy network.
-- **The relay replaces a duplicate registration silently.**  Two sessions
-  authenticating as the same node ID leave the newest registered and the oldest
-  with a dead route.  The spec does not say what should happen.
 - **Card serials come from the wall clock.**  `Endpoint::card` seeds the serial
   from Unix seconds and increments.  A clock that goes backwards across a
   restart produces a card that a verifier will reject under rule 8, correctly

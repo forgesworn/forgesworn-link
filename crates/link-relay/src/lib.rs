@@ -19,8 +19,8 @@ use futures_util::{SinkExt, StreamExt};
 use link_core::id::NodeId;
 use link_core::rendezvous::Tag;
 use link_core::wire::{
-    CLOSE_REASON_MALFORMED, Frame, IDLE_CLOSE_SECONDS, MAX_QUEUED_FRAMES, REFLECT_REQUEST_BYTES,
-    parse_reflect_request, reflect_reply, verify_relay_auth,
+    CLOSE_REASON_MALFORMED, CLOSE_REASON_SUPERSEDED, Frame, IDLE_CLOSE_SECONDS, MAX_QUEUED_FRAMES,
+    REFLECT_REQUEST_BYTES, parse_reflect_request, reflect_reply, verify_relay_auth,
 };
 use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -362,9 +362,26 @@ fn register_tags(
         let entries = guard.tags.entry(*tag).or_default();
         if !entries.iter().any(|(id, _)| *id == session_id) {
             entries.push((session_id, tx.clone()));
+            // A tag has two ends.  A third registrant is either an end that
+            // reconnected before its old session died, or someone else who
+            // holds the tag; in both cases the oldest session is the one to
+            // go, and it is told why.
+            while entries.len() > TAG_ENDS {
+                let oldest = entries
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, (id, _))| *id)
+                    .map(|(index, _)| index)
+                    .expect("more than two entries");
+                let (_, evicted) = entries.remove(oldest);
+                let _ = evicted.try_send(Frame::Close(CLOSE_REASON_SUPERSEDED));
+            }
         }
     }
 }
+
+/// A rendezvous tag names one pair, so at most two sessions hold it.
+const TAG_ENDS: usize = 2;
 
 async fn serve_session(
     stream: TcpStream,
@@ -408,11 +425,18 @@ async fn serve_session(
                 let _ = ws.send(binary(Frame::Close(CLOSE_REASON_MALFORMED))).await;
                 anyhow::bail!("auth signature refused");
             }
-            registry
+            if let Some(previous) = registry
                 .lock()
                 .expect("registry")
                 .sessions
-                .insert(node_id, tx.clone());
+                .insert(node_id, tx.clone())
+            {
+                // Newest wins.  The old session is told why, so a node that
+                // reconnected before its old session died does not leave a
+                // dead route behind, and a node that was replaced knows to
+                // back off rather than fight for the slot.
+                let _ = previous.try_send(Frame::Close(CLOSE_REASON_SUPERSEDED));
+            }
             Mode::Identity(node_id)
         }
         Some(Frame::Register { tags }) => {
@@ -460,7 +484,14 @@ async fn serve_session(
                 match outbound {
                     Some(frame) => {
                         frames_out += 1;
+                        let closing = matches!(frame, Frame::Close(_));
                         ws.send(binary(frame)).await?;
+                        if closing {
+                            // A queued Close means a newer registration
+                            // superseded this session; the frame said why and
+                            // there is nothing left to route.
+                            break Err(anyhow::anyhow!("superseded"));
+                        }
                     }
                     None => break Ok(()),
                 }

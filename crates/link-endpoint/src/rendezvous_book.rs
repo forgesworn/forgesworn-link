@@ -31,13 +31,28 @@ pub struct TagBook {
     /// Bumped on every change, so the relay pump re-registers within its next
     /// refresh tick instead of waiting for the epoch to turn.
     version: AtomicU64,
+    /// Send tags by (peer, epoch) for the relay host the session is on, so a
+    /// datagram costs a hash lookup rather than an HKDF.  Cleared whenever
+    /// the material changes or the session moves to another relay.
+    send_cache: Mutex<SendCache>,
 }
+
+#[derive(Default)]
+struct SendCache {
+    host: String,
+    tags: HashMap<(NodeId, u64), Tag>,
+}
+
+/// Bound on cached send tags: a roster of pairs times a few epochs.  Past it
+/// the cache is simply cleared and refilled.
+const SEND_CACHE_CAP: usize = 4096;
 
 impl TagBook {
     pub fn new(peers: HashMap<NodeId, RendezvousPeer>) -> Self {
         TagBook {
             peers: Mutex::new(peers),
             version: AtomicU64::new(0),
+            send_cache: Mutex::new(SendCache::default()),
         }
     }
 
@@ -47,11 +62,18 @@ impl TagBook {
     pub fn upsert(&self, peer: NodeId, material: RendezvousPeer) {
         self.peers.lock().expect("book").insert(peer, material);
         self.version.fetch_add(1, Ordering::Relaxed);
+        self.send_cache.lock().expect("send cache").tags.clear();
     }
 
     pub fn remove(&self, peer: NodeId) {
         self.peers.lock().expect("book").remove(&peer);
         self.version.fetch_add(1, Ordering::Relaxed);
+        self.send_cache.lock().expect("send cache").tags.clear();
+    }
+
+    /// How many send tags are cached right now.
+    pub fn cache_len(&self) -> usize {
+        self.send_cache.lock().expect("send cache").tags.len()
     }
 
     /// Monotone change counter; the relay pump re-registers when it moves.
@@ -91,17 +113,36 @@ impl TagBook {
         tags
     }
 
-    /// The current-epoch tag for an outbound datagram to `peer`.
+    /// The current-epoch tag for an outbound datagram to `peer`.  Derived once
+    /// per (peer, relay, epoch) and served from the cache after that.
     pub fn tag_for_send(&self, peer: NodeId, relay_host: &str, now_unix: u64) -> Option<Tag> {
-        let peers = self.peers.lock().expect("book");
-        let material = peers.get(&peer)?;
-        Some(derive_tag(
-            material.case,
-            &material.static_x,
-            &material.eph_x,
-            relay_host,
-            epoch_index(now_unix),
-        ))
+        let epoch = epoch_index(now_unix);
+        let mut cache = self.send_cache.lock().expect("send cache");
+        if cache.host != relay_host {
+            // A failover moved the session to another relay: every tag
+            // changes with the host, so the cache starts again.
+            cache.host = relay_host.to_owned();
+            cache.tags.clear();
+        }
+        if let Some(tag) = cache.tags.get(&(peer, epoch)) {
+            return Some(*tag);
+        }
+        let tag = {
+            let peers = self.peers.lock().expect("book");
+            let material = peers.get(&peer)?;
+            derive_tag(
+                material.case,
+                &material.static_x,
+                &material.eph_x,
+                relay_host,
+                epoch,
+            )
+        };
+        if cache.tags.len() >= SEND_CACHE_CAP {
+            cache.tags.clear();
+        }
+        cache.tags.insert((peer, epoch), tag);
+        Some(tag)
     }
 
     /// Attribute an inbound tag to its pair, over the same three-epoch window
@@ -173,5 +214,30 @@ mod tests {
         // And the same pair on another relay derives a different tag.
         let elsewhere = book.tag_for_send(peer, "relay2.example.net", now).unwrap();
         assert_ne!(tag, elsewhere);
+    }
+
+    /// A send tag is derived once per (peer, relay, epoch) and reused for
+    /// every datagram until the material changes.
+    #[test]
+    fn send_tags_are_cached_until_the_material_changes() {
+        let peer = node(4);
+        let book = TagBook::new(HashMap::from([(peer, material(40))]));
+        let now = 1_793_588_888;
+        let first = book.tag_for_send(peer, "relay.example.org", now).unwrap();
+        assert_eq!(book.cache_len(), 1);
+        assert_eq!(
+            book.tag_for_send(peer, "relay.example.org", now + 5)
+                .unwrap(),
+            first,
+            "same epoch, same tag"
+        );
+        assert_eq!(book.cache_len(), 1, "same epoch, same entry");
+        book.upsert(peer, material(41));
+        assert_eq!(book.cache_len(), 0, "an upsert clears the cache");
+        assert_ne!(
+            book.tag_for_send(peer, "relay.example.org", now).unwrap(),
+            first,
+            "new material, new tag"
+        );
     }
 }
