@@ -1,0 +1,46 @@
+{
+  "format": "forgesworn-link-fsl-scheme-vectors-1",
+  "note": "Node id: canonical lowercase base32, 52 chars, zero pad bits. Digest: canonical lowercase hex, 64 chars. accept=false entries MUST be rejected.",
+  "cases": [
+    {
+      "name": "valid",
+      "url": "fsl://ugq2dinbugq2dinbugq2dinbugq2dinbugq2dinbugq2dinbugqq/4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d",
+      "accept": true,
+      "nodeIdHex": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+      "sha256Hex": "4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d"
+    },
+    {
+      "name": "valid-with-extension",
+      "url": "fsl://ugq2dinbugq2dinbugq2dinbugq2dinbugq2dinbugq2dinbugqq/4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d.bin",
+      "accept": true,
+      "nodeIdHex": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+      "sha256Hex": "4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d"
+    },
+    {
+      "name": "uppercase-digest",
+      "url": "fsl://ugq2dinbugq2dinbugq2dinbugq2dinbugq2dinbugq2dinbugqq/4D4D4D4D4D4D4D4D4D4D4D4D4D4D4D4D4D4D4D4D4D4D4D4D4D4D4D4D4D4D4D4D",
+      "accept": false
+    },
+    {
+      "name": "short-digest",
+      "url": "fsl://ugq2dinbugq2dinbugq2dinbugq2dinbugq2dinbugq2dinbugqq/4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d",
+      "accept": false
+    },
+    {
+      "name": "non-canonical-node-pad-bits",
+      "url": "fsl://ugq2dinbugq2dinbugq2dinbugq2dinbugq2dinbugq2dinbugqr/4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d",
+      "accept": false
+    },
+    {
+      "name": "short-node",
+      "url": "fsl://ugq2dinbugq2dinbugq2dinbugq2dinbugq2dinbugq2dinbugq/4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d",
+      "accept": false
+    },
+    {
+      "name": "wrong-scheme-is-unsupported-not-broken",
+      "url": "https://example.org/4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d",
+      "accept": false,
+      "unsupported": true
+    }
+  ]
+}

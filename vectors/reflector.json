@@ -1,0 +1,26 @@
+{
+  "format": "forgesworn-link-reflector-vectors-1",
+  "note": "A reply MUST echo the nonce of the node’s own outstanding request or be dropped.",
+  "request": {
+    "nonceHex": "9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e",
+    "bytesHex": "46534c52019e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e"
+  },
+  "reply": {
+    "observed": "192.0.2.7:4242",
+    "bytesHex": "46534c52029e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e00000000000000000000ffffc00002071092"
+  },
+  "hostile": [
+    {
+      "name": "request-short",
+      "bytesHex": "46534c52019e9e9e9e9e9e9e9e9e9e9e9e9e9e9e"
+    },
+    {
+      "name": "request-bad-magic",
+      "bytesHex": "58534c52019e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e"
+    },
+    {
+      "name": "reply-bad-kind",
+      "bytesHex": "46534c52039e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e00000000000000000000ffffc00002071092"
+    }
+  ]
+}

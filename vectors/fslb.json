@@ -1,0 +1,60 @@
+{
+  "format": "forgesworn-link-fslb-vectors-1",
+  "note": "Request is fixed 37 bytes. Status 0x03 answers a version the server does not speak; bad magic is a stream reset, not a status.",
+  "request": {
+    "sha256Hex": "3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d",
+    "bytesHex": "46534c42013d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d"
+  },
+  "responses": [
+    {
+      "name": "ok-with-content-type",
+      "size": 5242880,
+      "contentType": "application/octet-stream",
+      "bytesHex": "00000000000050000000186170706c69636174696f6e2f6f637465742d73747265616d"
+    },
+    {
+      "name": "ok-no-content-type",
+      "size": 1,
+      "bytesHex": "0000000000000000010000"
+    },
+    {
+      "name": "not-found",
+      "bytesHex": "01"
+    },
+    {
+      "name": "error",
+      "bytesHex": "02"
+    },
+    {
+      "name": "unsupported-version",
+      "bytesHex": "03"
+    }
+  ],
+  "hostile": [
+    {
+      "name": "request-bad-magic",
+      "bytesHex": "58534c42013d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d"
+    },
+    {
+      "name": "request-future-version",
+      "note": "a server answers status 0x03, not a reset",
+      "bytesHex": "46534c42023d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d"
+    },
+    {
+      "name": "request-short",
+      "bytesHex": "46534c42013d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d"
+    },
+    {
+      "name": "response-bad-status",
+      "bytesHex": "09"
+    },
+    {
+      "name": "response-content-type-too-long",
+      "bytesHex": "000000000000000001012c"
+    },
+    {
+      "name": "response-truncated-content-type",
+      "bytesHex": "000000000000000001000a746578742f706c61"
+    }
+  ]
+}

@@ -329,4 +329,42 @@ mod tests {
             Err(FetchError::UnsupportedSource)
         ));
     }
+
+    /// The frozen scheme vectors, vectors/fsl-scheme.json: every accepted case
+    /// yields the stated node id and digest, every rejected case fails, and a
+    /// foreign scheme is UnsupportedSource so a dispatcher tries the next lane.
+    #[test]
+    fn the_frozen_scheme_vectors_hold() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../vectors/fsl-scheme.json");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let v: serde_json::Value = serde_json::from_str(&text).expect("json");
+        for case in v["cases"].as_array().expect("cases") {
+            let name = case["name"].as_str().unwrap();
+            let url = Url::parse(case["url"].as_str().unwrap())
+                .unwrap_or_else(|e| panic!("{name}: url parses: {e}"));
+            let outcome = parse_fsl_source(&url);
+            if case["accept"].as_bool() == Some(true) {
+                let (node, sha256) = outcome.unwrap_or_else(|e| panic!("{name}: accepts: {e}"));
+                assert_eq!(
+                    hex::encode(node.as_bytes()),
+                    case["nodeIdHex"].as_str().unwrap(),
+                    "{name}"
+                );
+                assert_eq!(
+                    hex::encode(sha256),
+                    case["sha256Hex"].as_str().unwrap(),
+                    "{name}"
+                );
+            } else if case["unsupported"].as_bool() == Some(true) {
+                assert!(
+                    matches!(outcome, Err(FetchError::UnsupportedSource)),
+                    "{name}"
+                );
+            } else {
+                assert!(matches!(outcome, Err(FetchError::Unreachable(_))), "{name}");
+            }
+        }
+    }
 }
