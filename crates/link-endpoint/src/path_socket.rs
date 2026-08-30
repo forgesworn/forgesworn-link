@@ -353,13 +353,14 @@ pub async fn build(
     key: TransportKey,
     bind: SocketAddr,
     relays: Vec<crate::relay_client::RelaySpec>,
+    book: Option<Arc<crate::rendezvous_book::TagBook>>,
 ) -> io::Result<(Arc<PathSocket>, Arc<Paths>)> {
     let udp = Arc::new(UdpSocket::bind(bind).await?);
     let udp_local = udp.local_addr()?;
     let (inbound_tx, inbound_rx) = mpsc::channel::<Inbound>(INBOUND_CAPACITY);
     let (relay_inbound_tx, mut relay_inbound_rx) =
         mpsc::channel::<(NodeId, Vec<u8>)>(INBOUND_CAPACITY);
-    let relay = crate::relay_client::spawn(key.clone(), relays, relay_inbound_tx);
+    let relay = crate::relay_client::spawn(key.clone(), relays, relay_inbound_tx, book);
 
     let local_synthetic = key.node_id().synthetic_addr();
     let paths = Arc::new(Paths {

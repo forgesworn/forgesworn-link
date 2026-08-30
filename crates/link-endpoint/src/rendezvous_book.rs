@@ -1,0 +1,164 @@
+//! The endpoint's side of tag-mode rendezvous, spec section 9.
+//!
+//! The shell computes the ECDH x-coordinates from the pair's cards and Nostr
+//! keys and hands them over as opaque bytes; the transport never touches
+//! Nostr.  From that material the book derives, per relay host, the tags to
+//! register (previous, current and next epoch, so clock skew in either
+//! direction cannot drop a pair at an epoch boundary), the tag to send with,
+//! and the peer an inbound tag belongs to.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use link_core::id::NodeId;
+use link_core::rendezvous::{Tag, TagCase, derive_tag, epoch_index};
+
+/// One pair's rendezvous material, as computed by the shell from the current
+/// cards.  `eph_x` is 32 zero bytes for `TagCase::None`.
+#[derive(Clone, Copy, Debug)]
+pub struct RendezvousPeer {
+    pub case: TagCase,
+    pub static_x: [u8; 32],
+    pub eph_x: [u8; 32],
+}
+
+/// The registration window: previous, current and next epoch.
+const EPOCH_WINDOW: [i64; 3] = [-1, 0, 1];
+
+pub struct TagBook {
+    peers: Mutex<HashMap<NodeId, RendezvousPeer>>,
+}
+
+impl TagBook {
+    pub fn new(peers: HashMap<NodeId, RendezvousPeer>) -> Self {
+        TagBook {
+            peers: Mutex::new(peers),
+        }
+    }
+
+    /// Replace one pair's material, e.g. after a card rotation.  The next
+    /// registration refresh picks it up.
+    pub fn upsert(&self, peer: NodeId, material: RendezvousPeer) {
+        self.peers.lock().expect("book").insert(peer, material);
+    }
+
+    pub fn remove(&self, peer: NodeId) {
+        self.peers.lock().expect("book").remove(&peer);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.peers.lock().expect("book").is_empty()
+    }
+
+    fn window(&self, now_unix: u64) -> Vec<u64> {
+        let current = epoch_index(now_unix);
+        EPOCH_WINDOW
+            .iter()
+            .filter_map(|offset| current.checked_add_signed(*offset))
+            .collect()
+    }
+
+    /// Every tag this endpoint registers with `relay_host` right now: three
+    /// epochs per pair.
+    pub fn registration(&self, relay_host: &str, now_unix: u64) -> Vec<Tag> {
+        let peers = self.peers.lock().expect("book");
+        let epochs = self.window(now_unix);
+        let mut tags = Vec::with_capacity(peers.len() * epochs.len());
+        for material in peers.values() {
+            for epoch in &epochs {
+                tags.push(derive_tag(
+                    material.case,
+                    &material.static_x,
+                    &material.eph_x,
+                    relay_host,
+                    *epoch,
+                ));
+            }
+        }
+        tags
+    }
+
+    /// The current-epoch tag for an outbound datagram to `peer`.
+    pub fn tag_for_send(&self, peer: NodeId, relay_host: &str, now_unix: u64) -> Option<Tag> {
+        let peers = self.peers.lock().expect("book");
+        let material = peers.get(&peer)?;
+        Some(derive_tag(
+            material.case,
+            &material.static_x,
+            &material.eph_x,
+            relay_host,
+            epoch_index(now_unix),
+        ))
+    }
+
+    /// Attribute an inbound tag to its pair, over the same three-epoch window
+    /// the registration covers.  `None` for a tag this endpoint never
+    /// registered, which the caller drops.
+    pub fn resolve(&self, tag: &Tag, relay_host: &str, now_unix: u64) -> Option<NodeId> {
+        let peers = self.peers.lock().expect("book");
+        let epochs = self.window(now_unix);
+        for (peer, material) in peers.iter() {
+            for epoch in &epochs {
+                let candidate = derive_tag(
+                    material.case,
+                    &material.static_x,
+                    &material.eph_x,
+                    relay_host,
+                    *epoch,
+                );
+                if candidate == *tag {
+                    return Some(*peer);
+                }
+            }
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn material(byte: u8) -> RendezvousPeer {
+        RendezvousPeer {
+            case: TagCase::Both,
+            static_x: [byte; 32],
+            eph_x: [byte.wrapping_add(1); 32],
+        }
+    }
+
+    fn node(byte: u8) -> NodeId {
+        NodeId([byte; 32])
+    }
+
+    #[test]
+    fn registration_covers_three_epochs_per_pair() {
+        let book = TagBook::new(HashMap::from([
+            (node(1), material(10)),
+            (node(2), material(20)),
+        ]));
+        let tags = book.registration("relay.example.org", 1_793_588_888);
+        assert_eq!(tags.len(), 6);
+        let unique: std::collections::HashSet<_> = tags.iter().map(|t| t.0).collect();
+        assert_eq!(unique.len(), 6, "all tags distinct");
+    }
+
+    #[test]
+    fn send_resolve_round_trip_within_the_window() {
+        let peer = node(3);
+        let book = TagBook::new(HashMap::from([(peer, material(30))]));
+        let now = 1_793_588_888;
+        let tag = book.tag_for_send(peer, "relay.example.org", now).unwrap();
+        assert_eq!(book.resolve(&tag, "relay.example.org", now), Some(peer));
+        // A peer's tag from one epoch back still resolves (the skew window)...
+        let earlier = book
+            .tag_for_send(peer, "relay.example.org", now - 3600)
+            .unwrap();
+        assert_eq!(book.resolve(&earlier, "relay.example.org", now), Some(peer));
+        // ...but an unknown tag does not.
+        assert_eq!(book.resolve(&Tag([9; 16]), "relay.example.org", now), None);
+        // And the same pair on another relay derives a different tag.
+        let elsewhere = book.tag_for_send(peer, "relay2.example.net", now).unwrap();
+        assert_ne!(tag, elsewhere);
+    }
+}

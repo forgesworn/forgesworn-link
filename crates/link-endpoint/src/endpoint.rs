@@ -1,5 +1,6 @@
 //! `Endpoint` of spec section 5: the transport key, the path socket and the relays.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,6 +17,7 @@ use tracing::{info, warn};
 
 use crate::path_socket::{Paths, build};
 use crate::relay_client::{RelaySpec, RelayStatus};
+use crate::rendezvous_book::{RendezvousPeer, TagBook};
 use crate::session::Session;
 
 /// Cap the MTU so a QUIC packet always fits the relay's 1..=1350 frame bound.
@@ -40,6 +42,12 @@ pub struct EndpointConfig {
     /// the spec: it exists so a test can prove the relay carried a transfer
     /// before the upgrade, and so a product can defer probing.
     pub probe_delay: Duration,
+    /// Tag-mode rendezvous material per peer, spec 9.  `Some` switches every
+    /// relay session to tag registration, so no node ID, Nostr key or
+    /// signature ever reaches a relay; `None` keeps the deployed identity
+    /// mode.  The shell computes the material from the pair's cards and Nostr
+    /// keys; the transport never touches Nostr.
+    pub rendezvous: Option<HashMap<NodeId, RendezvousPeer>>,
 }
 
 impl EndpointConfig {
@@ -51,6 +59,7 @@ impl EndpointConfig {
             bind: "0.0.0.0:0".parse().expect("literal"),
             reflector: None,
             probe_delay: Duration::ZERO,
+            rendezvous: None,
         }
     }
 }
@@ -66,7 +75,12 @@ pub struct Endpoint {
 impl Endpoint {
     /// Bind the sockets and start the relay driver.  Does not wait for a relay.
     pub async fn open(config: EndpointConfig) -> anyhow::Result<Endpoint> {
-        let (socket, paths) = build(config.key.clone(), config.bind, config.relays.clone()).await?;
+        let book = config
+            .rendezvous
+            .clone()
+            .map(|peers| Arc::new(TagBook::new(peers)));
+        let (socket, paths) =
+            build(config.key.clone(), config.bind, config.relays.clone(), book).await?;
 
         let mut endpoint_config = quinn::EndpointConfig::default();
         endpoint_config.max_udp_payload_size(MAX_MTU)?;

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::Waker;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use link_core::id::{NodeId, TransportKey};
@@ -14,6 +14,8 @@ use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
+
+use crate::rendezvous_book::TagBook;
 
 /// Backoff bounds of spec 4.3.
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
@@ -140,6 +142,9 @@ pub struct RelayClient {
     status: watch::Receiver<RelayStatus>,
     events: broadcast::Sender<RelayStatus>,
     readiness: Arc<WriteReadiness>,
+    /// `Some` switches the session to tag mode, spec 9: registration instead
+    /// of identity auth, and sends translated to the pair's current tag.
+    book: Option<Arc<TagBook>>,
 }
 
 /// What the path socket should do with a datagram it could not queue.
@@ -155,11 +160,32 @@ impl RelayClient {
     /// Queue a datagram for the relay.  Never blocks, so it is safe to call
     /// from quinn's driver.
     pub fn try_send(&self, destination: NodeId, datagram: &[u8]) -> QueueOutcome {
-        let up = matches!(&*self.status.borrow(), RelayStatus::Up(_));
-        match self.outbound.try_send(Frame::Send {
-            destination,
-            datagram: datagram.to_vec(),
-        }) {
+        let (up, host) = match &*self.status.borrow() {
+            RelayStatus::Up(url) => (true, RelaySpec::plain(url.clone()).host().ok()),
+            _ => (false, None),
+        };
+        let frame = match &self.book {
+            None => Frame::Send {
+                destination,
+                datagram: datagram.to_vec(),
+            },
+            Some(book) => {
+                // Tag mode: the peer's identity never goes to the relay.  The
+                // tag depends on which relay this session is on, so nothing is
+                // sendable before the welcome names it.
+                let Some(host) = host else {
+                    return QueueOutcome::Dropped;
+                };
+                let Some(tag) = book.tag_for_send(destination, &host, now_unix()) else {
+                    return QueueOutcome::Dropped;
+                };
+                Frame::SendTag {
+                    tag,
+                    datagram: datagram.to_vec(),
+                }
+            }
+        };
+        match self.outbound.try_send(frame) {
             Ok(()) => QueueOutcome::Queued,
             Err(mpsc::error::TrySendError::Full(_)) if up => QueueOutcome::WouldBlock,
             Err(_) => QueueOutcome::Dropped,
@@ -210,6 +236,7 @@ pub fn spawn(
     key: TransportKey,
     relays: Vec<RelaySpec>,
     inbound: mpsc::Sender<(NodeId, Vec<u8>)>,
+    book: Option<Arc<TagBook>>,
 ) -> RelayClient {
     let (outbound_tx, outbound_rx) = mpsc::channel::<Frame>(MAX_QUEUED_FRAMES);
     let (status_tx, status_rx) = watch::channel(RelayStatus::Connecting);
@@ -223,12 +250,14 @@ pub fn spawn(
         status_tx,
         events_tx.clone(),
         readiness.clone(),
+        book.clone(),
     ));
     RelayClient {
         outbound: outbound_tx,
         status: status_rx,
         events: events_tx,
         readiness,
+        book,
     }
 }
 
@@ -246,6 +275,7 @@ fn set_status(
     let _ = events.send(next);
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn driver(
     key: TransportKey,
     relays: Vec<RelaySpec>,
@@ -254,6 +284,7 @@ async fn driver(
     status: watch::Sender<RelayStatus>,
     events: broadcast::Sender<RelayStatus>,
     readiness: Arc<WriteReadiness>,
+    book: Option<Arc<TagBook>>,
 ) {
     if relays.is_empty() {
         set_status(&status, &events, RelayStatus::Failed);
@@ -265,16 +296,26 @@ async fn driver(
 
     loop {
         let spec = relays[index % relays.len()].clone();
-        match connect(&key, &spec).await {
+        match connect(&key, &spec, book.as_deref()).await {
             Ok(ws) => {
                 backoff = BACKOFF_MIN;
                 // Drop anything queued while the previous relay was down.  Those
-                // datagrams are stale and QUIC has already retransmitted.
+                // datagrams are stale and QUIC has already retransmitted; in tag
+                // mode they also carry the previous relay's tags.
                 while outbound.try_recv().is_ok() {}
                 set_status(&status, &events, RelayStatus::Up(spec.url.clone()));
                 readiness.wake_all();
                 info!(relay = %spec.url, "relay session up");
-                pump(ws, &mut outbound, &inbound, &readiness).await;
+                let host = spec.host().unwrap_or_default();
+                pump(
+                    ws,
+                    &mut outbound,
+                    &inbound,
+                    &readiness,
+                    book.as_deref(),
+                    &host,
+                )
+                .await;
                 warn!(relay = %spec.url, "relay session lost");
                 set_status(&status, &events, RelayStatus::Reconnecting);
                 down_since = Some(std::time::Instant::now());
@@ -305,7 +346,11 @@ type Socket = tokio_tungstenite::WebSocketStream<Box<dyn Duplex>>;
 pub trait Duplex: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Duplex for T {}
 
-async fn connect(key: &TransportKey, spec: &RelaySpec) -> anyhow::Result<Socket> {
+async fn connect(
+    key: &TransportKey,
+    spec: &RelaySpec,
+    book: Option<&TagBook>,
+) -> anyhow::Result<Socket> {
     let (tls, host, port, path) = spec.parts()?;
     let stream = tokio::time::timeout(
         Duration::from_secs(10),
@@ -325,20 +370,34 @@ async fn connect(key: &TransportKey, spec: &RelaySpec) -> anyhow::Result<Socket>
     let request = format!("{}://{host}:{port}{path}", if tls { "wss" } else { "ws" });
     let (mut ws, _) = tokio_tungstenite::client_async(request, transport).await?;
 
-    // Authentication, spec 3.1.
+    // First contact: identity auth (spec 3.1) or tag registration (spec 9).
     let challenge = match next_frame(&mut ws).await? {
         Some(Frame::Challenge(challenge)) => challenge,
         other => anyhow::bail!("expected a challenge, got {other:?}"),
     };
-    let signature = link_core::wire::sign_relay_auth(key, &host, &challenge);
-    ws.send(Message::Binary(
-        Frame::Auth {
-            node_id: key.node_id(),
-            signature,
+    match book {
+        None => {
+            let signature = link_core::wire::sign_relay_auth(key, &host, &challenge);
+            ws.send(Message::Binary(
+                Frame::Auth {
+                    node_id: key.node_id(),
+                    signature,
+                }
+                .encode(),
+            ))
+            .await?;
         }
-        .encode(),
-    ))
-    .await?;
+        Some(book) => {
+            // No identity and no signature ever go to the relay on this path;
+            // the challenge is acknowledged by ignoring it.
+            let tags = book.registration(&host, now_unix());
+            if tags.is_empty() {
+                anyhow::bail!("tag mode with no rendezvous pairs to register");
+            }
+            ws.send(Message::Binary(Frame::Register { tags }.encode()))
+                .await?;
+        }
+    }
     match next_frame(&mut ws).await? {
         Some(Frame::Welcome(_token)) => Ok(ws),
         other => anyhow::bail!("expected a welcome, got {other:?}"),
@@ -361,9 +420,16 @@ async fn pump(
     outbound: &mut mpsc::Receiver<Frame>,
     inbound: &mpsc::Sender<(NodeId, Vec<u8>)>,
     readiness: &WriteReadiness,
+    book: Option<&TagBook>,
+    host: &str,
 ) {
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Tag mode re-registers when the epoch turns, so the relay always holds the
+    // previous, current and next epoch's tags for every pair.
+    let mut refresh = tokio::time::interval(Duration::from_secs(60));
+    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_epoch = link_core::rendezvous::epoch_index(now_unix());
     let mut nonce = [0u8; 8];
     loop {
         tokio::select! {
@@ -371,6 +437,20 @@ async fn pump(
                 rand::rngs::OsRng.fill_bytes(&mut nonce);
                 if ws.send(Message::Binary(Frame::Ping(nonce).encode())).await.is_err() {
                     return;
+                }
+            }
+            _ = refresh.tick(), if book.is_some() => {
+                let current = link_core::rendezvous::epoch_index(now_unix());
+                if current != last_epoch {
+                    last_epoch = current;
+                    if let Some(book) = book {
+                        let tags = book.registration(host, now_unix());
+                        if !tags.is_empty()
+                            && ws.send(Message::Binary(Frame::Register { tags }.encode())).await.is_err()
+                        {
+                            return;
+                        }
+                    }
                 }
             }
             frame = outbound.recv() => {
@@ -388,8 +468,21 @@ async fn pump(
                 match message {
                     Message::Binary(bytes) => match Frame::decode(&bytes) {
                         Some(Frame::Recv { source, datagram }) => {
+                            // Identity deliveries belong to identity sessions.
+                            if book.is_some() {
+                                return;
+                            }
                             // A full inbound queue is loss, not backpressure.
                             let _ = inbound.try_send((source, datagram));
+                        }
+                        Some(Frame::RecvTag { tag, datagram }) => {
+                            let Some(book) = book else { return };
+                            // Attribute by this endpoint's own book; a tag it
+                            // cannot resolve (a stale epoch, a removed pair) is
+                            // dropped, which QUIC treats as loss.
+                            if let Some(peer) = book.resolve(&tag, host, now_unix()) {
+                                let _ = inbound.try_send((peer, datagram));
+                            }
                         }
                         Some(Frame::Pong(_)) => {}
                         Some(Frame::Close(reason)) => {
@@ -409,4 +502,11 @@ async fn pump(
             }
         }
     }
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
