@@ -714,7 +714,15 @@ async fn a_reconnecting_node_supersedes_its_old_session_and_does_not_stall() {
         let bob = bob.clone();
         tokio::spawn(async move { bob.accept().await })
     };
+    // Before the fix this connect timed out at 30 s: bob's handshake replies
+    // were routed by the proof of the first process's socket.
+    let dialled = Instant::now();
     let session_2 = second.connect(&card).await.expect("second connect");
+    let handshake = dialled.elapsed();
+    assert!(
+        handshake < Duration::from_secs(5),
+        "the second handshake was not routed by a stale proof: took {handshake:?}"
+    );
     let bob_session_2 = Arc::new(accepting.await.unwrap().expect("bob accepts the second"));
     let sink_2 = spawn_sink(bob_session_2.clone(), 1);
 
@@ -728,15 +736,17 @@ async fn a_reconnecting_node_supersedes_its_old_session_and_does_not_stall() {
         describe(&old)
     );
 
-    // The new session goes direct and moves 64 MiB in well under the 15 s that
-    // a stale proof would have cost.
+    // The new session moves 64 MiB.  The bound is loose on purpose: what the
+    // defect broke was the handshake, asserted tightly above; a loaded CI
+    // runner has carried this transfer in 14 s over a direct path, which is
+    // slow but not the stall.
     let started = Instant::now();
     send_and_verify(&session_2, 0x5eed_0011, 64 * MIB)
         .await
         .expect("64 MiB on the second session");
     let took = started.elapsed();
     assert!(
-        took < Duration::from_secs(10),
+        took < Duration::from_secs(30),
         "the reconnected session did not stall: took {took:?}, history: {}",
         describe(&session_2.history())
     );
