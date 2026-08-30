@@ -1,6 +1,8 @@
 # ForgeSworn Link specification
 
-**Version:** 1 (`FSL1` cards, ALPN `fsl/0`).
+**Version:** card format 1 (`FSL1`); ALPN `fsl/0`.  The ALPN counts from
+zero and changes only on an incompatible change at the QUIC level; the card
+version byte changes only on an incompatible change to the card.
 **Status:** Normative.
 
 This document specifies the ForgeSworn Link transport: the endpoint address
@@ -448,11 +450,8 @@ Open problems the spike surfaced, to settle before Phase 1:
 - Relay convergence is by convention: both sides walk the same relay list in
   the same order.  Nothing enforces it, and per-peer relay selection from a
   card's hints is undecided.
-- The reflector reply is unauthenticated and not matched to its nonce.
 - Card serials come from the wall clock in the spike; a node must persist its
   highest issued serial or a clock step can reissue a stale one.
-- `wss://` relay TLS in the spike pins a leaf fingerprint because it ships no
-  root store; production relays use ordinary WebPKI certificates.
 
 ## 9. Rendezvous-tag routing
 

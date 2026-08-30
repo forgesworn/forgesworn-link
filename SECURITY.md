@@ -19,6 +19,14 @@ working exploit or a step-by-step extraction path.
 - The single TLS rule is that the peer's presented public key must byte-equal
   the expected node ID and its TLS 1.3 signature must validate. An endpoint that
   presents any other key fails closed.
+- **Authentication is not authorisation.** In identity mode any node with a
+  relay session can start a handshake with any node ID it knows, and the
+  transport pins the handshake to that ID; whether that node may talk to this
+  one is the application's decision, made on `Session::peer()` against its own
+  pairing set, exactly as with any other key-addressed transport. In tag mode
+  the relay path is authorised by construction: only a paired peer can derive
+  the rendezvous tag, so nobody else can reach the endpoint through the relay
+  at all.
 - A relay may learn routing tokens, source addresses, timing and byte counts. It
   must not learn Nostr keys, application authorisation, blob plaintext, retention
   tier, or content hashes the application did not deliberately expose. Relay

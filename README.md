@@ -1,6 +1,6 @@
 # ForgeSworn Link
 
-A wide-area transport lane for ForgeSworn storage: two authorised nodes find a
+A wide-area transport lane for ForgeSworn storage: two nodes find a
 route, attempt a direct QUIC path, and fall back to an opaque relay, without
 renting one company's endpoint IDs, DNS service or public relay estate.  It is
 the native lane a Bothy box or a Tor-less Wildbloom node uses to mirror and
@@ -105,6 +105,8 @@ presents no identity, so this is what stops one address holding every slot),
 `--reflector-per-second`.  Without `--insecure-ws` the
 relay generates a self-signed leaf and prints its SHA-256; a client then needs
 `--relay-cert-sha256 <hex>` or, for development only, `--relay-insecure-tls`.
+A relay behind an ordinary WebPKI certificate needs neither: the client
+verifies it against the bundled Mozilla roots.
 
 ## Tests
 
@@ -272,11 +274,13 @@ convenience alone.
    last 32 ms, so anything that samples `path()` will miss it.  The spec should
    say that the transition record is part of the interface, not only of the log.
 
-9. **Client-side relay TLS pins a fingerprint.**  The spike ships no root
-   certificate store, so a `wss://` relay is either pinned by the SHA-256 of
-   its DER leaf or accepted unchecked behind an explicit development flag.  A
-   deployed relay presents an ordinary WebPKI leaf and a product build would use
-   the platform trust store.
+9. **Client-side relay TLS, now closed.**  The spike originally shipped no root
+   store and pinned a `wss://` relay by the SHA-256 of its DER leaf.  A relay
+   behind an ordinary WebPKI certificate is now verified against the bundled
+   Mozilla roots with no pin at all, which is the deployed default; the pin
+   remains for a relay that has no WebPKI name, and the unchecked mode remains
+   for development only.  The platform trust store is the planned upgrade when
+   Android system roots and revocation matter.
 
 10. **`Failed(Timeout)` is reachable from QUIC, not only from the relay.**
     Spec 4.3 only produces `Failed(relay)` and `Failed(identity)`, yet spec 5
@@ -326,10 +330,6 @@ the suite ran at once.  Both are spec lessons, not only code fixes.
   they converge.  Nothing forces that.  A real deployment needs per-peer relay
   selection from the peer's card hints, or endpoints registered on several
   relays at once.  The spec does not decide this.
-- **The reflector result is a single value with no source check.**  Anything
-  that can reach the direct socket can set it by sending a well-formed reply.
-  It only ever becomes a candidate the peer is asked to probe, so the cost of a
-  lie is a wasted probe, but it should be nonce-matched.
 - **No adversarial TLS handshake test.**  The one identity rule is exercised in
   the positive direction end to end and asserted directly on the verifier.  A
   test that drives a handshake where the presented key differs from the pin
