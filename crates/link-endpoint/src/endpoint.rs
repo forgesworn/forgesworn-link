@@ -195,10 +195,26 @@ impl Endpoint {
                 hints.push(Hint::udp(addr));
             }
         }
+        // The caller's extra hints are never dropped: the endpoint truncates
+        // its OWN relay and UDP hints into the space that remains, so an
+        // ephemeral rendezvous hint (0x04) survives any hint pressure instead
+        // of silently costing the pair its forward secrecy.
+        let mut extra = extra;
+        extra.truncate(link_core::card::MAX_HINTS);
+        hints.truncate(link_core::card::MAX_HINTS - extra.len());
         hints.extend(extra);
-        hints.truncate(link_core::card::MAX_HINTS);
-        // Strictly increasing per node ID across every card it ever signs.
-        let serial = self.serial.fetch_add(1, Ordering::SeqCst).max(now);
+        // Strictly increasing while the process lives: the counter ratchets to
+        // max(last + 1, now), so a clock jump ahead of the counter cannot
+        // repeat a serial within one second.  A restart inside the same second
+        // still can, which only a persisted high-water mark closes -- that
+        // belongs to the shell and stays a SPEC open problem.
+        let last = self
+            .serial
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |last| {
+                Some(last.saturating_add(1).max(now))
+            })
+            .expect("the ratchet closure always returns Some");
+        let serial = last.saturating_add(1).max(now);
         Card::sign(&self.key, now, now + ttl, serial, hints)
     }
 
