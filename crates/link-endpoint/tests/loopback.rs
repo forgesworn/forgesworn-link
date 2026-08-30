@@ -102,9 +102,13 @@ async fn relayed_transfer_then_direct_upgrade() {
         "direct upgrade on loopback, history: {}",
         describe(&history)
     );
+    // The report follows the socket (spec 5): if bob's punch-now round proves
+    // alice's path before her own tick starts a round, her history goes
+    // straight from Relayed to Direct, which is honest.  What must hold is
+    // that Direct came only after the request, never before it.
     assert!(
-        saw_after(&history, PathStatus::Relayed, PathStatus::Probing),
-        "the upgrade went through Probing, history: {}",
+        saw_after(&history, PathStatus::Relayed, PathStatus::Direct),
+        "Direct came after Relayed, history: {}",
         describe(&history)
     );
 
@@ -506,24 +510,28 @@ async fn punch_now_starts_a_round_on_the_peer() {
         "bob received alice's punch-now on the control stream, history: {}",
         describe(&bob_session.history())
     );
+    // Alice's own round is recorded when it happens.  If bob's punch-now
+    // round proves alice's path before her tick starts one, her history goes
+    // straight from Relayed to Direct: the report follows the socket (spec 5).
     let history = wait_for_history(&session, Duration::from_secs(10), |h| {
-        saw(h, PathStatus::Probing)
+        saw(h, PathStatus::Direct)
     })
     .await;
-    let probing = history
+    assert!(
+        saw_after(&history, PathStatus::Relayed, PathStatus::Direct),
+        "alice reached Direct after the request, history: {}",
+        describe(&history)
+    );
+    if let Some(probing) = history
         .iter()
         .find(|report| report.status == PathStatus::Probing)
-        .unwrap_or_else(|| {
-            panic!(
-                "alice never started a round, history: {}",
-                describe(&history)
-            )
-        });
-    assert!(
-        probing.cause.contains("requested here"),
-        "alice's round records who asked, cause: {}",
-        probing.cause
-    );
+    {
+        assert!(
+            probing.cause.contains("requested here"),
+            "alice's round records who asked, cause: {}",
+            probing.cause
+        );
+    }
     // Both sides reach Direct: bob by answering alice's pings and, had a NAT
     // eaten those, by the round the punch-now started.
     let bob_history = wait_for_history(&bob_session, Duration::from_secs(10), |h| {
