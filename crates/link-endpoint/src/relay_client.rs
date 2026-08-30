@@ -447,6 +447,19 @@ async fn driver(
     let mut down_since: Option<std::time::Instant> = None;
 
     loop {
+        if let Some(book) = &book
+            && book.is_empty()
+        {
+            // A peerless tag node is idle, not failing: there is nothing to
+            // register yet, so the reconnect deadline must not run and the
+            // client must not die.  A fresh node learns its first pair from
+            // the shell (a Nostr claim) after opening; the first upsert lets
+            // the next pass connect and register within a second.
+            set_status(&status, &events, RelayStatus::Connecting);
+            down_since = None;
+            tokio::time::sleep(BACKOFF_MIN).await;
+            continue;
+        }
         let spec = relays[index % relays.len()].clone();
         match connect(&key, &spec, book.as_deref()).await {
             Ok(ws) => {
