@@ -33,8 +33,8 @@ IETF QUIC connection (Quinn, rustls, TLS 1.3) whose certificate check is a
 single rule: the peer's presented public key byte-equals the node ID in the
 card.  QUIC never learns which path it is on.  Beneath it, a **path socket**
 delivers QUIC datagrams either through a **relay** (opaque, bounded frames over
-WebSocket Secure) or over a **direct** UDP path it has proved with signed
-probes.  The relay also runs a **reflector** so nodes can learn their public
+WebSocket Secure) or over a **direct** UDP path it has proved with probes
+keyed to the session.  The relay also runs a **reflector** so nodes can learn their public
 UDP address.  Standard Blossom over Tor or HTTPS is a separate, independently
 configured route and is never touched by this document.
 
@@ -259,22 +259,39 @@ neither loopback nor link-local, the default route's address first and at
 most eight, then loopback, then the reflector result.  *Spike finding:* a
 list holding only the default route's address made a LAN pair fall back to
 the relay whenever a VPN held the default route, because the LAN address was
-never offered.  Each side then sends signed probes over UDP to every
-candidate of the other side:
+never offered.  Each side then sends session-keyed probes over UDP to every
+candidate of the other side.
 
-- `FSLP` || `0x01` || 32-byte sender node ID || 32-byte receiver node ID ||
-  16-byte nonce || Ed25519 signature over `forgesworn-link/probe/v1\0` and
-  the preceding fields;
-- the receiver, if the signature verifies under the sender node ID it already
-  knows from QUIC and the receiver node ID is its own, replies with `0x02` and
-  the same nonce, signed the same way;
-- a path is **proved** for a peer when a signed pong for a nonce this side
-  issued arrives from an address.  Both sides prove independently.
-- *Spike finding, one-sided proving.*  A side that receives a valid signed
-  ping from an address it holds no fresh proof for sends its own probe to that
-  address at once, rate-limited to one per address per second.  Without this a
-  peer that answers pings but never issues its own is proved by nobody, and
-  every direct datagram it sends is dropped under 4.1.
+Probes are bound to the session, not to the node keys (probe version 2).
+After the QUIC handshake each side exports 40 bytes of keying material
+(RFC 8446 section 7.5) with the label `forgesworn-link/probe/v2` and an empty
+context; bytes 0..32 are the **probe key** and bytes 32..40 the **key id**.
+Both sides obtain the same bytes without exchanging anything.
+
+- A probe is `FSLP` || `0x02` || kind || 8-byte key id || 16-byte nonce ||
+  HMAC-SHA256 under the probe key over `forgesworn-link/probe/v2\0` and the
+  preceding 30 bytes: 62 bytes.  Kind `0x01` is a ping, `0x02` a pong.
+- The receiver finds the session by key id, verifies the MAC in constant
+  time, and drops anything that does not open.  For a ping it replies with a
+  pong carrying the same nonce, at most one pong per source address per
+  second.
+- A path is **proved** for a peer when a pong for a nonce this side issued
+  arrives from an address.  Both sides prove independently.
+- *Spike finding, one-sided proving.*  A side that receives a valid ping from
+  an address it holds no fresh proof for sends its own probe to that address
+  at once, rate-limited to one per address per second.  Without this a peer
+  that answers pings but never issues its own is proved by nobody, and every
+  direct datagram it sends is dropped under 4.1.  An address learnt this way
+  that is not in the peer's own list is probed for ten seconds and then
+  forgotten unless it proved.
+- The key dies with the session: a probe captured from one session opens
+  under no other, and a probe replayed into the same session earns at most
+  one pong a second and a candidate that lapses in ten seconds.
+
+Version 1 probes were signed by the node's long-term Ed25519 key and carried
+both node IDs in clear; an on-path observer read who was probing whom and a
+captured ping replayed for ever.  Version 2 names nobody, and an observer
+learns only that two Link endpoints are probing.
 
 The control stream carries two message kinds, each a `u32` big-endian length
 followed by a kind byte and a body: `0x01 candidates` (a `u8` count, then
@@ -298,9 +315,6 @@ callback, and a shell that has one may set the poll to zero.  A proof on an
 interface that has gone is not dropped early: it ages out under the 15 second
 rule of 4.1 while the new round proves the new path, so a report never says
 `Relayed` while a still-working direct path carries bytes.
-
-Probes carry node IDs in clear, which an on-path observer can read.  They
-never carry anything else.  Encrypting them is future work.
 
 ### 4.3 State machine
 
@@ -412,8 +426,11 @@ Android client and any browser code verify the same bytes.
 - `spki.json`: the DER SubjectPublicKeyInfo for the vector key, the byte
   offsets of the 32-byte key within it, and the synthetic IPv6 address from
   4.1.
-- `relay-auth.json` and `probe.json`: challenge, host, nonce, the signing
-  input and signature for each.
+- `relay-auth.json`: challenge, host, the signing input and signature.
+- `probe.json`: a fixed probe key, key id and nonce, and for each of ping and
+  pong the body, the MAC input, the MAC and the wire bytes, plus the hostile
+  forms (wrong key, truncated, one MAC bit flipped) a verifier must reject.
+  Generated by `vectors/generate-probe-v2.mjs`, which needs no Ed25519.
 
 The generator is a short script with no dependencies beyond an Ed25519
 implementation.  Vectors are regenerated only when the version byte changes.

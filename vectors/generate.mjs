@@ -22,7 +22,6 @@ const v6text = (b) => Array.from({ length: 8 }, (_, i) => ((b[2 * i] << 8) | b[2
 const CARD_DOMAIN = cat(te.encode('forgesworn-link/card/v1'), u8(0))
 const ADDR_DOMAIN = cat(te.encode('forgesworn-link/addr/v1'), u8(0))
 const RELAY_DOMAIN = cat(te.encode('forgesworn-link/relay-auth/v1'), u8(0))
-const PROBE_DOMAIN = cat(te.encode('forgesworn-link/probe/v1'), u8(0))
 const SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex')
 
 const seedA = sha256(te.encode('forgesworn-link/vectors/1/node-a'))
@@ -99,19 +98,15 @@ const relayHost = 'relay.example'
 const relayInput = cat(RELAY_DOMAIN, u16(relayHost.length), te.encode(relayHost), challenge)
 const relaySig = ed25519.sign(relayInput, seedA)
 
-const nonce = sha256(te.encode('forgesworn-link/vectors/1/probe-nonce')).subarray(0, 16)
-const ping = cat(te.encode('FSLP'), u8(0x01), pubA, pubB, nonce)
-const pingSig = ed25519.sign(cat(PROBE_DOMAIN, ping), seedA)
-const pong = cat(te.encode('FSLP'), u8(0x02), pubB, pubA, nonce)
-const pongSig = ed25519.sign(cat(PROBE_DOMAIN, pong), seedB)
 
-const meta = { version: 'FSL-CARD-1', generated_for: 'forgesworn-link phase 0 spike', domains: { card: hex(CARD_DOMAIN), addr: hex(ADDR_DOMAIN), relay_auth: hex(RELAY_DOMAIN), probe: hex(PROBE_DOMAIN) }, keys: { node_a: { seed_hex: hex(seedA), node_id_hex: hex(pubA), node_id_base32: base32(pubA) }, node_b: { seed_hex: hex(seedB), node_id_hex: hex(pubB), node_id_base32: base32(pubB) } }, clock_skew_seconds: 300, max_lifetime_seconds: 604800, max_card_bytes: 4096, min_card_bytes: 126 }
+// Probe vectors are session-keyed since probe v2 and live in
+// generate-probe-v2.mjs, which needs no Ed25519.
+const meta = { version: 'FSL-CARD-1', generated_for: 'forgesworn-link phase 0 spike', domains: { card: hex(CARD_DOMAIN), addr: hex(ADDR_DOMAIN), relay_auth: hex(RELAY_DOMAIN) }, keys: { node_a: { seed_hex: hex(seedA), node_id_hex: hex(pubA), node_id_base32: base32(pubA) }, node_b: { seed_hex: hex(seedB), node_id_hex: hex(pubB), node_id_base32: base32(pubB) } }, clock_skew_seconds: 300, max_lifetime_seconds: 604800, max_card_bytes: 4096, min_card_bytes: 126 }
 const out = (name, data) => writeFileSync(new URL('./' + name, import.meta.url), JSON.stringify(data, null, 2) + '\n')
 out('meta.json', meta)
 out('card-valid.json', valid)
 out('card-hostile.json', hostile)
 out('spki.json', { node_id_hex: hex(pubA), spki_der_hex: hex(spkiA), key_offset: SPKI_PREFIX.length, key_length: 32, synthetic_ipv6: v6text(addrA), synthetic_port: 7 })
 out('relay-auth.json', { relay_host: relayHost, challenge_hex: hex(challenge), node_id_hex: hex(pubA), signing_input_hex: hex(relayInput), signature_hex: hex(relaySig) })
-out('probe.json', { ping: { bytes_hex: hex(ping), signing_input_hex: hex(cat(PROBE_DOMAIN, ping)), signature_hex: hex(pingSig), wire_hex: hex(cat(ping, pingSig)) }, pong: { bytes_hex: hex(pong), signing_input_hex: hex(cat(PROBE_DOMAIN, pong)), signature_hex: hex(pongSig), wire_hex: hex(cat(pong, pongSig)) } })
 console.log('node A', base32(pubA), '| valid', valid.length, '| hostile', hostile.length)
 console.log('card sizes', valid.map(v => v.card_hex.length / 2).join(','), '| oversize fixture', hostile[1].card_hex.length / 2)

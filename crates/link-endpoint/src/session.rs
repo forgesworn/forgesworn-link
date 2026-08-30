@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use link_core::card::{Hint, to_ipv6};
 use link_core::id::NodeId;
 use link_core::path::{FailReason, PathReport, PathStatus};
+use link_core::wire::{PROBE_EXPORT_BYTES, PROBE_EXPORT_LABEL, PROBE_ID_BYTES, PROBE_KEY_BYTES};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
@@ -96,6 +97,8 @@ pub(crate) struct SessionInner {
     control_tx: mpsc::Sender<ControlSend>,
     /// How many `punch-now` messages the peer has sent this session.
     punch_requests: AtomicU32,
+    /// The probe key id this session registered, to forget when it ends.
+    probe_key_id: Option<[u8; PROBE_ID_BYTES]>,
 }
 
 impl SessionInner {
@@ -176,6 +179,27 @@ impl Session {
             since: Instant::now(),
             cause: "connect".into(),
         };
+        // Probe v2, spec 4.2: both ends export the same bytes from the TLS
+        // session; the first 32 seal probes and the last 8 name the session.
+        // A probe therefore authenticates the live session, carries no node
+        // ID, and dies with the session.
+        let mut material = [0u8; PROBE_EXPORT_BYTES];
+        let probe_key_id = match conn.export_keying_material(&mut material, PROBE_EXPORT_LABEL, b"")
+        {
+            Ok(()) => {
+                let key: [u8; PROBE_KEY_BYTES] =
+                    material[..PROBE_KEY_BYTES].try_into().expect("32 bytes");
+                let key_id: [u8; PROBE_ID_BYTES] =
+                    material[PROBE_KEY_BYTES..].try_into().expect("8 bytes");
+                paths.register_probe_key(peer, key_id, key);
+                Some(key_id)
+            }
+            Err(e) => {
+                warn!(%peer, error = ?e, "no exporter material: this session cannot probe");
+                None
+            }
+        };
+
         let (control_tx, control_rx) = mpsc::channel::<ControlSend>(CONTROL_QUEUE);
         let inner = Arc::new(SessionInner {
             peer,
@@ -185,6 +209,7 @@ impl Session {
             probe_now: AtomicU8::new(PROBE_IDLE),
             control_tx,
             punch_requests: AtomicU32::new(0),
+            probe_key_id,
             report: Mutex::new(initial.clone()),
             history: Mutex::new(vec![initial]),
         });
@@ -482,6 +507,10 @@ async fn drive(inner: Arc<SessionInner>, probe_delay: Duration) {
         let mut relay_event = None;
         tokio::select! {
             reason = inner.conn.closed() => {
+                // The probe key dies with the session, spec 4.2.
+                if let Some(key_id) = inner.probe_key_id {
+                    inner.paths.unregister_probe_key(key_id);
+                }
                 let status = inner.status();
                 if !matches!(status, PathStatus::Failed(_)) {
                     match reason {

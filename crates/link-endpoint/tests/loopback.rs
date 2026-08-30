@@ -413,7 +413,6 @@ async fn unproven_addresses_and_forged_probes_are_dropped() {
     let alice = start_endpoint(options()).await;
     let bob = Arc::new(start_endpoint(options()).await);
     let bob_udp = bob.paths().udp_local();
-    let alice_id = alice.node_id();
     let bob_id = bob.node_id();
     let card = exchange_card(&bob);
 
@@ -430,19 +429,17 @@ async fn unproven_addresses_and_forged_probes_are_dropped() {
     for _ in 0..50 {
         attacker.send_to(&[0xa5u8; 1200], bob_udp).await.unwrap();
     }
-    // A probe with the right shape, signed by the wrong key.
-    let mut forged = link_core::wire::Probe {
+    // A probe with the right shape, sealed under a key no session has.
+    let forged = link_core::wire::Probe {
         kind: link_core::wire::PROBE_PING,
-        sender: alice_id,
-        receiver: bob_id,
+        key_id: [7u8; 8],
         nonce: [7u8; 16],
     }
-    .sign(&link_core::id::TransportKey::generate());
-    forged[5..37].copy_from_slice(alice_id.as_bytes());
+    .seal(&[7u8; 32]);
     assert_eq!(
-        link_core::wire::Probe::parse_verified(&forged),
-        None,
-        "the forged probe does not verify"
+        link_core::wire::Probe::peek_key_id(&forged),
+        Some([7u8; 8]),
+        "the forged probe has a probe's shape"
     );
     attacker.send_to(&forged, bob_udp).await.unwrap();
 
