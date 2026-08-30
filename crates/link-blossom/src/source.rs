@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -64,6 +65,15 @@ pub trait BlobSource: Send + Sync + 'static {
     /// The `(size, content_type, byte stream)` for a lower-case hex SHA-256, or
     /// `None` when the store holds no such blob.
     fn get(&self, sha256: &str) -> BoxFuture<'_, Option<BlobBytes>>;
+}
+
+/// Delegation through shared ownership, so a shell holding an
+/// `Arc<dyn BlobSource>` hands it to [`serve`](crate::serve) or
+/// [`serve_stream`](crate::serve_stream) without a newtype.
+impl<T: BlobSource + ?Sized> BlobSource for Arc<T> {
+    fn get(&self, sha256: &str) -> BoxFuture<'_, Option<BlobBytes>> {
+        (**self).get(sha256)
+    }
 }
 
 /// An in-memory [`BlobSource`] for tests and examples.
@@ -130,5 +140,28 @@ impl BlobSource for MapBlobSource {
                 }
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn an_arc_dyn_source_serves_through_the_blanket_impl() {
+        let source = MapBlobSource::new().with_blob("aa".repeat(32), None, "bytes");
+        let shared: Arc<dyn BlobSource> = Arc::new(source);
+        // The blanket impl is what makes Arc<dyn BlobSource> itself a
+        // BlobSource, so a generic caller accepts it without a newtype.
+        fn generic<S: BlobSource>(source: &S, sha256: &str) -> BoxFuture<'_, Option<BlobBytes>>
+        where
+            S: Sized,
+        {
+            source.get(sha256)
+        }
+        let hit = generic(&shared, &"aa".repeat(32)).await;
+        assert_eq!(hit.expect("held").size, 5);
+        let miss = generic(&shared, &"bb".repeat(32)).await;
+        assert!(miss.is_none());
     }
 }
