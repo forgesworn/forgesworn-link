@@ -3,7 +3,7 @@
 use std::fmt;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 /// Domain separator for the synthetic address derivation, spec 4.1.
@@ -119,11 +119,14 @@ impl NodeId {
         SocketAddr::new(IpAddr::V6(Ipv6Addr::from(octets)), SYNTHETIC_PORT)
     }
 
+    /// Strict verification (cofactored, malleability rejected), so a signed
+    /// byte string has exactly one valid signature encoding and card bytes can
+    /// serve as a dedup key.
     pub fn verify(&self, message: &[u8], signature: &[u8; 64]) -> bool {
         let Some(key) = self.verifying_key() else {
             return false;
         };
-        key.verify(message, &Signature::from_bytes(signature))
+        key.verify_strict(message, &Signature::from_bytes(signature))
             .is_ok()
     }
 }

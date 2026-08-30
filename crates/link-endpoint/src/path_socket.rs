@@ -72,6 +72,8 @@ pub struct Paths {
     inner: Mutex<Inner>,
     inbound_tx: mpsc::Sender<Inbound>,
     reflexive: Mutex<Option<SocketAddr>>,
+    /// The nonce of the outstanding reflector request; a reply must echo it.
+    reflector_nonce: Mutex<Option<[u8; 16]>>,
     local_synthetic: SocketAddr,
     udp_local: SocketAddr,
 }
@@ -206,6 +208,7 @@ impl Paths {
     pub fn query_reflector(&self, reflector: SocketAddr) {
         let mut nonce = [0u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
+        *self.reflector_nonce.lock().expect("reflector nonce") = Some(nonce);
         let _ = self.udp.try_send_to(&reflect_request(&nonce), reflector);
     }
 
@@ -370,6 +373,7 @@ pub async fn build(
         inner: Mutex::new(Inner::default()),
         inbound_tx,
         reflexive: Mutex::new(None),
+        reflector_nonce: Mutex::new(None),
         local_synthetic,
         udp_local,
     });
@@ -407,8 +411,20 @@ pub async fn build(
                     continue;
                 }
                 if len == REFLECT_REPLY_BYTES && data[..4] == REFLECT_MAGIC {
-                    if let Some((_, observed)) = parse_reflect_reply(data) {
-                        *paths.reflexive.lock().expect("reflexive") = Some(unmap_ipv6(observed));
+                    if let Some((nonce, observed)) = parse_reflect_reply(data) {
+                        // Only the reply to this node's own outstanding request
+                        // counts; anything else could plant a false reflexive
+                        // candidate.
+                        let matched = paths
+                            .reflector_nonce
+                            .lock()
+                            .expect("reflector nonce")
+                            .take_if(|expected| *expected == nonce)
+                            .is_some();
+                        if matched {
+                            *paths.reflexive.lock().expect("reflexive") =
+                                Some(unmap_ipv6(observed));
+                        }
                     }
                     continue;
                 }

@@ -147,8 +147,15 @@ impl ResponseHeader {
     pub fn encode(&self) -> Vec<u8> {
         match self {
             ResponseHeader::Ok { size, content_type } => {
-                let content_type = content_type.as_deref().unwrap_or("").as_bytes();
-                let content_len = content_type.len().min(MAX_CONTENT_TYPE);
+                // A media type longer than the bound is dropped whole rather
+                // than truncated: a byte-boundary cut can split a UTF-8
+                // character, and the peer would then reject the entire header.
+                let content_type = content_type
+                    .as_deref()
+                    .filter(|text| text.len() <= MAX_CONTENT_TYPE)
+                    .unwrap_or("")
+                    .as_bytes();
+                let content_len = content_type.len();
                 let mut out = Vec::with_capacity(1 + 8 + 2 + content_len);
                 out.push(STATUS_OK);
                 out.extend_from_slice(&size.to_be_bytes());
@@ -293,6 +300,22 @@ mod tests {
         assert_eq!(
             ResponseHeader::decode(&[]),
             Err(WireError::Short { needed: 1, had: 0 })
+        );
+    }
+
+    #[test]
+    fn an_over_long_content_type_is_omitted_not_truncated() {
+        let header = ResponseHeader::Ok {
+            size: 1,
+            content_type: Some("x".repeat(MAX_CONTENT_TYPE + 45)),
+        };
+        let (decoded, _) = ResponseHeader::decode(&header.encode()).expect("decodes");
+        assert_eq!(
+            decoded,
+            ResponseHeader::Ok {
+                size: 1,
+                content_type: None
+            }
         );
     }
 }
