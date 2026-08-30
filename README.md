@@ -204,6 +204,12 @@ They do not cover:
 - **A full security review.**  The identity rule is implemented and tested for
   the positive case and by unit assertions; there is no adversarial TLS test
   that drives a full handshake with a mismatched key.
+- **The VPN-default-route LAN row, re-run.**  That row fell back to the relay
+  because only the address on the default route was offered as a candidate,
+  so the LAN address that would have worked never reached the peer.  Every
+  interface of the socket's family is offered now (`local_addresses`,
+  loopback last, at most eight), and the row has not been re-run on a real
+  VPN since.
 
 ## Deviations from the spec
 

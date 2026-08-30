@@ -252,8 +252,13 @@ for.  A session is handed to the application only after its control stream
 has been opened; otherwise an application stream can win the lower stream ID
 under load, be mistaken for the control stream and reset mid-transfer.  A
 control stream that goes quiet is held open, never dropped.  Each side sends
-its candidate list: local interface addresses and the reflector result.  Each
-side then sends signed probes over UDP to every candidate of the other side:
+its candidate list: every interface address of the socket's family that is
+neither loopback nor link-local, the default route's address first and at
+most eight, then loopback, then the reflector result.  *Spike finding:* a
+list holding only the default route's address made a LAN pair fall back to
+the relay whenever a VPN held the default route, because the LAN address was
+never offered.  Each side then sends signed probes over UDP to every
+candidate of the other side:
 
 - `FSLP` || `0x01` || 32-byte sender node ID || 32-byte receiver node ID ||
   16-byte nonce || Ed25519 signature over `forgesworn-link/probe/v1\0` and
