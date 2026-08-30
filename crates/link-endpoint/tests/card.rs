@@ -29,7 +29,7 @@ async fn the_callers_ephemeral_hint_survives_a_full_card() {
     let card = endpoint.card(Duration::from_secs(300), vec![ephemeral.clone()]);
     assert_eq!(card.hints.len(), MAX_HINTS, "the card is exactly full");
     assert!(
-        card.hints.iter().any(|hint| *hint == ephemeral),
+        card.hints.contains(&ephemeral),
         "the caller's 0x04 hint survives hint pressure"
     );
     assert_eq!(
