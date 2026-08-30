@@ -1,10 +1,11 @@
 # ForgeSworn Link
 
 A wide-area transport lane for ForgeSworn storage: two nodes find a
-route, attempt a direct QUIC path, and fall back to an opaque relay, without
-renting one company's endpoint IDs, DNS service or public relay estate.  It is
-the native lane a Bothy box or a Tor-less Wildbloom node uses to mirror and
-repair between machines.
+route, attempt a direct QUIC path, and fall back to an opaque relay, on
+upstream `quinn` and `rustls`, with no third-party endpoint IDs, discovery
+service or relay estate inside the contract and a relay that, in tag mode,
+learns no identity at all.  It is the native lane a Bothy box or a Tor-less
+Wildbloom node uses to mirror and repair between machines.
 
 We own the small contract that matters -- how a node identifies itself, how two
 nodes discover a route, how they attempt a direct connection, how they fall back
