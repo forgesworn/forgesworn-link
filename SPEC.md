@@ -38,10 +38,15 @@ keyed to the session.  The relay also runs a **reflector** so nodes can learn th
 UDP address.  Standard Blossom over Tor or HTTPS is a separate, independently
 configured route and is never touched by this document.
 
-That is the same shape as iroh's magic socket and Tailscale's disco layer.  The
-difference is that every piece is ours or standard: no third-party endpoint
-IDs, DNS discovery, public relay estate or moving Rust API sits inside the
-contract.
+That is the shape iroh used up to 0.95 (a magic socket beneath QUIC, probes
+beside it, a DERP-style relay) and the shape of Tailscale's disco layer.
+Since 0.96 iroh has moved hole-punching and multipath inside QUIC itself, on
+its own fork of the QUIC stack; that is a fine design and it is not this one.
+The difference here is that every piece is ours or standard: upstream `quinn`
+and `rustls`, no third-party endpoint IDs, discovery service or relay estate
+inside the contract, probes that name nobody, and a relay that in tag mode
+learns no identity at all.  When upstream QUIC grows multipath and address
+discovery, this design takes them by bumping a dependency.
 
 ## 1. Node identity
 
