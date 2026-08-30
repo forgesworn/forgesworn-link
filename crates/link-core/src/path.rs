@@ -11,6 +11,10 @@ pub enum FailReason {
     Relay,
     Identity,
     Timeout,
+    /// A newer session from the same node ID arrived and took over, spec
+    /// 4.3: one QUIC connection per peer, newest wins.  This session was
+    /// closed so its stale path state cannot sabotage the new one.
+    Superseded,
 }
 
 impl std::fmt::Display for FailReason {
@@ -19,6 +23,7 @@ impl std::fmt::Display for FailReason {
             FailReason::Relay => f.write_str("relay"),
             FailReason::Identity => f.write_str("identity"),
             FailReason::Timeout => f.write_str("timeout"),
+            FailReason::Superseded => f.write_str("superseded"),
         }
     }
 }

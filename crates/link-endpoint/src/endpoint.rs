@@ -243,6 +243,11 @@ impl Endpoint {
             return Err(FailReason::Identity);
         }
         self.paths.register_peer(peer);
+        // Spec 4.3: one QUIC connection per peer, newest wins.  Take the slot
+        // before the handshake: an earlier session with this peer is
+        // superseded and its proof cleared, so the handshake goes over the
+        // relay rather than to a socket the old session pointed at.
+        let (session_id, superseded) = self.paths.begin_session(peer);
         // Spec 3.1: dial the peer on the relays its card names, so two nodes
         // need no shared configuration to meet.  A card with no relay hint
         // means this endpoint's own relay.
@@ -278,11 +283,13 @@ impl Endpoint {
             .connect_with(client_config, peer.synthetic_addr(), "link")
             .map_err(|e| {
                 warn!(%peer, error = %e, "connect refused before the handshake");
+                self.paths.end_session(peer, session_id);
                 FailReason::Relay
             })?;
         let conn = connecting.await.map_err(|e| {
             let reason = classify(&e);
             warn!(%peer, error = %e, %reason, "QUIC handshake failed");
+            self.paths.end_session(peer, session_id);
             reason
         })?;
 
@@ -292,6 +299,8 @@ impl Endpoint {
             self.paths.clone(),
             self.config.allow_direct,
             self.config.probe_delay,
+            session_id,
+            superseded,
         )
         .await)
     }
@@ -308,6 +317,10 @@ impl Endpoint {
                 incoming.refuse();
                 continue;
             };
+            // Spec 4.3: a new connection from a peer supersedes its earlier
+            // session now, before the handshake, so replies are not routed by
+            // a proof that points at the socket the old session used.
+            let (session_id, superseded) = self.paths.begin_session(peer);
 
             let mut server_crypto = match rustls::ServerConfig::builder_with_provider(Arc::new(
                 rustls::crypto::ring::default_provider(),
@@ -332,6 +345,7 @@ impl Endpoint {
                 Ok(connecting) => connecting,
                 Err(e) => {
                     warn!(%peer, error = %e, "inbound refused");
+                    self.paths.end_session(peer, session_id);
                     continue;
                 }
             };
@@ -339,6 +353,7 @@ impl Endpoint {
                 Ok(conn) => conn,
                 Err(e) => {
                     warn!(%peer, error = %e, "inbound handshake failed");
+                    self.paths.end_session(peer, session_id);
                     continue;
                 }
             };
@@ -348,6 +363,7 @@ impl Endpoint {
             if presented_node_id(&conn) != Some(peer) {
                 warn!(%peer, "presented certificate does not match the source node ID");
                 conn.close(VarInt::from_u32(1), b"identity");
+                self.paths.end_session(peer, session_id);
                 return Err(FailReason::Identity);
             }
 
@@ -357,6 +373,8 @@ impl Endpoint {
                 self.paths.clone(),
                 self.config.allow_direct,
                 self.config.probe_delay,
+                session_id,
+                superseded,
             )
             .await);
         }

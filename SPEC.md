@@ -360,11 +360,29 @@ Relayed | Direct
 Reconnecting
   new relay welcome ----------------> previous state
   no relay within 60 s -------------> Failed(relay)
+any state
+  a newer session from the same node ID arrives -> Failed(superseded)
+                                       (this one is closed; the new one
+                                        starts with clean path state)
 Failed(reason)
   application is told once, with the reason.  Nothing is retried on its
   behalf; the standard Blossom-over-Tor/HTTPS route is a separate decision
   above this layer.
 ```
+
+*One session per peer, newest wins.*  Section 0 says two nodes talk over one
+QUIC connection.  When a node dials a peer it already has a session with, or
+accepts a new connection from one, the earlier session is superseded: it is
+told once (`Failed(superseded)`), closed, and the peer's path state
+(candidates, learnt addresses, pending probes, the direct proof) starts clean
+for the new session.  The slot is taken before the handshake, not after it,
+because the handshake's own packets are routed by that path state: a proof
+built by the old session points at a socket the new one does not own, and a
+reply sent there is lost.  *Spike finding:* without this rule a node that
+restarted within the 30 second idle window (an app restart, a relay flap)
+either stalled for the 15 seconds the stale proof stayed fresh -- a 256 MiB
+transfer that took 1.5 s took 22 s -- or, when the old process was still
+alive, never completed the handshake at all.
 
 *Spike findings on the diagram.*  `Idle` exists before `connect()` and is a
 reportable status.  `Probing` can be too brief to observe: the socket sends
@@ -397,7 +415,7 @@ pub struct Session;            // one QUIC connection to one peer
 pub struct Stream;             // one bidirectional QUIC stream
 
 pub enum PathStatus { Idle, Rendezvous, Relayed, Probing, Direct, Reconnecting, Failed(FailReason) }
-pub enum FailReason { Relay, Identity, Timeout }
+pub enum FailReason { Relay, Identity, Timeout, Superseded }
 pub struct PathReport {
     pub status: PathStatus,
     pub relay: Option<String>,      // the relay URL in use, as text

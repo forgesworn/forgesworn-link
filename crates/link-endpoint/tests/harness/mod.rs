@@ -51,7 +51,12 @@ pub struct EndpointOptions {
 }
 
 pub async fn start_endpoint(options: EndpointOptions) -> Endpoint {
-    let mut config = EndpointConfig::new(TransportKey::generate());
+    start_endpoint_with_key(options, TransportKey::generate()).await
+}
+
+/// An endpoint on a chosen key, so a test can bring "the same node" back.
+pub async fn start_endpoint_with_key(options: EndpointOptions, key: TransportKey) -> Endpoint {
+    let mut config = EndpointConfig::new(key);
     config.relays = options.relays;
     config.allow_direct = options.allow_direct;
     config.probe_delay = options.probe_delay;
