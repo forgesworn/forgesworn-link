@@ -396,7 +396,7 @@ fn the_identity_rule_accepts_only_the_pinned_node_id() {
         "any other key fails closed"
     );
 
-    let client_verifier = link_core::tls::PinnedClientVerifier::new(Some(b.node_id()));
+    let client_verifier = link_core::tls::PinnedClientVerifier::new(b.node_id());
     assert!(
         client_verifier.offer_client_auth(),
         "client auth is offered"

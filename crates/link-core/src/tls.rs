@@ -44,13 +44,11 @@ fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
-fn check_pinned(expected: Option<NodeId>, cert: &CertificateDer<'_>) -> Result<NodeId, TlsError> {
+fn check_pinned(expected: NodeId, cert: &CertificateDer<'_>) -> Result<NodeId, TlsError> {
     let presented = node_id_from_cert_der(cert.as_ref()).ok_or(TlsError::InvalidCertificate(
         rustls::CertificateError::BadEncoding,
     ))?;
-    if let Some(expected) = expected
-        && presented.spki_der() != expected.spki_der()
-    {
+    if presented.spki_der() != expected.spki_der() {
         return Err(TlsError::InvalidCertificate(
             rustls::CertificateError::ApplicationVerificationFailure,
         ));
@@ -83,7 +81,7 @@ impl ServerCertVerifier for PinnedServerVerifier {
         _ocsp: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, TlsError> {
-        check_pinned(Some(self.expected), end_entity)?;
+        check_pinned(self.expected, end_entity)?;
         Ok(ServerCertVerified::assertion())
     }
 
@@ -104,7 +102,7 @@ impl ServerCertVerifier for PinnedServerVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, TlsError> {
-        check_pinned(Some(self.expected), cert)?;
+        check_pinned(self.expected, cert)?;
         verify_tls13_signature(
             message,
             cert,
@@ -118,24 +116,94 @@ impl ServerCertVerifier for PinnedServerVerifier {
     }
 }
 
-/// Server side: client authentication is mandatory.  When the expected node ID
-/// is known ahead of the handshake (quinn hands us the synthetic source address
-/// before we accept) the same pin applies; otherwise any well-formed Ed25519
-/// leaf passes here and the caller binds it to the address afterwards.
+/// Server side: client authentication is mandatory and the pin is too.  The
+/// expected node ID is always known ahead of the handshake, because quinn hands
+/// over the synthetic source address before `accept_with` builds this verifier.
+/// There is deliberately no unpinned mode: an endpoint that does not yet know
+/// who it is accepting uses [`RefusingClientVerifier`] and completes nothing.
 #[derive(Debug)]
 pub struct PinnedClientVerifier {
-    expected: Option<NodeId>,
+    expected: NodeId,
     provider: Arc<CryptoProvider>,
     empty: Vec<DistinguishedName>,
 }
 
 impl PinnedClientVerifier {
-    pub fn new(expected: Option<NodeId>) -> Arc<Self> {
+    pub fn new(expected: NodeId) -> Arc<Self> {
         Arc::new(PinnedClientVerifier {
             expected,
             provider: provider(),
             empty: Vec::new(),
         })
+    }
+}
+
+/// The placeholder verifier for an endpoint's default server configuration,
+/// which quinn requires at bind time before any peer is known.  Every inbound
+/// handshake is served through `accept_with` and a [`PinnedClientVerifier`]
+/// built for that connection's expected node ID; this verifier exists only so
+/// the default path can never authenticate anyone.  It refuses every client
+/// certificate.
+#[derive(Debug)]
+pub struct RefusingClientVerifier {
+    empty: Vec<DistinguishedName>,
+}
+
+impl RefusingClientVerifier {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Arc<Self> {
+        Arc::new(RefusingClientVerifier { empty: Vec::new() })
+    }
+}
+
+impl ClientCertVerifier for RefusingClientVerifier {
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &self.empty
+    }
+
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        true
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, TlsError> {
+        Err(TlsError::InvalidCertificate(
+            rustls::CertificateError::ApplicationVerificationFailure,
+        ))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        Err(TlsError::PeerIncompatible(
+            rustls::PeerIncompatible::Tls12NotOffered,
+        ))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        Err(TlsError::InvalidCertificate(
+            rustls::CertificateError::ApplicationVerificationFailure,
+        ))
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![SignatureScheme::ED25519]
     }
 }
 
