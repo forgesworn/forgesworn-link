@@ -129,6 +129,7 @@ async fn fetch_over_link(
         ResponseHeader::Ok { size, content_type } => (size, content_type),
         ResponseHeader::NotFound => return Err(FetchError::UnusableStatus(404)),
         ResponseHeader::Error => return Err(FetchError::UnusableStatus(500)),
+        ResponseHeader::UnsupportedVersion => return Err(FetchError::UnusableStatus(505)),
     };
 
     // Report the path the session actually proved, never inferred from the fact

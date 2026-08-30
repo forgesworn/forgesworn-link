@@ -18,11 +18,14 @@
 //!
 //! ```text
 //!   offset  size  field
-//!   0       1     status: 0x00 ok, 0x01 not found, 0x02 error
+//!   0       1     status: 0x00 ok, 0x01 not found, 0x02 error,
+//!                 0x03 unsupported version
 //! ```
 //!
-//! For `not found` and `error` the header is the single status byte and no body
-//! follows.  For `ok` the status byte is followed by:
+//! For `not found`, `error` and `unsupported version` the header is the single
+//! status byte and no body follows.  A server answers a request whose version
+//! byte it does not speak with `unsupported version`, so a newer client can
+//! tell "too new" from "broken".  For `ok` the status byte is followed by:
 //!
 //! ```text
 //!   1       8     size, u64, the exact body length in bytes
@@ -51,6 +54,8 @@ pub const STATUS_OK: u8 = 0x00;
 pub const STATUS_NOT_FOUND: u8 = 0x01;
 /// The server could not serve the blob for some other reason.
 pub const STATUS_ERROR: u8 = 0x02;
+/// The request named a protocol version this server does not speak.
+pub const STATUS_UNSUPPORTED_VERSION: u8 = 0x03;
 /// Bodies move in pieces no larger than this, so neither side buffers a whole
 /// blob in memory.
 pub const CHUNK: usize = 64 * 1024;
@@ -140,6 +145,8 @@ pub enum ResponseHeader {
     NotFound,
     /// The blob could not be served for some other reason.
     Error,
+    /// The request named a protocol version this server does not speak.
+    UnsupportedVersion,
 }
 
 impl ResponseHeader {
@@ -165,6 +172,7 @@ impl ResponseHeader {
             }
             ResponseHeader::NotFound => vec![STATUS_NOT_FOUND],
             ResponseHeader::Error => vec![STATUS_ERROR],
+            ResponseHeader::UnsupportedVersion => vec![STATUS_UNSUPPORTED_VERSION],
         }
     }
 
@@ -208,6 +216,7 @@ impl ResponseHeader {
             }
             STATUS_NOT_FOUND => Ok((ResponseHeader::NotFound, 1)),
             STATUS_ERROR => Ok((ResponseHeader::Error, 1)),
+            STATUS_UNSUPPORTED_VERSION => Ok((ResponseHeader::UnsupportedVersion, 1)),
             other => Err(WireError::BadStatus(other)),
         }
     }
@@ -271,7 +280,11 @@ mod tests {
 
     #[test]
     fn not_found_and_error_headers_round_trip() {
-        for header in [ResponseHeader::NotFound, ResponseHeader::Error] {
+        for header in [
+            ResponseHeader::NotFound,
+            ResponseHeader::Error,
+            ResponseHeader::UnsupportedVersion,
+        ] {
             let bytes = header.encode();
             assert_eq!(bytes.len(), 1);
             let (decoded, consumed) = ResponseHeader::decode(&bytes).expect("decodes");
