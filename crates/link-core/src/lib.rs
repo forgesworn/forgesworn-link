@@ -7,9 +7,11 @@
 pub mod card;
 pub mod id;
 pub mod path;
+pub mod rendezvous;
 pub mod tls;
 pub mod wire;
 
 pub use card::{Card, Hint, RuleViolation, VerifyContext};
 pub use id::{NodeId, TransportKey};
 pub use path::{FailReason, PathReport, PathStatus};
+pub use rendezvous::{Tag, TagCase};

@@ -9,6 +9,8 @@ publish.workspace = true
 [dependencies]
 ed25519-dalek.workspace = true
 hex.workspace = true
+hkdf.workspace = true
+k256.workspace = true
 rand.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
