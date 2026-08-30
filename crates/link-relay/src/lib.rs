@@ -1,14 +1,23 @@
 //! `link-relay`: the WebSocket datagram relay and the UDP reflector of spec
-//! section 3.  One self-hostable binary, two services, no persistence.
+//! section 3, plus the tag-mode sessions of spec section 9.  One self-hostable
+//! binary, two services, no persistence.
+//!
+//! A session speaks one of two modes, chosen by its first frame.  An identity
+//! session authenticates a node ID and routes by it (spec 3.1, the deployed
+//! behaviour).  A tag session registers pair-scoped rendezvous tags and routes
+//! by them (spec 9): no node ID, no Nostr key and no signature ever reach the
+//! relay on that path, and the relay never logs a tag.
 
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use link_core::id::NodeId;
+use link_core::rendezvous::Tag;
 use link_core::wire::{
     CLOSE_REASON_MALFORMED, Frame, IDLE_CLOSE_SECONDS, MAX_QUEUED_FRAMES, REFLECT_REQUEST_BYTES,
     parse_reflect_request, reflect_reply, verify_relay_auth,
@@ -36,7 +45,8 @@ pub struct RelayConfig {
     pub tls: Option<TlsMaterial>,
     /// Per-session outbound byte budget.  Zero means the operator set no budget.
     pub bytes_per_second: u64,
-    /// Cap on concurrent authenticated sessions.
+    /// Cap on concurrent sessions, counted from accept so unauthenticated
+    /// handshakes cannot slip under it.
     pub max_sessions: usize,
     /// Reflector replies per source address per second.
     pub reflector_per_second: f64,
@@ -117,10 +127,20 @@ impl RelayHandle {
 
 #[derive(Default)]
 struct Registry {
+    /// Identity-mode sessions, spec 3.1: node ID to outbound queue.
     sessions: HashMap<NodeId, mpsc::Sender<Frame>>,
+    /// Tag-mode sessions, spec 9: tag to (session id, outbound queue).  In
+    /// practice a tag has the two ends of one pair; the Vec covers the epoch
+    /// and card-rotation transition windows.
+    tags: HashMap<Tag, Vec<(u64, mpsc::Sender<Frame>)>>,
+    /// Connections currently inside `serve_session`, both modes, counted from
+    /// accept so unauthenticated handshakes cannot slip under the cap.
+    live: usize,
 }
 
 type Shared = Arc<Mutex<Registry>>;
+
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Start both services.  Returns once the sockets are bound.
 pub async fn start(config: RelayConfig) -> anyhow::Result<RelayHandle> {
@@ -158,10 +178,16 @@ pub async fn start(config: RelayConfig) -> anyhow::Result<RelayHandle> {
                         continue;
                     }
                 };
-                let live = registry.lock().expect("registry").sessions.len();
-                if live >= config.max_sessions {
-                    debug!(live, "relay at session cap, dropping connection");
-                    continue;
+                {
+                    let mut guard = registry.lock().expect("registry");
+                    if guard.live >= config.max_sessions {
+                        debug!(
+                            live = guard.live,
+                            "relay at session cap, dropping connection"
+                        );
+                        continue;
+                    }
+                    guard.live += 1;
                 }
                 let registry = registry.clone();
                 let config = config.clone();
@@ -169,10 +195,12 @@ pub async fn start(config: RelayConfig) -> anyhow::Result<RelayHandle> {
                 let stop_rx = session_stop.clone();
                 tokio::spawn(async move {
                     if let Err(e) =
-                        serve_session(stream, peer, acceptor, config, registry, stop_rx).await
+                        serve_session(stream, peer, acceptor, config, registry.clone(), stop_rx)
+                            .await
                     {
                         debug!(error = %e, "relay session ended");
                     }
+                    registry.lock().expect("registry").live -= 1;
                 });
             }
         });
@@ -269,6 +297,43 @@ impl SourceLimiter {
     }
 }
 
+/// Which kind of session the first frame chose.
+enum Mode {
+    Identity(NodeId),
+    Tags(Vec<Tag>),
+}
+
+/// Replace `session_id`'s registrations: drop `current`, add `next`.  A later
+/// `Register` carries the full replacement set, which is how an endpoint
+/// rotates epochs and cards.
+fn register_tags(
+    registry: &Shared,
+    session_id: u64,
+    tx: &mpsc::Sender<Frame>,
+    current: &[Tag],
+    next: &[Tag],
+) {
+    let mut guard = registry.lock().expect("registry");
+    for tag in current {
+        let empty = match guard.tags.get_mut(tag) {
+            Some(entries) => {
+                entries.retain(|(id, _)| *id != session_id);
+                entries.is_empty()
+            }
+            None => false,
+        };
+        if empty {
+            guard.tags.remove(tag);
+        }
+    }
+    for tag in next {
+        let entries = guard.tags.entry(*tag).or_default();
+        if !entries.iter().any(|(id, _)| *id == session_id) {
+            entries.push((session_id, tx.clone()));
+        }
+    }
+}
+
 async fn serve_session(
     stream: TcpStream,
     peer: SocketAddr,
@@ -284,16 +349,24 @@ async fn serve_session(
     };
     let mut ws = tokio_tungstenite::accept_async(transport).await?;
 
-    // Authentication, spec 3.1.
+    // First contact.  The relay always issues a challenge; an identity session
+    // answers it with a signature (spec 3.1), a tag session ignores it and
+    // registers its tags instead (spec 9), so no identity ever reaches the tag
+    // path.
     let mut challenge = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut challenge);
     ws.send(binary(Frame::Challenge(challenge))).await?;
 
-    let auth = tokio::time::timeout(Duration::from_secs(10), ws.next())
+    let first = tokio::time::timeout(Duration::from_secs(10), ws.next())
         .await
-        .map_err(|_| anyhow::anyhow!("auth timed out"))?
-        .ok_or_else(|| anyhow::anyhow!("closed before auth"))??;
-    let node_id = match decode_binary(&auth) {
+        .map_err(|_| anyhow::anyhow!("first frame timed out"))?
+        .ok_or_else(|| anyhow::anyhow!("closed before the first frame"))??;
+
+    let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+    // Bounded outbound queue, spec 3.1: at most 64 queued frames per session.
+    let (tx, mut rx) = mpsc::channel::<Frame>(MAX_QUEUED_FRAMES);
+
+    let mut mode = match decode_binary(&first) {
         Some(Frame::Auth { node_id, signature }) => {
             let ok = config
                 .hosts
@@ -303,28 +376,30 @@ async fn serve_session(
                 let _ = ws.send(binary(Frame::Close(CLOSE_REASON_MALFORMED))).await;
                 anyhow::bail!("auth signature refused");
             }
-            node_id
+            registry
+                .lock()
+                .expect("registry")
+                .sessions
+                .insert(node_id, tx.clone());
+            Mode::Identity(node_id)
+        }
+        Some(Frame::Register { tags }) => {
+            register_tags(&registry, session_id, &tx, &[], &tags);
+            Mode::Tags(tags)
         }
         _ => {
             let _ = ws.send(binary(Frame::Close(CLOSE_REASON_MALFORMED))).await;
-            anyhow::bail!("first frame was not a valid auth");
+            anyhow::bail!("first frame was not an auth or a register");
         }
     };
 
     let mut token = [0u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut token);
     let token_hex = hex_lower(&token);
-
-    // Bounded outbound queue, spec 3.1: at most 64 queued frames per session.
-    let (tx, mut rx) = mpsc::channel::<Frame>(MAX_QUEUED_FRAMES);
-    registry
-        .lock()
-        .expect("registry")
-        .sessions
-        .insert(node_id, tx.clone());
     ws.send(binary(Frame::Welcome(token))).await?;
-    // Only the routing token and counters are logged.  The node ID is never logged
-    // and never persisted past the session, spec 3.1.
+    // Only the routing token and counters are logged.  Neither the node ID nor
+    // any tag is ever logged, and both leave memory with the session, spec 3.1
+    // and spec 9.
     info!(token = %token_hex, source = %peer.ip(), "relay session up");
 
     let mut last_ping = Instant::now();
@@ -378,6 +453,11 @@ async fn serve_session(
                 frames_in += 1;
                 match frame {
                     Frame::Send { destination, datagram } => {
+                        let Mode::Identity(node_id) = &mode else {
+                            let _ = ws.send(binary(Frame::Close(CLOSE_REASON_MALFORMED))).await;
+                            break Err(anyhow::anyhow!("identity frame on a tag session"));
+                        };
+                        let source = *node_id;
                         bytes_in += datagram.len() as u64;
                         if !budget.allow(datagram.len() as u64) {
                             dropped += 1;
@@ -394,7 +474,7 @@ async fn serve_session(
                         match target {
                             Some(target) => {
                                 if target
-                                    .try_send(Frame::Recv { source: node_id, datagram })
+                                    .try_send(Frame::Recv { source, datagram })
                                     .is_err()
                                 {
                                     dropped += 1;
@@ -403,13 +483,60 @@ async fn serve_session(
                             None => dropped += 1,
                         }
                     }
+                    Frame::SendTag { tag, datagram } => {
+                        if !matches!(mode, Mode::Tags(_)) {
+                            let _ = ws.send(binary(Frame::Close(CLOSE_REASON_MALFORMED))).await;
+                            break Err(anyhow::anyhow!("tag frame on an identity session"));
+                        }
+                        bytes_in += datagram.len() as u64;
+                        if !budget.allow(datagram.len() as u64) {
+                            dropped += 1;
+                            continue;
+                        }
+                        // Deliver to every other session registered with this
+                        // tag.  A tag nobody has registered is dropped silently,
+                        // so the relay never amplifies.
+                        let targets: Vec<mpsc::Sender<Frame>> = registry
+                            .lock()
+                            .expect("registry")
+                            .tags
+                            .get(&tag)
+                            .map(|entries| {
+                                entries
+                                    .iter()
+                                    .filter(|(id, _)| *id != session_id)
+                                    .map(|(_, sender)| sender.clone())
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if targets.is_empty() {
+                            dropped += 1;
+                        } else {
+                            for target in targets {
+                                if target
+                                    .try_send(Frame::RecvTag { tag, datagram: datagram.clone() })
+                                    .is_err()
+                                {
+                                    dropped += 1;
+                                }
+                            }
+                        }
+                    }
+                    Frame::Register { tags: next } => {
+                        let Mode::Tags(current) = &mode else {
+                            let _ = ws.send(binary(Frame::Close(CLOSE_REASON_MALFORMED))).await;
+                            break Err(anyhow::anyhow!("register on an identity session"));
+                        };
+                        register_tags(&registry, session_id, &tx, current, &next);
+                        mode = Mode::Tags(next);
+                    }
                     Frame::Ping(opaque) => {
                         last_ping = Instant::now();
                         ws.send(binary(Frame::Pong(opaque))).await?;
                     }
                     Frame::Pong(_) => last_ping = Instant::now(),
                     Frame::Close(_) => break Ok(()),
-                    // A client may only send, ping, pong or close.
+                    // A client may only send, register, ping, pong or close.
                     _ => {
                         let _ = ws.send(binary(Frame::Close(CLOSE_REASON_MALFORMED))).await;
                         break Err(anyhow::anyhow!("unexpected frame from client"));
@@ -419,13 +546,18 @@ async fn serve_session(
         }
     };
 
-    // The node ID leaves the relay's memory with the session.
-    {
-        let mut guard = registry.lock().expect("registry");
-        if let Some(existing) = guard.sessions.get(&node_id)
-            && existing.same_channel(&tx)
-        {
-            guard.sessions.remove(&node_id);
+    // Whatever the session registered leaves the relay's memory with it.
+    match &mode {
+        Mode::Identity(node_id) => {
+            let mut guard = registry.lock().expect("registry");
+            if let Some(existing) = guard.sessions.get(node_id)
+                && existing.same_channel(&tx)
+            {
+                guard.sessions.remove(node_id);
+            }
+        }
+        Mode::Tags(current) => {
+            register_tags(&registry, session_id, &tx, current, &[]);
         }
     }
     info!(
