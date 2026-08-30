@@ -1,10 +1,11 @@
 # ForgeSworn Link
 
 A wide-area transport lane for ForgeSworn storage: two nodes find a
-route, attempt a direct QUIC path, and fall back to an opaque relay, without
-renting one company's endpoint IDs, DNS service or public relay estate.  It is
-the native lane a Bothy box or a Tor-less Wildbloom node uses to mirror and
-repair between machines.
+route, attempt a direct QUIC path, and fall back to an opaque relay, on
+upstream `quinn` and `rustls`, with no third-party endpoint IDs, discovery
+service or relay estate inside the contract and a relay that, in tag mode,
+learns no identity at all.  It is the native lane a Bothy box or a Tor-less
+Wildbloom node uses to mirror and repair between machines.
 
 We own the small contract that matters -- how a node identifies itself, how two
 nodes discover a route, how they attempt a direct connection, how they fall back
@@ -16,7 +17,7 @@ Licensed MIT.
 
 The design is the Phase 0 specification: the `FSL-CARD-1` address card, the
 WebSocket relay and UDP reflector, the path socket with its synthetic addressing
-and signed probes, the single TLS identity rule, and the narrow `Endpoint` /
+and session-keyed probes, the single TLS identity rule, and the narrow `Endpoint` /
 `Session` / `Stream` surface.  `link-blossom` adds a hash-addressed blob-fetch
 protocol over that surface and an optional `shelter-kit` `BlobFetcher` adapter,
 so a storage node mirrors and repairs over the lane through the same interface
@@ -37,9 +38,9 @@ is listed under [What this does NOT prove](#what-this-does-not-prove).
 
 | Crate | What it holds |
 | --- | --- |
-| `link-core` | Node identity and base32 node IDs, `FSL-CARD-1` encode and verify, SPKI helpers, the synthetic IPv6 address, relay-auth and probe signing, relay frame codec, the rustls verifiers that carry the one identity rule, the `PathStatus` and `PathReport` types |
+| `link-core` | Node identity and base32 node IDs, `FSL-CARD-1` encode and verify, SPKI helpers, the synthetic IPv6 address, relay-auth signing, the session-keyed probe codec, relay frame codec, the rustls verifiers that carry the one identity rule, the `PathStatus` and `PathReport` types |
 | `link-relay` | The `link-relay` binary: bounded WebSocket datagram relay plus the stateless UDP reflector |
-| `link-endpoint` | `Endpoint`, `Session`, `Stream`, the path socket implementing quinn's `AsyncUdpSocket`, candidate exchange on the control stream, signed UDP probing, and the state machine with its recorded transition history |
+| `link-endpoint` | `Endpoint`, `Session`, `Stream`, the path socket implementing quinn's `AsyncUdpSocket`, candidate exchange on the control stream, session-keyed UDP probing, and the state machine with its recorded transition history |
 | `link-blossom` | The hash-addressed blob-fetch protocol over a `Session` stream, a transport-neutral `BlobSource` serving trait, and an optional `LinkFetcher` (behind the `shelter-kit` feature) implementing `shelter_kit::BlobFetcher` for mirror and repair |
 | `link-spike` | The `link-spike` binary: `keygen`, `card`, `serve`, `send` |
 
@@ -250,11 +251,11 @@ convenience alone.
 
 6. **Both sides must probe before either can use a direct path.**  Spec 4.1
    drops "a datagram from an unproven address", and spec 4.2 only makes an
-   address proved when a signed pong for a nonce *this side* issued arrives.
+   address proved when a pong for a nonce *this side* issued arrives.
    Together those mean a peer that answers pings but never sends its own will
    drop every direct datagram the other side sends it.  The implementation
    therefore probes back, rate-limited to one ping per address per second,
-   whenever a valid signed ping arrives from an address it has no fresh proof
+   whenever a valid ping arrives from an address it has no fresh proof
    for.  The spec should say this explicitly, or say that a verified inbound
    ping is itself sufficient to accept traffic from that address.
 

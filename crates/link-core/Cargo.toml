@@ -10,6 +10,7 @@ publish.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
 hkdf.workspace = true
+hmac.workspace = true
 k256.workspace = true
 rand.workspace = true
 rcgen.workspace = true

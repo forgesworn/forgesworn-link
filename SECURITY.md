@@ -19,6 +19,12 @@ working exploit or a step-by-step extraction path.
 - The single TLS rule is that the peer's presented public key must byte-equal
   the expected node ID and its TLS 1.3 signature must validate. An endpoint that
   presents any other key fails closed.
+- Direct-path probes authenticate the live session, not the long-term key:
+  both ends derive the probe key from the TLS session (RFC 8446 exporter),
+  a probe carries a key id and a MAC and no node ID, and the key dies with
+  the session. A captured probe opens under no other session; a replay into
+  the same session earns at most one pong a second and a candidate that
+  lapses in ten seconds.
 - **Authentication is not authorisation.** In identity mode any node with a
   relay session can start a handshake with any node ID it knows, and the
   transport pins the handshake to that ID; whether that node may talk to this

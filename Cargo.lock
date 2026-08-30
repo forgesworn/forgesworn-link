@@ -1356,6 +1356,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "hkdf",
+ "hmac",
  "k256",
  "rand 0.8.8",
  "rcgen",

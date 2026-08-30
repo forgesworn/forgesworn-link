@@ -5,7 +5,10 @@ use std::path::PathBuf;
 
 use link_core::card::{Card, VerifyContext};
 use link_core::id::{NodeId, TransportKey, node_id_from_spki};
-use link_core::wire::{Probe, sign_relay_auth, verify_relay_auth};
+use link_core::wire::{
+    PROBE_BODY_BYTES, PROBE_DOMAIN_V2, PROBE_EXPORT_BYTES, PROBE_EXPORT_LABEL, PROBE_WIRE_BYTES,
+    Probe, sign_relay_auth, verify_relay_auth,
+};
 use serde_json::Value;
 
 fn vectors_dir() -> PathBuf {
@@ -231,58 +234,92 @@ fn relay_auth_vector_matches() {
 }
 
 #[test]
-fn probe_vectors_match() {
+fn probe_v2_vectors_match() {
     let vector = load("probe.json");
-    let a = node_a();
-    let b = node_b();
+    assert_eq!(vector["version"].as_u64(), Some(2), "probe version byte");
+    assert_eq!(
+        vector["wire_bytes"].as_u64(),
+        Some(PROBE_WIRE_BYTES as u64),
+        "wire length"
+    );
+    assert_eq!(
+        hex_field(&vector, "domain_hex"),
+        PROBE_DOMAIN_V2.to_vec(),
+        "MAC domain"
+    );
+    assert_eq!(
+        vector["export_label"].as_str().map(str::as_bytes),
+        Some(PROBE_EXPORT_LABEL),
+        "exporter label"
+    );
+    assert_eq!(
+        vector["export_bytes"].as_u64(),
+        Some(PROBE_EXPORT_BYTES as u64),
+        "exporter length"
+    );
+    let key: [u8; 32] = hex_field(&vector, "key_hex").try_into().unwrap();
+    let key_id: [u8; 8] = hex_field(&vector, "key_id_hex").try_into().unwrap();
+    let nonce: [u8; 16] = hex_field(&vector, "nonce_hex").try_into().unwrap();
+    let wrong: [u8; 32] = hex_field(&vector["hostile"], "wrong_key_hex")
+        .try_into()
+        .unwrap();
+    let truncated_len = vector["hostile"]["truncated_len"].as_u64().unwrap() as usize;
+    let flipped_byte = vector["hostile"]["flipped_byte"].as_u64().unwrap() as usize;
 
-    for (name, kind, signer, sender, receiver) in [
-        (
-            "ping",
-            link_core::wire::PROBE_PING,
-            &a,
-            a.node_id(),
-            b.node_id(),
-        ),
-        (
-            "pong",
-            link_core::wire::PROBE_PONG,
-            &b,
-            b.node_id(),
-            a.node_id(),
-        ),
+    for (name, kind) in [
+        ("ping", link_core::wire::PROBE_PING),
+        ("pong", link_core::wire::PROBE_PONG),
     ] {
         let entry = &vector[name];
-        let body = hex_field(entry, "bytes_hex");
-        let nonce: [u8; 16] = body[69..85].try_into().unwrap();
+        assert_eq!(entry["kind"].as_u64(), Some(u64::from(kind)));
         let probe = Probe {
             kind,
-            sender,
-            receiver,
+            key_id,
             nonce,
         };
-
-        assert_eq!(probe.body().to_vec(), body, "{name} body");
         assert_eq!(
-            probe.signing_input(),
-            hex_field(entry, "signing_input_hex"),
-            "{name} input"
+            probe.body().to_vec(),
+            hex_field(entry, "body_hex"),
+            "{name} body"
         );
-        let wire = probe.sign(signer);
+        let wire = probe.seal(&key);
         assert_eq!(
-            wire[85..].to_vec(),
-            hex_field(entry, "signature_hex"),
-            "{name} signature"
+            wire[PROBE_BODY_BYTES..].to_vec(),
+            hex_field(entry, "mac_hex"),
+            "{name} MAC"
         );
         assert_eq!(wire.to_vec(), hex_field(entry, "wire_hex"), "{name} wire");
-        assert_eq!(Probe::parse_verified(&wire), Some(probe), "{name} verifies");
+        assert_eq!(Probe::peek_key_id(&wire), Some(key_id), "{name} key id");
+        assert_eq!(Probe::open(&wire, &key), Some(probe), "{name} opens");
 
-        let mut tampered = wire;
-        tampered[70] ^= 0x01;
         assert_eq!(
-            Probe::parse_verified(&tampered),
+            Probe::open(&wire, &wrong),
             None,
-            "{name} tampered nonce rejects"
+            "{name} under the wrong key"
+        );
+        assert_eq!(
+            Probe::open(&wire[..truncated_len], &key),
+            None,
+            "{name} truncated"
+        );
+        assert_eq!(
+            Probe::peek_key_id(&wire[..truncated_len]),
+            None,
+            "{name} truncated has no key id"
+        );
+        let mut flipped = wire;
+        flipped[flipped_byte] ^= 0x01;
+        assert_eq!(
+            Probe::open(&flipped, &key),
+            None,
+            "{name} with a flipped MAC bit"
+        );
+        let mut other_nonce = wire;
+        other_nonce[14] ^= 0x01;
+        assert_eq!(
+            Probe::open(&other_nonce, &key),
+            None,
+            "{name} with a tampered nonce"
         );
     }
 }
