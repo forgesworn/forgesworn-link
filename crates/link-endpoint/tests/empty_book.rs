@@ -50,7 +50,7 @@ async fn an_empty_book_idles_then_registers_on_the_first_upsert() {
     // still be idling in Connecting, not Failed.
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert_ne!(
-        a.paths().relay().status(),
+        a.paths().relay().home().status(),
         RelayStatus::Failed,
         "a peerless tag node must idle, not die"
     );

@@ -149,19 +149,16 @@ mod tests {
 
     #[tokio::test]
     async fn an_arc_dyn_source_serves_through_the_blanket_impl() {
-        let source = MapBlobSource::new().with_blob("aa".repeat(32), None, "bytes");
-        let shared: Arc<dyn BlobSource> = Arc::new(source);
         // The blanket impl is what makes Arc<dyn BlobSource> itself a
         // BlobSource, so a generic caller accepts it without a newtype.
-        fn generic<S: BlobSource>(source: &S, sha256: &str) -> BoxFuture<'_, Option<BlobBytes>>
-        where
-            S: Sized,
-        {
-            source.get(sha256)
+        async fn via_generic<S: BlobSource>(source: &S, sha256: &str) -> Option<BlobBytes> {
+            source.get(sha256).await
         }
-        let hit = generic(&shared, &"aa".repeat(32)).await;
+        let source = MapBlobSource::new().with_blob("aa".repeat(32), None, "bytes");
+        let shared: Arc<dyn BlobSource> = Arc::new(source);
+        let hit = via_generic(&shared, &"aa".repeat(32)).await;
         assert_eq!(hit.expect("held").size, 5);
-        let miss = generic(&shared, &"bb".repeat(32)).await;
+        let miss = via_generic(&shared, &"bb".repeat(32)).await;
         assert!(miss.is_none());
     }
 }
