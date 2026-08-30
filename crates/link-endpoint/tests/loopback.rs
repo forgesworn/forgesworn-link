@@ -461,3 +461,79 @@ async fn unproven_addresses_and_forged_probes_are_dropped() {
     assert_eq!(sink.await.expect("sink"), 1);
     relay.shutdown();
 }
+
+/// A `request_direct` on one side makes the *other* side start its own
+/// probing round at once (the `punch-now` control message, spec 4.2), rather
+/// than only answering pings.  Both ends punching in the same instant is what
+/// a NAT mapping needs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn punch_now_starts_a_round_on_the_peer() {
+    init_tracing();
+    let relay = start_relay().await;
+    let url = relay.url("127.0.0.1");
+    let options = || EndpointOptions {
+        relays: vec![RelaySpec::plain(url.clone())],
+        allow_direct: true,
+        probe_delay: NEVER,
+        reflector: Some(relay.udp_addr),
+    };
+    let alice = start_endpoint(options()).await;
+    let bob = Arc::new(start_endpoint(options()).await);
+    let card = exchange_card(&bob);
+    let accepting = {
+        let bob = bob.clone();
+        tokio::spawn(async move { bob.accept().await })
+    };
+    let session = alice.connect(&card).await.expect("alice connects");
+    let bob_session = Arc::new(accepting.await.unwrap().expect("bob accepts"));
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        bob_session.punch_requests(),
+        0,
+        "nobody has asked bob for a round yet, history: {}",
+        describe(&bob_session.history())
+    );
+    assert!(
+        !saw(&session.history(), PathStatus::Probing),
+        "alice is idle until asked, history: {}",
+        describe(&session.history())
+    );
+
+    session.request_direct();
+    assert!(
+        wait_until(Duration::from_secs(5), || bob_session.punch_requests() >= 1).await,
+        "bob received alice's punch-now on the control stream, history: {}",
+        describe(&bob_session.history())
+    );
+    let history = wait_for_history(&session, Duration::from_secs(10), |h| {
+        saw(h, PathStatus::Probing)
+    })
+    .await;
+    let probing = history
+        .iter()
+        .find(|report| report.status == PathStatus::Probing)
+        .unwrap_or_else(|| {
+            panic!(
+                "alice never started a round, history: {}",
+                describe(&history)
+            )
+        });
+    assert!(
+        probing.cause.contains("requested here"),
+        "alice's round records who asked, cause: {}",
+        probing.cause
+    );
+    // Both sides reach Direct: bob by answering alice's pings and, had a NAT
+    // eaten those, by the round the punch-now started.
+    let bob_history = wait_for_history(&bob_session, Duration::from_secs(10), |h| {
+        saw(h, PathStatus::Direct)
+    })
+    .await;
+    assert!(
+        saw(&bob_history, PathStatus::Direct),
+        "bob: {}",
+        describe(&bob_history)
+    );
+    relay.shutdown();
+}

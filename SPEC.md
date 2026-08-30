@@ -274,6 +274,19 @@ candidate of the other side:
   peer that answers pings but never issues its own is proved by nobody, and
   every direct datagram it sends is dropped under 4.1.
 
+The control stream carries two message kinds, each a `u32` big-endian length
+followed by a kind byte and a body: `0x01 candidates` (a `u8` count, then
+18-byte address entries as in the `udp` hint) and `0x02 punch-now` (no body).
+A side MAY re-send `candidates` whenever its addresses change and SHOULD
+follow it with `punch-now`.  On receiving `punch-now` a side starts a probing
+round at once, so both ends punch in the same instant, which is what a NAT
+mapping needs: a round started by one side's timer alone reaches a peer whose
+own round is on a different timer only if the peer's NAT happens to be open,
+and after one failed round the two cooldowns drift apart.  A side counts the
+`punch-now` messages it receives, so an operator can tell "the peer never
+asked" from "the peer asked and every probe was lost".  Unknown kinds are
+ignored.
+
 Probes carry node IDs in clear, which an on-path observer can read.  They
 never carry anything else.  Encrypting them is future work.
 
