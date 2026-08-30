@@ -3,12 +3,14 @@
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+
 use crate::card::to_ipv6;
 use crate::id::{NodeId, TransportKey};
 use crate::rendezvous::{TAG_BYTES, Tag};
 
 pub const RELAY_AUTH_DOMAIN: &[u8] = b"forgesworn-link/relay-auth/v1\0";
-pub const PROBE_DOMAIN: &[u8] = b"forgesworn-link/probe/v1\0";
 
 /// Largest QUIC datagram a relay frame may carry, spec 3.1.
 pub const MAX_DATAGRAM: usize = 1350;
@@ -313,21 +315,43 @@ pub fn parse_reflect_reply(bytes: &[u8]) -> Option<([u8; 16], SocketAddr)> {
 }
 
 // ---------------------------------------------------------------------------
-// Signed probes, spec 4.2
+// Session-keyed probes, spec 4.2 (probe version 2)
 // ---------------------------------------------------------------------------
+//
+// Version 1 was signed by the node's long-term key and carried both node IDs
+// in clear, so an on-path observer read who was probing whom and a captured
+// ping could be replayed into any later session.  Version 2 is keyed to the
+// QUIC session: both sides export the same 40 bytes from the TLS session,
+// the first 32 are the HMAC key and the last 8 the key id the receiver looks
+// the session up by.  A probe therefore authenticates the live session, names
+// nobody, and dies with the session.
 
 pub const PROBE_MAGIC: [u8; 4] = *b"FSLP";
+/// The probe version byte; a change means new vectors.
+pub const PROBE_VERSION: u8 = 0x02;
 pub const PROBE_PING: u8 = 0x01;
 pub const PROBE_PONG: u8 = 0x02;
-/// Magic, kind, sender, receiver, nonce.
-pub const PROBE_BODY_BYTES: usize = 4 + 1 + 32 + 32 + 16;
-pub const PROBE_WIRE_BYTES: usize = PROBE_BODY_BYTES + 64;
+/// Domain separator for the probe MAC.
+pub const PROBE_DOMAIN_V2: &[u8] = b"forgesworn-link/probe/v2\0";
+/// The TLS exporter label (RFC 8446 section 7.5) both sides derive the probe
+/// material from, with an empty context.
+pub const PROBE_EXPORT_LABEL: &[u8] = b"forgesworn-link/probe/v2";
+pub const PROBE_KEY_BYTES: usize = 32;
+pub const PROBE_ID_BYTES: usize = 8;
+/// Both sides export this many bytes: key `[0..32]`, key id `[32..40]`.
+pub const PROBE_EXPORT_BYTES: usize = PROBE_KEY_BYTES + PROBE_ID_BYTES;
+/// Magic, version, kind, key id, nonce.
+pub const PROBE_BODY_BYTES: usize = 4 + 1 + 1 + PROBE_ID_BYTES + 16;
+pub const PROBE_MAC_BYTES: usize = 32;
+pub const PROBE_WIRE_BYTES: usize = PROBE_BODY_BYTES + PROBE_MAC_BYTES;
+
+type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Probe {
     pub kind: u8,
-    pub sender: NodeId,
-    pub receiver: NodeId,
+    /// Which session's key seals this probe.
+    pub key_id: [u8; PROBE_ID_BYTES],
     pub nonce: [u8; 16],
 }
 
@@ -335,47 +359,60 @@ impl Probe {
     pub fn body(&self) -> [u8; PROBE_BODY_BYTES] {
         let mut out = [0u8; PROBE_BODY_BYTES];
         out[..4].copy_from_slice(&PROBE_MAGIC);
-        out[4] = self.kind;
-        out[5..37].copy_from_slice(self.sender.as_bytes());
-        out[37..69].copy_from_slice(self.receiver.as_bytes());
-        out[69..].copy_from_slice(&self.nonce);
+        out[4] = PROBE_VERSION;
+        out[5] = self.kind;
+        out[6..6 + PROBE_ID_BYTES].copy_from_slice(&self.key_id);
+        out[6 + PROBE_ID_BYTES..].copy_from_slice(&self.nonce);
         out
     }
 
-    pub fn signing_input(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(PROBE_DOMAIN.len() + PROBE_BODY_BYTES);
-        out.extend_from_slice(PROBE_DOMAIN);
-        out.extend_from_slice(&self.body());
-        out
+    fn mac(key: &[u8; PROBE_KEY_BYTES]) -> HmacSha256 {
+        let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+        mac.update(PROBE_DOMAIN_V2);
+        mac
     }
 
-    pub fn sign(&self, key: &TransportKey) -> [u8; PROBE_WIRE_BYTES] {
-        let signature = key.sign(&self.signing_input());
+    /// The wire bytes: body, then HMAC-SHA256 over the domain and the body
+    /// under the session's probe key.
+    pub fn seal(&self, key: &[u8; PROBE_KEY_BYTES]) -> [u8; PROBE_WIRE_BYTES] {
+        let body = self.body();
+        let mut mac = Self::mac(key);
+        mac.update(&body);
+        let tag = mac.finalize().into_bytes();
         let mut out = [0u8; PROBE_WIRE_BYTES];
-        out[..PROBE_BODY_BYTES].copy_from_slice(&self.body());
-        out[PROBE_BODY_BYTES..].copy_from_slice(&signature);
+        out[..PROBE_BODY_BYTES].copy_from_slice(&body);
+        out[PROBE_BODY_BYTES..].copy_from_slice(&tag);
         out
     }
 
-    /// Parse and verify in one step.  An unsigned or badly signed probe is not a probe.
-    pub fn parse_verified(bytes: &[u8]) -> Option<Probe> {
-        if bytes.len() != PROBE_WIRE_BYTES || bytes[..4] != PROBE_MAGIC {
+    /// The key id of a datagram that has a probe's shape, so the receiver can
+    /// find the session before it verifies anything.  `None` for anything
+    /// that is not a version-2 probe of the right length.
+    pub fn peek_key_id(bytes: &[u8]) -> Option<[u8; PROBE_ID_BYTES]> {
+        if bytes.len() != PROBE_WIRE_BYTES || bytes[..4] != PROBE_MAGIC || bytes[4] != PROBE_VERSION
+        {
             return None;
         }
-        let kind = bytes[4];
+        bytes[6..6 + PROBE_ID_BYTES].try_into().ok()
+    }
+
+    /// Verify the MAC in constant time under the session key the key id named
+    /// and parse the probe.  A probe that does not verify is not a probe.
+    pub fn open(bytes: &[u8], key: &[u8; PROBE_KEY_BYTES]) -> Option<Probe> {
+        let key_id = Self::peek_key_id(bytes)?;
+        let kind = bytes[5];
         if kind != PROBE_PING && kind != PROBE_PONG {
             return None;
         }
-        let probe = Probe {
+        let mut mac = Self::mac(key);
+        mac.update(&bytes[..PROBE_BODY_BYTES]);
+        mac.verify_slice(&bytes[PROBE_BODY_BYTES..]).ok()?;
+        Some(Probe {
             kind,
-            sender: NodeId::from_slice(&bytes[5..37])?,
-            receiver: NodeId::from_slice(&bytes[37..69])?,
-            nonce: bytes[69..PROBE_BODY_BYTES].try_into().ok()?,
-        };
-        let signature: [u8; 64] = bytes[PROBE_BODY_BYTES..].try_into().ok()?;
-        if !probe.sender.verify(&probe.signing_input(), &signature) {
-            return None;
-        }
-        Some(probe)
+            key_id,
+            nonce: bytes[6 + PROBE_ID_BYTES..PROBE_BODY_BYTES]
+                .try_into()
+                .ok()?,
+        })
     }
 }

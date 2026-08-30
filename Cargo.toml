@@ -25,6 +25,7 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 hex = "0.4"
 if-addrs = "0.15"
 hkdf = "0.12"
+hmac = "0.12"
 k256 = { version = "0.13", default-features = false, features = ["ecdh", "arithmetic", "std"] }
 libc = "0.2"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
