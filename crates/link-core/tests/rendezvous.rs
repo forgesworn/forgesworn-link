@@ -120,3 +120,39 @@ fn rejects_an_invalid_point() {
     assert!(!valid_compressed_point(&bad));
     assert!(!valid_compressed_point(&[0x02; 32]));
 }
+
+#[test]
+fn rejects_the_sec1_compact_spelling_of_a_real_point() {
+    // Tag 0x05 (SEC1 compact, even-Y) parses in a bare from_sec1_bytes call
+    // and carries a genuine on-curve x, so this is the regression case: one
+    // point must have exactly one spelling inside signed card bytes.
+    let v = load();
+    let mut compact = hex33(&v, "/testOnlyKeys/nostrAPubCompressedHex");
+    compact[0] = 0x05;
+    assert!(!valid_compressed_point(&compact));
+    let scalar = hex32(&v, "/testOnlyKeys/nostrBPrivHex");
+    assert_eq!(ecdh_x(&scalar, &compact), None, "ecdh_x refuses it too");
+}
+
+#[test]
+fn a_compact_spelling_in_a_card_fails_rule_three() {
+    use link_core::card::{Card, HINT_EPHEMERAL, Hint, VerifyContext};
+    use link_core::id::TransportKey;
+    let v = load();
+    let mut compact = hex33(&v, "/testOnlyKeys/nostrAPubCompressedHex");
+    compact[0] = 0x05;
+    let key = TransportKey::generate();
+    let card = Card::sign(
+        &key,
+        1_000,
+        2_000,
+        1,
+        vec![Hint {
+            kind: HINT_EPHEMERAL,
+            value: compact.to_vec(),
+        }],
+    );
+    let err = Card::verify(card.as_bytes(), &VerifyContext::new(1_000))
+        .expect_err("a compact ephemeral spelling fails the whole card");
+    assert_eq!(err.rule, 3, "refused under the hint rule: {err}");
+}
