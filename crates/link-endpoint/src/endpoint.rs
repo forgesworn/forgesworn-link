@@ -8,7 +8,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use link_core::card::{Card, Hint};
 use link_core::id::{NodeId, TransportKey, node_id_from_cert_der};
 use link_core::path::FailReason;
-use link_core::tls::{PinnedClientVerifier, PinnedServerVerifier, node_certificate};
+use link_core::tls::{
+    PinnedClientVerifier, PinnedServerVerifier, RefusingClientVerifier, node_certificate,
+};
 use quinn::VarInt;
 use tracing::{info, warn};
 
@@ -74,7 +76,9 @@ impl Endpoint {
             rustls::crypto::ring::default_provider(),
         ))
         .with_protocol_versions(&[&rustls::version::TLS13])?
-        .with_client_cert_verifier(PinnedClientVerifier::new(None))
+        // The default server config can never authenticate anyone: every real
+        // inbound handshake goes through accept_with and a per-connection pin.
+        .with_client_cert_verifier(RefusingClientVerifier::new())
         .with_single_cert(vec![leaf.cert_der.clone()], leaf.key_der.clone_key())?;
         server_crypto.alpn_protocols = vec![ALPN.to_vec()];
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
@@ -251,7 +255,7 @@ impl Endpoint {
                 Ok(builder) => builder,
                 Err(_) => return Err(FailReason::Identity),
             }
-            .with_client_cert_verifier(PinnedClientVerifier::new(Some(peer)))
+            .with_client_cert_verifier(PinnedClientVerifier::new(peer))
             .with_single_cert(vec![leaf.cert_der], leaf.key_der)
             .map_err(|_| FailReason::Identity)?;
             server_crypto.alpn_protocols = vec![ALPN.to_vec()];
