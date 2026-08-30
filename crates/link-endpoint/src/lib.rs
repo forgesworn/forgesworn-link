@@ -4,6 +4,7 @@
 //! WebSocket relay and a direct UDP address proved with signed probes.
 
 pub mod endpoint;
+pub mod netmon;
 pub mod path_socket;
 pub mod relay_client;
 mod relay_tls;

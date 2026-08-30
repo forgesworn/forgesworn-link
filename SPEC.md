@@ -287,6 +287,16 @@ and after one failed round the two cooldowns drift apart.  A side counts the
 asked" from "the peer asked and every probe was lost".  Unknown kinds are
 ignored.
 
+A side re-sends `candidates` and `punch-now` when its interface set changes.
+The reference implementation polls the set every 5 seconds
+(`EndpointConfig.net_poll`), asks the reflector again first, and re-announces
+300 ms later so the fresh reflexive address is in the list;
+`Session::reannounce` does the same on demand, for a platform connectivity
+callback, and a shell that has one may set the poll to zero.  A proof on an
+interface that has gone is not dropped early: it ages out under the 15 second
+rule of 4.1 while the new round proves the new path, so a report never says
+`Relayed` while a still-working direct path carries bytes.
+
 Probes carry node IDs in clear, which an on-path observer can read.  They
 never carry anything else.  Encrypting them is future work.
 
@@ -438,9 +448,6 @@ Open problems the spike surfaced, to settle before Phase 1:
 - Relay convergence is by convention: both sides walk the same relay list in
   the same order.  Nothing enforces it, and per-peer relay selection from a
   card's hints is undecided.
-- Candidates are exchanged once and never re-announced.  An interface change
-  (Wi-Fi to mobile on a phone) is the first real-network case expected to
-  break; the state machine needs a re-announce and re-probe rule.
 - The reflector reply is unauthenticated and not matched to its nonce.
 - Card serials come from the wall clock in the spike; a node must persist its
   highest issued serial or a clock step can reissue a stale one.

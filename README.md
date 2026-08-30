@@ -178,8 +178,11 @@ acceptance record of spec section 7, a person has to do the following by hand.
    background service keeps the WebSocket session alive across doze, what the
    carrier does to a long-lived outbound WSS connection, and whether the direct
    path survives a Wi-Fi to mobile handover.  Nothing in this spike answers any
-   of them, and the state machine has no handling for an interface change: see
-   the second open problem below.
+   of them.  The endpoint polls the interface set every five seconds and, on a
+   change, re-queries the reflector, re-announces its candidates and starts a
+   probing round (`EndpointConfig.net_poll`); a service with a
+   `ConnectivityManager` callback should call `Session::reannounce` from it
+   and set the poll to zero.
 
 Record every row against the table in spec section 7 and treat any missing row
 as a no-go, not as a pass.
@@ -323,9 +326,6 @@ the suite ran at once.  Both are spec lessons, not only code fixes.
   they converge.  Nothing forces that.  A real deployment needs per-peer relay
   selection from the peer's card hints, or endpoints registered on several
   relays at once.  The spec does not decide this.
-- **Candidates are exchanged once.**  A new interface or a new reflexive result
-  after the handshake is never announced.  A long-lived session on a device that
-  changes network will not re-offer candidates.
 - **The reflector result is a single value with no source check.**  Anything
   that can reach the direct socket can set it by sending a well-formed reply.
   It only ever becomes a candidate the peer is asked to probe, so the cost of a

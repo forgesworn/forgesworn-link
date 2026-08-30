@@ -462,6 +462,14 @@ async fn drive(inner: Arc<SessionInner>, probe_delay: Duration) {
     let mut candidates_announced = false;
     // Why the next probing round starts, for the transition record.
     let mut round_cause = "settle delay elapsed";
+    // The interface monitor, spec 4.2.  On a change the reflector is asked
+    // again first, and the re-announcement follows once its reply has had a
+    // moment to arrive.
+    let mut net = inner.paths.net_generation();
+    net.borrow_and_update();
+    let mut net_alive = true;
+    let mut reannounce_at: Option<Instant> = None;
+    const REFLECTOR_GRACE: Duration = Duration::from_millis(300);
 
     // Relay state is consumed as an ordered event stream, never sampled.  A
     // failover can complete in tens of milliseconds, which a tick would step
@@ -493,6 +501,14 @@ async fn drive(inner: Arc<SessionInner>, probe_delay: Duration) {
                 return;
             }
             event = events.recv() => relay_event = Some(event),
+            changed = net.changed(), if net_alive => match changed {
+                Ok(()) => {
+                    info!(peer = %inner.peer, "interface change: re-querying the reflector");
+                    inner.paths.requery_reflector();
+                    reannounce_at = Some(Instant::now() + REFLECTOR_GRACE);
+                }
+                Err(_) => net_alive = false,
+            },
             _ = tokio::time::sleep(TICK) => {}
         }
 
@@ -552,6 +568,14 @@ async fn drive(inner: Arc<SessionInner>, probe_delay: Duration) {
                 inner.transition(PathStatus::Relayed, "owner declined direct paths");
             }
             continue;
+        }
+
+        if reannounce_at.is_some_and(|at| Instant::now() >= at) {
+            reannounce_at = None;
+            info!(peer = %inner.peer, "interface change: re-announcing candidates");
+            let _ = inner.control_tx.try_send(ControlSend::Candidates);
+            let _ = inner.control_tx.try_send(ControlSend::PunchNow);
+            inner.probe_now.store(PROBE_LOCAL, Ordering::SeqCst);
         }
 
         let peer_candidates = inner.paths.peer_candidates(inner.peer);

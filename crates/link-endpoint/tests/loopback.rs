@@ -537,3 +537,53 @@ async fn punch_now_starts_a_round_on_the_peer() {
     );
     relay.shutdown();
 }
+
+/// `reannounce` re-sends this side's candidates on the control stream and
+/// the peer records the update, spec 4.2.  This is what the network monitor
+/// does on an interface change, and what an application does from a
+/// connectivity callback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reannounce_resends_candidates() {
+    init_tracing();
+    let relay = start_relay().await;
+    let url = relay.url("127.0.0.1");
+    let options = || EndpointOptions {
+        relays: vec![RelaySpec::plain(url.clone())],
+        allow_direct: true,
+        probe_delay: NEVER,
+        reflector: Some(relay.udp_addr),
+    };
+    let alice = start_endpoint(options()).await;
+    let bob = Arc::new(start_endpoint(options()).await);
+    let card = exchange_card(&bob);
+    let accepting = {
+        let bob = bob.clone();
+        tokio::spawn(async move { bob.accept().await })
+    };
+    let session = alice.connect(&card).await.expect("alice connects");
+    let bob_session = Arc::new(accepting.await.unwrap().expect("bob accepts"));
+
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            bob.paths().candidate_updates(alice.node_id()) == 1
+        })
+        .await,
+        "the initial exchange is one update, saw {}",
+        bob.paths().candidate_updates(alice.node_id())
+    );
+
+    session.reannounce();
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            bob.paths().candidate_updates(alice.node_id()) == 2
+        })
+        .await,
+        "bob received the re-announcement, saw {}",
+        bob.paths().candidate_updates(alice.node_id())
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || bob_session.punch_requests() >= 1).await,
+        "a re-announcement is followed by a punch-now"
+    );
+    relay.shutdown();
+}

@@ -21,7 +21,7 @@ use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, UdpPoller};
 use rand::RngCore;
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, trace};
 
 use crate::relay_client::QueueOutcome;
@@ -50,6 +50,9 @@ pub struct Proven {
 #[derive(Default)]
 struct Peer {
     candidates: Vec<SocketAddr>,
+    /// How many candidate lists the peer has sent: one for the initial
+    /// exchange, one more per re-announcement.
+    updates: u32,
     /// Nonces this side issued, with the address probed and when.
     pending: HashMap<[u8; 16], (SocketAddr, Instant)>,
     /// When this side last pinged each address.
@@ -74,6 +77,10 @@ pub struct Paths {
     reflexive: Mutex<Option<SocketAddr>>,
     /// The nonce of the outstanding reflector request; a reply must echo it.
     reflector_nonce: Mutex<Option<[u8; 16]>>,
+    /// The reflector to ask again after an interface change, spec 3.2.
+    reflector: Option<SocketAddr>,
+    /// The interface monitor's generation, spec 4.2; sessions subscribe.
+    net: watch::Receiver<u64>,
     local_synthetic: SocketAddr,
     udp_local: SocketAddr,
 }
@@ -122,7 +129,21 @@ impl Paths {
             .filter(|addr| self.can_reach(*addr))
             .collect();
         let mut inner = self.inner.lock().expect("paths");
-        inner.peers.entry(peer).or_default().candidates = usable;
+        let entry = inner.peers.entry(peer).or_default();
+        entry.candidates = usable;
+        entry.updates += 1;
+    }
+
+    /// How many candidate lists `peer` has sent this endpoint: one for the
+    /// initial exchange and one per re-announcement.
+    pub fn candidate_updates(&self, peer: NodeId) -> u32 {
+        self.inner
+            .lock()
+            .expect("paths")
+            .peers
+            .get(&peer)
+            .map(|p| p.updates)
+            .unwrap_or(0)
     }
 
     pub fn peer_candidates(&self, peer: NodeId) -> Vec<SocketAddr> {
@@ -210,6 +231,21 @@ impl Paths {
         rand::rngs::OsRng.fill_bytes(&mut nonce);
         *self.reflector_nonce.lock().expect("reflector nonce") = Some(nonce);
         let _ = self.udp.try_send_to(&reflect_request(&nonce), reflector);
+    }
+
+    /// Ask the configured reflector again, after an interface change.  The
+    /// old reflexive result is kept until the reply replaces it, so a
+    /// candidate list sent in the meantime is stale rather than empty.
+    pub fn requery_reflector(&self) {
+        if let Some(reflector) = self.reflector {
+            self.query_reflector(reflector);
+        }
+    }
+
+    /// The interface monitor's generation counter, spec 4.2.  It advances
+    /// whenever the host's address set changes.
+    pub fn net_generation(&self) -> watch::Receiver<u64> {
+        self.net.clone()
     }
 
     pub fn reflexive(&self) -> Option<SocketAddr> {
@@ -396,6 +432,8 @@ pub async fn build(
     bind: SocketAddr,
     relays: Vec<crate::relay_client::RelaySpec>,
     book: Option<Arc<crate::rendezvous_book::TagBook>>,
+    reflector: Option<SocketAddr>,
+    net: watch::Receiver<u64>,
 ) -> io::Result<(Arc<PathSocket>, Arc<Paths>)> {
     let udp = Arc::new(UdpSocket::bind(bind).await?);
     let udp_local = udp.local_addr()?;
@@ -413,6 +451,8 @@ pub async fn build(
         inbound_tx,
         reflexive: Mutex::new(None),
         reflector_nonce: Mutex::new(None),
+        reflector,
+        net,
         local_synthetic,
         udp_local,
     });
