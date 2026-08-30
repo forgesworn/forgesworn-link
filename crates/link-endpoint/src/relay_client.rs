@@ -1,7 +1,8 @@
 //! The outbound WebSocket relay session of spec 3.1, with the failover of 4.3.
 
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::Waker;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -135,9 +136,20 @@ impl WriteReadiness {
 /// vanish from it; a broadcast queue keeps every distinct state in order.
 const EVENT_CAPACITY: usize = 64;
 
-/// A handle onto the single live relay session.
+/// A datagram a relay session delivered, with which driver it arrived on so
+/// the path socket can answer the peer on the same relay.
+pub struct RelayInbound {
+    pub source: NodeId,
+    pub datagram: Vec<u8>,
+    pub driver: u64,
+}
+
+/// A handle onto one relay driver: a single live session that walks its own
+/// relay list with failover, spec 4.3.
 #[derive(Clone)]
-pub struct RelayClient {
+pub struct RelayDriver {
+    id: u64,
+    urls: Arc<Vec<String>>,
     outbound: mpsc::Sender<Frame>,
     status: watch::Receiver<RelayStatus>,
     events: broadcast::Sender<RelayStatus>,
@@ -147,7 +159,84 @@ pub struct RelayClient {
     book: Option<Arc<TagBook>>,
     /// The lowercase host of the relay the session is on, memoised against
     /// its URL, so a tag-mode datagram costs no URL parse.
-    host_memo: Arc<std::sync::Mutex<Option<(String, String)>>>,
+    host_memo: Arc<Mutex<Option<(String, String)>>>,
+}
+
+/// At most this many drivers beyond the home driver; past it a peer's hints
+/// are ignored and the home relay is used, so fan-out is bounded.
+const MAX_EXTRA_DRIVERS: usize = 16;
+
+/// The relay pool, spec 3.1: the **home** driver over this endpoint's own
+/// configured list, plus one driver per distinct relay list a peer's card
+/// names, started on demand.  The dialer sends to a peer on the relay the
+/// peer's card names and the acceptor answers on whichever driver the
+/// dialer's datagrams arrived on, so two nodes need no shared configuration
+/// to meet.
+#[derive(Clone)]
+pub struct RelayClient {
+    key: TransportKey,
+    book: Option<Arc<TagBook>>,
+    inbound: mpsc::Sender<RelayInbound>,
+    /// One write-readiness set for the whole pool: a drain on any driver
+    /// wakes quinn, which retries and is told again if its driver is full.
+    readiness: Arc<WriteReadiness>,
+    home: RelayDriver,
+    next_id: Arc<AtomicU64>,
+    extra: Arc<Mutex<HashMap<Vec<String>, RelayDriver>>>,
+    by_id: Arc<Mutex<HashMap<u64, RelayDriver>>>,
+}
+
+impl RelayClient {
+    /// The driver over this endpoint's own configured relays.
+    pub fn home(&self) -> RelayDriver {
+        self.home.clone()
+    }
+
+    /// The pool's write-readiness set.
+    pub fn readiness(&self) -> &Arc<WriteReadiness> {
+        &self.readiness
+    }
+
+    /// The driver with this id, if it is still in the pool.
+    pub fn driver(&self, id: u64) -> Option<RelayDriver> {
+        self.by_id.lock().expect("drivers").get(&id).cloned()
+    }
+
+    /// A driver over `relays`, started now if none exists yet.  A list equal
+    /// to the home list is the home driver; an empty list is the home driver;
+    /// past the fan-out bound it is the home driver too.
+    pub fn driver_for(&self, relays: &[RelaySpec]) -> RelayDriver {
+        let urls: Vec<String> = relays.iter().map(|spec| spec.url.clone()).collect();
+        if urls.is_empty() || urls == *self.home.urls {
+            return self.home.clone();
+        }
+        let mut extra = self.extra.lock().expect("drivers");
+        if let Some(driver) = extra.get(&urls) {
+            return driver.clone();
+        }
+        if extra.len() >= MAX_EXTRA_DRIVERS {
+            warn!(
+                bound = MAX_EXTRA_DRIVERS,
+                "relay fan-out bound reached; using the home relay for this peer"
+            );
+            return self.home.clone();
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let driver = spawn_driver(
+            id,
+            self.key.clone(),
+            relays.to_vec(),
+            self.inbound.clone(),
+            self.book.clone(),
+            self.readiness.clone(),
+        );
+        extra.insert(urls, driver.clone());
+        self.by_id
+            .lock()
+            .expect("drivers")
+            .insert(id, driver.clone());
+        driver
+    }
 }
 
 /// What the path socket should do with a datagram it could not queue.
@@ -159,7 +248,17 @@ pub enum QueueOutcome {
     Dropped,
 }
 
-impl RelayClient {
+impl RelayDriver {
+    /// This driver's id, which inbound datagrams carry.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// The relay URLs this driver walks, in order.
+    pub fn urls(&self) -> &[String] {
+        &self.urls
+    }
+
     /// Queue a datagram for the relay.  Never blocks, so it is safe to call
     /// from quinn's driver.
     pub fn try_send(&self, destination: NodeId, datagram: &[u8]) -> QueueOutcome {
@@ -247,18 +346,51 @@ impl RelayClient {
     }
 }
 
-/// Start the relay driver.  Inbound datagrams are pushed to `inbound`.
+/// Start the pool with its home driver over `relays`.  Inbound datagrams
+/// from every driver are pushed to `inbound`.
 pub fn spawn(
     key: TransportKey,
     relays: Vec<RelaySpec>,
-    inbound: mpsc::Sender<(NodeId, Vec<u8>)>,
+    inbound: mpsc::Sender<RelayInbound>,
     book: Option<Arc<TagBook>>,
 ) -> RelayClient {
+    let readiness = Arc::new(WriteReadiness::default());
+    let home = spawn_driver(
+        0,
+        key.clone(),
+        relays,
+        inbound.clone(),
+        book.clone(),
+        readiness.clone(),
+    );
+    let by_id = HashMap::from([(0, home.clone())]);
+    RelayClient {
+        key,
+        book,
+        inbound,
+        readiness,
+        home,
+        next_id: Arc::new(AtomicU64::new(1)),
+        extra: Arc::new(Mutex::new(HashMap::new())),
+        by_id: Arc::new(Mutex::new(by_id)),
+    }
+}
+
+/// Start one driver over `relays` with the given id.
+fn spawn_driver(
+    id: u64,
+    key: TransportKey,
+    relays: Vec<RelaySpec>,
+    inbound: mpsc::Sender<RelayInbound>,
+    book: Option<Arc<TagBook>>,
+    readiness: Arc<WriteReadiness>,
+) -> RelayDriver {
     let (outbound_tx, outbound_rx) = mpsc::channel::<Frame>(MAX_QUEUED_FRAMES);
     let (status_tx, status_rx) = watch::channel(RelayStatus::Connecting);
-    let readiness = Arc::new(WriteReadiness::default());
     let (events_tx, _) = broadcast::channel(EVENT_CAPACITY);
+    let urls: Vec<String> = relays.iter().map(|spec| spec.url.clone()).collect();
     tokio::spawn(driver(
+        id,
         key,
         relays,
         inbound,
@@ -268,13 +400,15 @@ pub fn spawn(
         readiness.clone(),
         book.clone(),
     ));
-    RelayClient {
+    RelayDriver {
+        id,
+        urls: Arc::new(urls),
         outbound: outbound_tx,
         status: status_rx,
         events: events_tx,
         readiness,
         book,
-        host_memo: Arc::new(std::sync::Mutex::new(None)),
+        host_memo: Arc::new(Mutex::new(None)),
     }
 }
 
@@ -294,9 +428,10 @@ fn set_status(
 
 #[allow(clippy::too_many_arguments)]
 async fn driver(
+    driver_id: u64,
     key: TransportKey,
     relays: Vec<RelaySpec>,
-    inbound: mpsc::Sender<(NodeId, Vec<u8>)>,
+    inbound: mpsc::Sender<RelayInbound>,
     mut outbound: mpsc::Receiver<Frame>,
     status: watch::Sender<RelayStatus>,
     events: broadcast::Sender<RelayStatus>,
@@ -325,6 +460,7 @@ async fn driver(
                 info!(relay = %spec.url, "relay session up");
                 let host = spec.host().unwrap_or_default();
                 let end = pump(
+                    driver_id,
                     ws,
                     &mut outbound,
                     &inbound,
@@ -456,9 +592,10 @@ async fn next_frame(ws: &mut Socket) -> anyhow::Result<Option<Frame>> {
 }
 
 async fn pump(
+    driver_id: u64,
     mut ws: Socket,
     outbound: &mut mpsc::Receiver<Frame>,
-    inbound: &mpsc::Sender<(NodeId, Vec<u8>)>,
+    inbound: &mpsc::Sender<RelayInbound>,
     readiness: &WriteReadiness,
     book: Option<&TagBook>,
     host: &str,
@@ -518,7 +655,11 @@ async fn pump(
                                 return PumpEnd::Lost;
                             }
                             // A full inbound queue is loss, not backpressure.
-                            let _ = inbound.try_send((source, datagram));
+                            let _ = inbound.try_send(RelayInbound {
+                                source,
+                                datagram,
+                                driver: driver_id,
+                            });
                         }
                         Some(Frame::RecvTag { tag, datagram }) => {
                             let Some(book) = book else { return PumpEnd::Lost };
@@ -526,7 +667,11 @@ async fn pump(
                             // cannot resolve (a stale epoch, a removed pair) is
                             // dropped, which QUIC treats as loss.
                             if let Some(peer) = book.resolve(&tag, host, now_unix()) {
-                                let _ = inbound.try_send((peer, datagram));
+                                let _ = inbound.try_send(RelayInbound {
+                                    source: peer,
+                                    datagram,
+                                    driver: driver_id,
+                                });
                             }
                         }
                         Some(Frame::Pong(_)) => {}

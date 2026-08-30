@@ -595,3 +595,67 @@ async fn reannounce_resends_candidates() {
     );
     relay.shutdown();
 }
+
+/// Two endpoints configured with different relays still meet: the card names
+/// the callee's relay, the caller dials it, and the callee replies on the
+/// relay the caller's datagrams arrived on.  Convergence needs no shared
+/// configuration, spec 3.1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peers_converge_on_the_callee_relay_hints() {
+    init_tracing();
+    let relay_a = start_relay().await;
+    let relay_b = start_relay().await;
+    let url_a = relay_a.url("127.0.0.1");
+    let url_b = relay_b.url("127.0.0.1");
+
+    let alice = start_endpoint(EndpointOptions {
+        relays: vec![RelaySpec::plain(url_a.clone())],
+        allow_direct: false,
+        probe_delay: NEVER,
+        reflector: None,
+    })
+    .await;
+    let bob = Arc::new(
+        start_endpoint(EndpointOptions {
+            relays: vec![RelaySpec::plain(url_b.clone())],
+            allow_direct: false,
+            probe_delay: NEVER,
+            reflector: None,
+        })
+        .await,
+    );
+    let card = exchange_card(&bob);
+    assert_eq!(
+        card.relay_urls(),
+        vec![url_b.clone()],
+        "bob's card names bob's relay"
+    );
+
+    let accepting = {
+        let bob = bob.clone();
+        tokio::spawn(async move { bob.accept().await })
+    };
+    let session = tokio::time::timeout(Duration::from_secs(20), alice.connect(&card))
+        .await
+        .expect("alice reaches bob within 20 s by dialing the relay his card names")
+        .expect("alice connects");
+    let bob_session = Arc::new(accepting.await.unwrap().expect("bob accepts"));
+    let sink = spawn_sink(bob_session.clone(), 1);
+
+    assert_eq!(
+        session.path().relay.as_deref(),
+        Some(url_b.as_str()),
+        "alice's session rides bob's relay, not her own"
+    );
+    assert_eq!(
+        bob_session.path().relay.as_deref(),
+        Some(url_b.as_str()),
+        "bob answers on the relay alice arrived on"
+    );
+    send_and_verify(&session, 0x5eed_0009, 8 * MIB)
+        .await
+        .expect("8 MiB over the converged relay");
+    assert_eq!(sink.await.expect("sink"), 1);
+    relay_a.shutdown();
+    relay_b.shutdown();
+}

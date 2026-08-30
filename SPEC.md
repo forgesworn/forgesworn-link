@@ -150,6 +150,17 @@ One self-hostable binary, `link-relay`, offers two services.  Operators may
 run several from different organisations; a client may remove every
 ForgeSworn-operated instance and still work.
 
+A node keeps one session on its own configured relay list (its **home**
+relay, with the failover of 4.3) and, per peer, a session on the relays the
+peer's card names (hint `0x01`), started when the node dials that peer.  The
+accepting side answers on whichever relay the dialer's datagrams arrived on.
+Two nodes therefore need no shared configuration to meet: the dialer chooses,
+the acceptor follows.  A card with no relay hint means the dialer's own relay.
+Per-peer sessions are bounded (sixteen beyond the home session; past that a
+peer is dialled on the home relay).  A hint carries a URL only, so a hinted
+`wss://` relay is verified against the WebPKI roots; a relay that needs a
+pinned certificate is reachable only from configuration.
+
 ### 3.1 Relay session over WebSocket Secure
 
 - The node opens a WSS connection outbound.  Every home firewall and carrier
@@ -447,9 +458,6 @@ restated here so they cannot drift.
 
 Open problems the spike surfaced, to settle before Phase 1:
 
-- Relay convergence is by convention: both sides walk the same relay list in
-  the same order.  Nothing enforces it, and per-peer relay selection from a
-  card's hints is undecided.
 - Card serials come from the wall clock in the spike; a node must persist its
   highest issued serial or a clock step can reissue a stale one.
 

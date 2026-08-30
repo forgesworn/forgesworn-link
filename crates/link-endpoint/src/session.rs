@@ -101,7 +101,7 @@ pub(crate) struct SessionInner {
 impl SessionInner {
     fn transition(&self, status: PathStatus, cause: impl Into<String>) {
         let cause = cause.into();
-        let relay = match self.paths.relay().status() {
+        let relay = match self.paths.relay_for(self.peer).status() {
             RelayStatus::Up(url) => Some(url),
             _ => None,
         };
@@ -165,7 +165,7 @@ impl Session {
         allow_direct: bool,
         probe_delay: Duration,
     ) -> Session {
-        let relay = match paths.relay().status() {
+        let relay = match paths.relay_for(peer).status() {
             RelayStatus::Up(url) => Some(url),
             _ => None,
         };
@@ -475,8 +475,12 @@ async fn drive(inner: Arc<SessionInner>, probe_delay: Duration) {
     // failover can complete in tens of milliseconds, which a tick would step
     // straight over, and spec 4.3 requires the Reconnecting transition to be
     // recorded whatever its duration.
-    let mut events = inner.paths.relay().subscribe();
-    let mut relay_state = inner.paths.relay().status();
+    // The session follows the driver its peer is reached on, spec 3.1; that
+    // can change if the peer's datagrams start arriving on another relay,
+    // in which case the subscription moves with it.
+    let mut driver = inner.paths.relay_for(inner.peer);
+    let mut events = driver.subscribe();
+    let mut relay_state = driver.status();
 
     loop {
         let mut relay_event = None;
@@ -517,10 +521,17 @@ async fn drive(inner: Arc<SessionInner>, probe_delay: Duration) {
                 Ok(next) => relay_state = next,
                 Err(broadcast::error::RecvError::Lagged(missed)) => {
                     warn!(missed, "relay status events lagged, resynchronising");
-                    relay_state = inner.paths.relay().status();
+                    relay_state = driver.status();
                 }
                 Err(broadcast::error::RecvError::Closed) => {}
             }
+        }
+
+        let current = inner.paths.relay_for(inner.peer);
+        if current.id() != driver.id() {
+            driver = current;
+            events = driver.subscribe();
+            relay_state = driver.status();
         }
 
         let status = inner.status();

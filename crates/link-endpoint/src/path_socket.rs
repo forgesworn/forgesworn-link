@@ -24,7 +24,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, trace};
 
-use crate::relay_client::QueueOutcome;
+use crate::relay_client::{QueueOutcome, RelayDriver, RelayInbound, RelaySpec};
 
 /// A direct path counts as usable only while its proof is this fresh, spec 4.1.
 pub const DIRECT_FRESH: Duration = Duration::from_secs(15);
@@ -58,6 +58,9 @@ struct Peer {
     /// When this side last pinged each address.
     last_ping: HashMap<SocketAddr, Instant>,
     direct: Option<Proven>,
+    /// The relay driver this peer is reached on: the one its card named
+    /// when this side dialed, or the one its datagrams last arrived on.
+    driver: Option<u64>,
 }
 
 #[derive(Default)]
@@ -179,6 +182,44 @@ impl Paths {
     fn can_reach(&self, addr: SocketAddr) -> bool {
         // A socket bound to IPv4 cannot address a real IPv6 peer and the reverse.
         self.udp_local.is_ipv4() == addr.is_ipv4()
+    }
+
+    /// The relay driver `peer` is reached on, spec 3.1: the driver its card
+    /// named, or the one its datagrams last arrived on, or the home driver.
+    pub fn relay_for(&self, peer: NodeId) -> RelayDriver {
+        let id = self
+            .inner
+            .lock()
+            .expect("paths")
+            .peers
+            .get(&peer)
+            .and_then(|entry| entry.driver);
+        id.and_then(|id| self.relay.driver(id))
+            .unwrap_or_else(|| self.relay.home())
+    }
+
+    /// Dial `peer` on the relays its card names, starting a driver for them
+    /// if none exists.  An empty list means the home relay.
+    pub fn set_peer_relays(&self, peer: NodeId, relays: &[RelaySpec]) -> RelayDriver {
+        let driver = self.relay.driver_for(relays);
+        self.inner
+            .lock()
+            .expect("paths")
+            .peers
+            .entry(peer)
+            .or_default()
+            .driver = Some(driver.id());
+        driver
+    }
+
+    /// A datagram from `peer` arrived on `driver`: answer on the same relay,
+    /// which is how the accepting side follows the dialer's choice.
+    fn heard_on(&self, peer: NodeId, driver: u64) {
+        let mut inner = self.inner.lock().expect("paths");
+        let entry = inner.peers.entry(peer).or_default();
+        if entry.driver != Some(driver) {
+            entry.driver = Some(driver);
+        }
     }
 
     /// Send a signed ping to every candidate of the peer, spec 4.2.
@@ -418,6 +459,8 @@ pub fn local_addresses(v4: bool) -> Vec<IpAddr> {
 pub struct PathSocket {
     paths: Arc<Paths>,
     inbound_rx: Mutex<mpsc::Receiver<Inbound>>,
+    /// The driver whose full queue last refused a send; see `Poller`.
+    blocked_on: Arc<Mutex<Option<u64>>>,
 }
 
 impl std::fmt::Debug for PathSocket {
@@ -438,8 +481,7 @@ pub async fn build(
     let udp = Arc::new(UdpSocket::bind(bind).await?);
     let udp_local = udp.local_addr()?;
     let (inbound_tx, inbound_rx) = mpsc::channel::<Inbound>(INBOUND_CAPACITY);
-    let (relay_inbound_tx, mut relay_inbound_rx) =
-        mpsc::channel::<(NodeId, Vec<u8>)>(INBOUND_CAPACITY);
+    let (relay_inbound_tx, mut relay_inbound_rx) = mpsc::channel::<RelayInbound>(INBOUND_CAPACITY);
     let relay = crate::relay_client::spawn(key.clone(), relays, relay_inbound_tx, book);
 
     let local_synthetic = key.node_id().synthetic_addr();
@@ -461,8 +503,14 @@ pub async fn build(
     {
         let paths = paths.clone();
         tokio::spawn(async move {
-            while let Some((source, datagram)) = relay_inbound_rx.recv().await {
+            while let Some(RelayInbound {
+                source,
+                datagram,
+                driver,
+            }) = relay_inbound_rx.recv().await
+            {
                 paths.register_peer(source);
+                paths.heard_on(source, driver);
                 paths.deliver(source.synthetic_addr(), &datagram);
             }
         });
@@ -526,6 +574,7 @@ pub async fn build(
     let socket = Arc::new(PathSocket {
         paths: paths.clone(),
         inbound_rx: Mutex::new(inbound_rx),
+        blocked_on: Arc::new(Mutex::new(None)),
     });
     Ok((socket, paths))
 }
@@ -535,6 +584,10 @@ pub async fn build(
 struct Poller {
     paths: Arc<Paths>,
     id: u64,
+    /// The driver whose full queue last refused a send, shared with the
+    /// socket.  Readiness is judged on it, so quinn is not told "ready" by
+    /// a driver it is not sending on.
+    blocked_on: Arc<Mutex<Option<u64>>>,
 }
 
 impl std::fmt::Debug for Poller {
@@ -556,12 +609,20 @@ impl UdpPoller for Poller {
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             Poll::Ready(Ok(())) => {}
         }
-        if self.paths.relay.has_capacity() {
+        let has_capacity = || match *self.blocked_on.lock().expect("blocked") {
+            Some(id) => self
+                .paths
+                .relay
+                .driver(id)
+                .is_none_or(|driver| driver.has_capacity()),
+            None => true,
+        };
+        if has_capacity() {
             return Poll::Ready(Ok(()));
         }
         self.paths.relay.readiness().register(self.id, cx.waker());
         // Re-check after registering so a concurrent drain cannot be missed.
-        if self.paths.relay.has_capacity() {
+        if has_capacity() {
             Poll::Ready(Ok(()))
         } else {
             Poll::Pending
@@ -575,6 +636,7 @@ impl AsyncUdpSocket for PathSocket {
         Box::pin(Poller {
             paths: self.paths.clone(),
             id,
+            blocked_on: self.blocked_on.clone(),
         })
     }
 
@@ -605,12 +667,23 @@ impl AsyncUdpSocket for PathSocket {
                 }
                 Ok(())
             }
-            None => match self.paths.relay.try_send(peer, transmit.contents) {
-                QueueOutcome::Queued | QueueOutcome::Dropped => Ok(()),
-                // Real backpressure while the relay is up, so nothing is buffered
-                // above the bounded queue and nothing is needlessly dropped.
-                QueueOutcome::WouldBlock => Err(io::ErrorKind::WouldBlock.into()),
-            },
+            None => {
+                let driver = self.paths.relay_for(peer);
+                match driver.try_send(peer, transmit.contents) {
+                    QueueOutcome::Queued | QueueOutcome::Dropped => {
+                        *self.blocked_on.lock().expect("blocked") = None;
+                        Ok(())
+                    }
+                    // Real backpressure while the relay is up, so nothing is
+                    // buffered above the bounded queue and nothing is
+                    // needlessly dropped.  Remember which driver refused, so
+                    // the poller judges readiness on that one.
+                    QueueOutcome::WouldBlock => {
+                        *self.blocked_on.lock().expect("blocked") = Some(driver.id());
+                        Err(io::ErrorKind::WouldBlock.into())
+                    }
+                }
+            }
         }
     }
 
