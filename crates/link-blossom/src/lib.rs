@@ -24,7 +24,7 @@ pub mod wire;
 #[cfg(feature = "shelter-kit")]
 pub mod client;
 
-pub use server::serve;
+pub use server::{serve, serve_stream};
 pub use source::{BlobBytes, BlobSource, MapBlobSource};
 pub use wire::{Request, ResponseHeader, WireError};
 
