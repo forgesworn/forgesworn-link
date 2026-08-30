@@ -172,7 +172,13 @@ fn parse_fsl_source(source: &Url) -> Result<(NodeId, [u8; 32]), FetchError> {
         .next()
         .unwrap_or_default();
     let hex_digest = first.split('.').next().unwrap_or_default();
-    if hex_digest.len() != 64 || !hex_digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    // Canonical lowercase hex only, so one blob has exactly one fsl text form
+    // and a cache or allowlist keyed on the URL cannot be split by case.
+    if hex_digest.len() != 64
+        || !hex_digest
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
         return Err(FetchError::Unreachable(format!(
             "fsl source sha256 is not 64 hex characters: {hex_digest}"
         )));
@@ -292,4 +298,34 @@ fn link_body(
         }
     })
     .boxed()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fsl_url(digest: &str) -> Url {
+        let node = NodeId([0u8; 32]).to_base32();
+        Url::parse(&format!("fsl://{node}/{digest}")).expect("url")
+    }
+
+    #[test]
+    fn the_digest_must_be_lowercase_hex() {
+        let lower = "a".repeat(64);
+        assert!(parse_fsl_source(&fsl_url(&lower)).is_ok());
+        let upper = "A".repeat(64);
+        assert!(matches!(
+            parse_fsl_source(&fsl_url(&upper)),
+            Err(FetchError::Unreachable(_))
+        ));
+    }
+
+    #[test]
+    fn a_foreign_scheme_is_unsupported_not_broken() {
+        let url = Url::parse("https://example.org/x").expect("url");
+        assert!(matches!(
+            parse_fsl_source(&url),
+            Err(FetchError::UnsupportedSource)
+        ));
+    }
 }
