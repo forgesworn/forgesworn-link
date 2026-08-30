@@ -54,7 +54,12 @@ Definitions:
   - **one** card carries `0x04` (say A's): `eph_x = x(ECDH(eph_a, nostr_b))` —
     forward-secret **only** against compromise of A, the carrying side; a
     compromise of B's static key still reveals past tags. State this plainly
-    wherever the one-sided mode is used;
+    wherever the one-sided mode is used. The carrying side's ephemeral always
+    pairs with the **other** side's static key, and the two directions derive
+    **different** tags: A-carries and B-carries never meet. Which side carries
+    is read from the pair's current cards — the side whose card bears `0x04` —
+    so both ends reach the same answer from the same two cards. *(Jointly
+    agreed clarification, 2026-08-30; no byte change.)*;
   - **neither**: `eph_x` is 32 zero bytes — no forward secrecy.
 - `epoch_index = floor(unix_seconds / 3600)` (`EPOCH_SECONDS = 3600`).
 - `relay_host` — the lowercase hostname without port, exactly as in relay

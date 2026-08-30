@@ -7,6 +7,7 @@ const NM = process.env.NOBLE_NODE_MODULES
 if (!NM) { console.error('set NOBLE_NODE_MODULES'); process.exit(1) }
 const base = pathToFileURL(NM.endsWith('/') ? NM : NM + '/').href
 const { ed25519 } = await import(new URL('@noble/curves/ed25519.js', base).href)
+const { secp256k1 } = await import(new URL('@noble/curves/secp256k1.js', base).href)
 const { sha256 } = await import(new URL('@noble/hashes/sha2.js', base).href)
 
 const te = new TextEncoder()
@@ -48,12 +49,19 @@ function card(opts, seed = seedA) { const b = body(opts); return cat(b, sign(b, 
 const RELAY = 'wss://relay.example/link'
 const UDP = udpHint(v4mapped(198, 51, 100, 7), 4433)
 const ONION = onionHint('b'.repeat(56), 80)
+// The 0x04 ephemeral rendezvous hint, spec 9: a 33-byte compressed secp256k1
+// point, tag 0x02/0x03 only.  The 0x05 compact spelling of the same point must
+// fail the card: one point, one spelling inside signed bytes.
+const ephSeed = sha256(te.encode('forgesworn-link/vectors/1/eph'))
+const ephPub = secp256k1.getPublicKey(ephSeed, true)
+const ephCompact = cat(u8(0x05), ephPub.subarray(1))
 
 const valid = [
   { name: 'zero-hints', serial: 1, hints: [] },
   { name: 'one-relay-hint', serial: 2, hints: [relayHint(RELAY)] },
   { name: 'relay-udp-onion', serial: 3, hints: [relayHint(RELAY), UDP, ONION] },
   { name: 'unknown-hint-kind-skipped', serial: 4, hints: [relayHint(RELAY), hint(0x7e, te.encode('future')), UDP] },
+  { name: 'one-ephemeral-hint', serial: 5, hints: [relayHint(RELAY), hint(0x04, ephPub)] },
 ].map(({ name, serial, hints }) => {
   const b = body({ serial, hints }); const sig = sign(b)
   return { name, rule: null, expect: 'accept', now: NOW, highest_seen_serial: serial - 1, expected_node_id: hex(pubA), card_hex: hex(cat(b, sig)), signing_input_hex: hex(cat(CARD_DOMAIN, b)), signature_hex: hex(sig), hints: hints.length }
@@ -73,6 +81,9 @@ H('r3-seventeen-hints', 3, card({ serial: 10, hints: Array.from({ length: 17 }, 
 H('r3-udp-hint-wrong-length', 3, card({ serial: 10, hints: [hint(0x02, cat(v4mapped(198, 51, 100, 7), u16(4433), u8(0)))] }))
 H('r3-hint-overruns-card', 3, card({ serial: 10, hintCount: 1, hints: [cat(u8(0x01), u16(500), te.encode('wss://short'))] }))
 H('r3-garbage-between-hints-and-signature', 3, card({ serial: 10, hintCount: 0, hints: [u8(0x00)] }))
+H('r3-ephemeral-compact-spelling', 3, card({ serial: 10, hints: [hint(0x04, ephCompact)] }))
+H('r3-ephemeral-wrong-length', 3, card({ serial: 10, hints: [hint(0x04, ephPub.subarray(0, 32))] }))
+H('r3-two-ephemeral-hints', 3, card({ serial: 10, hints: [hint(0x04, ephPub), hint(0x04, ephPub)] }))
 H('r4-signature-bit-flipped', 4, flipSig(card({ serial: 10 })))
 H('r4-signed-by-other-key', 4, card({ serial: 10 }, seedB))
 H('r5-issued-in-the-future', 5, card({ serial: 10, issued: NOW + 301, expires: NOW + 301 + 3600 }))

@@ -105,6 +105,10 @@ pub fn derive_tag(
 /// hashed `ecdh()` convenience, which silently fails every known-answer
 /// vector.  `None` for an invalid scalar or a point not on the curve.
 pub fn ecdh_x(private_scalar: &[u8; 32], compressed_public: &[u8; 33]) -> Option<[u8; 32]> {
+    // The same canonical-tag rule as valid_compressed_point: 0x02/0x03 only.
+    if !matches!(compressed_public[0], 0x02 | 0x03) {
+        return None;
+    }
     let secret = k256::SecretKey::from_slice(private_scalar).ok()?;
     let public = k256::PublicKey::from_sec1_bytes(compressed_public).ok()?;
     let shared = k256::ecdh::diffie_hellman(secret.to_nonzero_scalar(), public.as_affine());
@@ -117,7 +121,13 @@ pub fn ecdh_x(private_scalar: &[u8; 32], compressed_public: &[u8; 33]) -> Option
 /// verifier uses this for hint `0x04`: a value that does not decompress is a
 /// malformed hint and fails the whole card.
 pub fn valid_compressed_point(bytes: &[u8]) -> bool {
-    bytes.len() == 33 && k256::PublicKey::from_sec1_bytes(bytes).is_ok()
+    // SEC1 tag 0x02/0x03 only.  from_sec1_bytes alone also parses the 0x05
+    // compact form, which would give one point two spellings inside signed
+    // card bytes -- and card bytes are a dedup key, so a point must have
+    // exactly one.
+    bytes.len() == 33
+        && matches!(bytes[0], 0x02 | 0x03)
+        && k256::PublicKey::from_sec1_bytes(bytes).is_ok()
 }
 
 /// A fresh ephemeral for one card: `(private scalar, compressed public key)`.
