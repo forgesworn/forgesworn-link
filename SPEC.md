@@ -58,15 +58,19 @@ contract.
   re-encode to the same string, so that each node has exactly one textual name.
   Without this, 16 spellings decode to one node and any allowlist, cache or
   dedup keyed on the text is bypassable.
-- **TLS binding.**  Every QUIC endpoint presents a self-signed X.509 leaf whose
-  SubjectPublicKeyInfo is exactly the Ed25519 node public key
-  (`id-Ed25519`, OID 1.3.101.112, RFC 8410).  Verification, on both client and
-  server sides, is one rule: **the presented SPKI byte-equals the expected node
-  ID's SPKI, and the TLS 1.3 CertificateVerify signature validates under that
-  key.**  Chain, names, validity dates and extensions are ignored; card expiry
-  governs freshness.  An endpoint that presents any other key fails closed.
-  RFC 7250 raw public keys satisfy the same rule and may replace X.509 later
-  without changing the contract.
+- **TLS binding.**  Every QUIC endpoint presents, in place of a certificate,
+  its raw public key (RFC 7250): the SubjectPublicKeyInfo of the Ed25519 node
+  key (`id-Ed25519`, OID 1.3.101.112, RFC 8410), 44 bytes, as the single entry
+  of the TLS `Certificate` message, negotiated with the
+  `client_certificate_type` and `server_certificate_type` extensions.
+  Verification, on both client and server sides, is one rule: **the presented
+  SPKI byte-equals the expected node ID's SPKI, and the TLS 1.3
+  CertificateVerify signature validates under that key.**  There is no chain,
+  name, validity window or extension to ignore, because none is sent; card
+  expiry governs freshness.  An endpoint that presents any other key, or an
+  X.509 certificate, fails closed.  (Version 0 of this document allowed a
+  self-signed X.509 leaf carrying the same SPKI; the rule was the same and the
+  bytes on the wire were 44 rather than a few hundred.)
 - **Rotation.**  A new transport key is a new node ID.  It requires a new card
   and re-pairing; it does not change any stored blob claim, which belong to
   Nostr signers, not transport keys.

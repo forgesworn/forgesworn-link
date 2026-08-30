@@ -186,13 +186,21 @@ fn spki_and_synthetic_address_match_the_vector() {
 }
 
 #[test]
-fn the_self_signed_leaf_carries_the_node_id_as_its_spki() {
+fn the_raw_public_key_identity_is_the_node_id_spki() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let key = node_a();
-    let leaf = link_core::tls::node_certificate(&key).expect("leaf");
+    let identity = link_core::tls::node_identity(&key).expect("identity");
+    // RFC 7250: what goes on the wire in place of a certificate is the
+    // SubjectPublicKeyInfo itself, and that is exactly the node ID's SPKI.
+    assert_eq!(identity.cert.len(), 1, "one raw public key, no chain");
     assert_eq!(
-        link_core::id::node_id_from_cert_der(leaf.cert_der.as_ref()),
-        Some(key.node_id()),
-        "the leaf SPKI is the node ID"
+        identity.cert[0].as_ref(),
+        key.node_id().spki_der().as_slice(),
+        "the raw public key is the node ID's SPKI"
+    );
+    assert_eq!(
+        link_core::id::node_id_from_spki(identity.cert[0].as_ref()),
+        Some(key.node_id())
     );
 }
 
@@ -375,8 +383,9 @@ fn the_identity_rule_accepts_only_the_pinned_node_id() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let a = node_a();
     let b = node_b();
-    let leaf_a = link_core::tls::node_certificate(&a).expect("leaf a");
-    let leaf_b = link_core::tls::node_certificate(&b).expect("leaf b");
+    // Under RFC 7250 the "certificate" a verifier sees is the raw SPKI.
+    let leaf_a = rustls::pki_types::CertificateDer::from(a.node_id().spki_der().to_vec());
+    let leaf_b = rustls::pki_types::CertificateDer::from(b.node_id().spki_der().to_vec());
 
     let name = ServerName::try_from("ignored.example").expect("name");
     // Names, dates and chains are ignored: a far future clock changes nothing.
@@ -385,13 +394,13 @@ fn the_identity_rule_accepts_only_the_pinned_node_id() {
     let server_verifier = link_core::tls::PinnedServerVerifier::new(a.node_id());
     assert!(
         server_verifier
-            .verify_server_cert(&leaf_a.cert_der, &[], &name, &[], now)
+            .verify_server_cert(&leaf_a, &[], &name, &[], now)
             .is_ok(),
         "the pinned node ID is accepted whatever the name or date says"
     );
     assert!(
         server_verifier
-            .verify_server_cert(&leaf_b.cert_der, &[], &name, &[], now)
+            .verify_server_cert(&leaf_b, &[], &name, &[], now)
             .is_err(),
         "any other key fails closed"
     );
@@ -407,12 +416,12 @@ fn the_identity_rule_accepts_only_the_pinned_node_id() {
     );
     assert!(
         client_verifier
-            .verify_client_cert(&leaf_b.cert_der, &[], now)
+            .verify_client_cert(&leaf_b, &[], now)
             .is_ok()
     );
     assert!(
         client_verifier
-            .verify_client_cert(&leaf_a.cert_der, &[], now)
+            .verify_client_cert(&leaf_a, &[], now)
             .is_err(),
         "the server side fails closed on the wrong key too"
     );
@@ -420,5 +429,9 @@ fn the_identity_rule_accepts_only_the_pinned_node_id() {
         server_verifier.supported_verify_schemes(),
         vec![rustls::SignatureScheme::ED25519],
         "only Ed25519 is offered, so a downgrade has nothing to pick"
+    );
+    assert!(
+        server_verifier.requires_raw_public_keys() && client_verifier.requires_raw_public_keys(),
+        "both verifiers negotiate RFC 7250 raw public keys, never X.509"
     );
 }

@@ -1,59 +1,71 @@
-//! The one identity rule of spec section 1, expressed as rustls verifiers, plus
-//! the self-signed Ed25519 leaf that carries the node ID as its SPKI.
+//! The one identity rule of spec section 1, expressed as rustls verifiers and
+//! an RFC 7250 raw-public-key identity.
 //!
-//! Chain, names, validity dates and extensions are ignored.  The only checks are
-//! that the presented SPKI byte-equals the expected node ID's SPKI and that the
-//! TLS 1.3 CertificateVerify signature validates under that key.
+//! Nothing here is a certificate.  What an endpoint presents in the TLS
+//! `Certificate` message is the SubjectPublicKeyInfo of its Ed25519 node key
+//! and nothing else, and the only checks on either side are that the
+//! presented SPKI byte-equals the expected node ID's SPKI and that the TLS 1.3
+//! CertificateVerify signature validates under that key.  There is no chain,
+//! no name, no validity window and no extension to ignore, because none is
+//! sent; card expiry governs freshness.
 
 use std::sync::Arc;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::crypto::{CryptoProvider, verify_tls13_signature};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use rustls::crypto::{CryptoProvider, verify_tls13_signature_with_raw_key};
+use rustls::pki_types::{
+    CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, SubjectPublicKeyInfoDer,
+    UnixTime,
+};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::sign::CertifiedKey;
 use rustls::{DigitallySignedStruct, DistinguishedName, Error as TlsError, SignatureScheme};
 
-use crate::id::{NodeId, TransportKey, node_id_from_cert_der};
+use crate::id::{NodeId, TransportKey, node_id_from_spki};
 
-/// A self-signed leaf whose SubjectPublicKeyInfo is exactly the node public key.
-pub struct NodeCertificate {
-    pub cert_der: CertificateDer<'static>,
-    pub key_der: PrivateKeyDer<'static>,
-}
-
-/// Build the leaf for a transport key.  The subject name is a placeholder: no
-/// verifier on either side ever reads it.
-pub fn node_certificate(key: &TransportKey) -> Result<NodeCertificate, rcgen::Error> {
+/// The identity an endpoint presents on every handshake, client or server:
+/// the node ID's SPKI as the single entry of the certificate list (RFC 7250)
+/// with the transport key beside it to sign CertificateVerify.  Built once
+/// per endpoint and shared by every connection.
+pub fn node_identity(key: &TransportKey) -> Result<Arc<CertifiedKey>, TlsError> {
     let pkcs8 = key.pkcs8_der();
-    let key_pair = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
-        &PrivatePkcs8KeyDer::from(pkcs8.as_slice()),
-        &rcgen::PKCS_ED25519,
-    )?;
-    let mut params =
-        rcgen::CertificateParams::new(vec![format!("{}.node.invalid", key.node_id())])?;
-    params.distinguished_name = rcgen::DistinguishedName::new();
-    let cert = params.self_signed(&key_pair)?;
-    Ok(NodeCertificate {
-        cert_der: cert.der().clone(),
-        key_der: PrivateKeyDer::try_from(pkcs8.to_vec())
-            .map_err(|_| rcgen::Error::CouldNotParseKeyPair)?,
-    })
+    let private = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8.to_vec()));
+    let signing = rustls::crypto::ring::sign::any_supported_type(&private)?;
+    let spki = CertificateDer::from(key.node_id().spki_der().to_vec());
+    Ok(Arc::new(CertifiedKey::new(vec![spki], signing)))
 }
 
 fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
-fn check_pinned(expected: NodeId, cert: &CertificateDer<'_>) -> Result<NodeId, TlsError> {
-    let presented = node_id_from_cert_der(cert.as_ref()).ok_or(TlsError::InvalidCertificate(
+/// The rule.  Under RFC 7250 the bytes rustls hands a verifier as the
+/// "certificate" are the raw SPKI, so this is a parse of the 44-byte
+/// id-Ed25519 SPKI and a byte comparison, nothing more.
+fn check_pinned(expected: NodeId, presented: &CertificateDer<'_>) -> Result<NodeId, TlsError> {
+    let presented = node_id_from_spki(presented.as_ref()).ok_or(TlsError::InvalidCertificate(
         rustls::CertificateError::BadEncoding,
     ))?;
-    if presented.spki_der() != expected.spki_der() {
+    if presented != expected {
         return Err(TlsError::InvalidCertificate(
             rustls::CertificateError::ApplicationVerificationFailure,
         ));
     }
     Ok(presented)
+}
+
+fn verify_signature(
+    provider: &CryptoProvider,
+    message: &[u8],
+    presented: &CertificateDer<'_>,
+    dss: &DigitallySignedStruct,
+) -> Result<HandshakeSignatureValid, TlsError> {
+    verify_tls13_signature_with_raw_key(
+        message,
+        &SubjectPublicKeyInfoDer::from(presented.as_ref()),
+        dss,
+        &provider.signature_verification_algorithms,
+    )
 }
 
 /// Client side: the server must present exactly the node ID from the card.
@@ -103,16 +115,15 @@ impl ServerCertVerifier for PinnedServerVerifier {
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, TlsError> {
         check_pinned(self.expected, cert)?;
-        verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
+        verify_signature(&self.provider, message, cert, dss)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         vec![SignatureScheme::ED25519]
+    }
+
+    fn requires_raw_public_keys(&self) -> bool {
+        true
     }
 }
 
@@ -142,8 +153,7 @@ impl PinnedClientVerifier {
 /// which quinn requires at bind time before any peer is known.  Every inbound
 /// handshake is served through `accept_with` and a [`PinnedClientVerifier`]
 /// built for that connection's expected node ID; this verifier exists only so
-/// the default path can never authenticate anyone.  It refuses every client
-/// certificate.
+/// the default path can never authenticate anyone.  It refuses every client.
 #[derive(Debug)]
 pub struct RefusingClientVerifier {
     empty: Vec<DistinguishedName>,
@@ -205,6 +215,10 @@ impl ClientCertVerifier for RefusingClientVerifier {
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         vec![SignatureScheme::ED25519]
     }
+
+    fn requires_raw_public_keys(&self) -> bool {
+        true
+    }
 }
 
 impl ClientCertVerifier for PinnedClientVerifier {
@@ -248,15 +262,14 @@ impl ClientCertVerifier for PinnedClientVerifier {
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, TlsError> {
         check_pinned(self.expected, cert)?;
-        verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
+        verify_signature(&self.provider, message, cert, dss)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         vec![SignatureScheme::ED25519]
+    }
+
+    fn requires_raw_public_keys(&self) -> bool {
+        true
     }
 }
