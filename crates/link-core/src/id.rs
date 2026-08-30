@@ -151,12 +151,6 @@ pub fn node_id_from_spki(der: &[u8]) -> Option<NodeId> {
     NodeId::from_slice(&der[12..])
 }
 
-/// Recover a node ID from a DER X.509 certificate by reading its SPKI, spec 1.
-pub fn node_id_from_cert_der(cert: &[u8]) -> Option<NodeId> {
-    let (_, parsed) = x509_parser::parse_x509_certificate(cert).ok()?;
-    node_id_from_spki(parsed.tbs_certificate.subject_pki.raw)
-}
-
 /// The long-lived transport key of one node.
 #[derive(Clone)]
 pub struct TransportKey {
@@ -195,7 +189,7 @@ impl TransportKey {
         self.signing.sign(message).to_bytes()
     }
 
-    /// PKCS#8 v1 DER, which is what rcgen and rustls both want.
+    /// PKCS#8 v1 DER, which is what rustls wants.
     pub fn pkcs8_der(&self) -> [u8; 48] {
         let mut out = [0u8; 48];
         out[..16].copy_from_slice(&PKCS8_ED25519_PREFIX);
