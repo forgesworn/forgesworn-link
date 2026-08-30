@@ -17,7 +17,7 @@ use tracing::{info, warn};
 
 use crate::netmon::{NetMonitor, interface_snapshot};
 use crate::path_socket::{Paths, build};
-use crate::relay_client::{RelaySpec, RelayStatus};
+use crate::relay_client::{RelayDriver, RelaySpec, RelayStatus};
 use crate::rendezvous_book::{RendezvousPeer, TagBook};
 use crate::session::Session;
 
@@ -202,14 +202,14 @@ impl Endpoint {
         Card::sign(&self.key, now, now + ttl, serial, hints)
     }
 
-    /// Wait for a relay welcome, spec 4.3 Rendezvous.
-    async fn rendezvous(&self) -> Result<String, FailReason> {
-        match self.paths.relay().status() {
+    /// Wait for a relay welcome on `driver`, spec 4.3 Rendezvous.
+    async fn rendezvous(driver: &RelayDriver) -> Result<String, FailReason> {
+        match driver.status() {
             RelayStatus::Up(url) => return Ok(url),
             RelayStatus::Failed => return Err(FailReason::Relay),
             _ => {}
         }
-        self.paths.relay().wait_up().await.ok_or(FailReason::Relay)
+        driver.wait_up().await.ok_or(FailReason::Relay)
     }
 
     /// Verify nothing here: `Card` can only exist verified or freshly signed.
@@ -219,7 +219,16 @@ impl Endpoint {
             return Err(FailReason::Identity);
         }
         self.paths.register_peer(peer);
-        let relay = self.rendezvous().await?;
+        // Spec 3.1: dial the peer on the relays its card names, so two nodes
+        // need no shared configuration to meet.  A card with no relay hint
+        // means this endpoint's own relay.
+        let hints: Vec<RelaySpec> = card
+            .relay_urls()
+            .into_iter()
+            .map(RelaySpec::plain)
+            .collect();
+        let driver = self.paths.set_peer_relays(peer, &hints);
+        let relay = Self::rendezvous(&driver).await?;
         info!(%peer, %relay, "rendezvous ready, starting QUIC over the relay");
 
         let mut client_crypto = rustls::ClientConfig::builder_with_provider(Arc::new(

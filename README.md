@@ -295,6 +295,15 @@ convenience alone.
     drains below half.  When no relay session is up, the datagram is dropped as
     loss, so a reconnect can never deadlock the QUIC driver.
 
+12. **The dialer follows the card's relay hints.**  `connect` starts a relay
+    session on the relays the peer's card names (hint `0x01`) and the accepting
+    side answers on the relay the dialer's datagrams arrived on, so two nodes
+    with different relay configurations meet without agreeing a list.  The
+    endpoint's own configured list stays its home relay for accepting and for
+    peers whose card names no relay.  Per-peer sessions are bounded at sixteen.
+    A hint is a URL only, so a hinted `wss://` relay is verified against the
+    WebPKI roots; a relay that needs a pin is reachable only from configuration.
+
 ## Defects the spike found in itself
 
 Both were invisible in a quiet single run and showed up only when five copies of
@@ -326,11 +335,6 @@ the suite ran at once.  Both are spec lessons, not only code fixes.
 
 ## Open problems
 
-- **Relay convergence is by convention.**  Each endpoint keeps one relay session
-  at a time and both sides walk the same configured list in the same order, so
-  they converge.  Nothing forces that.  A real deployment needs per-peer relay
-  selection from the peer's card hints, or endpoints registered on several
-  relays at once.  The spec does not decide this.
 - **No adversarial TLS handshake test.**  The one identity rule is exercised in
   the positive direction end to end and asserted directly on the verifier.  A
   test that drives a handshake where the presented key differs from the pin
