@@ -50,17 +50,35 @@ async fn serve_session<S: BlobSource>(session: Arc<Session>, source: Arc<S>) {
     while let Ok(stream) = session.accept_stream().await {
         let source = source.clone();
         tokio::spawn(async move {
-            if let Err(error) = answer(stream, source.as_ref()).await {
+            if let Err(error) = serve_stream(stream, source.as_ref(), &[]).await {
                 debug!(%error, "link-blossom stream ended with an error");
             }
         });
     }
 }
 
-/// Read one request off `stream` and answer it.
-async fn answer<S: BlobSource>(mut stream: Stream, source: &S) -> anyhow::Result<()> {
+/// Answer one already-accepted stream as FSLB.
+///
+/// An endpoint that serves several protocols beside FSLB runs its own accept
+/// loop, demultiplexes each stream on whatever prefix it read (for FSLB, the
+/// four magic bytes), and hands the stream here with that prefix as `preread`;
+/// a caller that consumed nothing passes an empty slice.  At most the fixed
+/// 37-byte request may be preread.
+pub async fn serve_stream<S: BlobSource>(
+    mut stream: Stream,
+    source: &S,
+    preread: &[u8],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        preread.len() <= REQUEST_LEN,
+        "preread longer than the fixed request"
+    );
     let mut request = [0u8; REQUEST_LEN];
-    stream.recv.read_exact(&mut request).await?;
+    request[..preread.len()].copy_from_slice(preread);
+    stream
+        .recv
+        .read_exact(&mut request[preread.len()..])
+        .await?;
     let request = match Request::decode(&request) {
         Ok(request) => request,
         Err(WireError::BadVersion(version)) => {

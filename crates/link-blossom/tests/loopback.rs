@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::TryStreamExt;
-use link_blossom::{LinkFetcher, MapBlobSource, MapCardResolver, serve};
+use link_blossom::{LinkFetcher, MapBlobSource, MapCardResolver, serve, serve_stream};
 use link_core::card::{Card, VerifyContext};
 use link_endpoint::{Endpoint, EndpointConfig, RelaySpec, TransportKey};
 use link_relay::{RelayConfig, RelayHandle};
@@ -192,6 +192,79 @@ async fn fetch_over_link_round_trips_a_5_mib_blob() {
     assert!(
         matches!(unsupported, Err(FetchError::UnsupportedSource)),
         "a non-fsl source is unsupported, got {unsupported:?}"
+    );
+
+    serving.abort();
+    relay.shutdown();
+}
+
+/// The multi-protocol path: the caller owns the accept loop, demultiplexes on
+/// the four magic bytes it reads itself, and hands the stream plus that prefix
+/// to `serve_stream`.  This is what a node serving HTTP-over-Link beside FSLB
+/// does; the fetcher on the other end must not be able to tell the difference.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_demultiplexing_accept_loop_serves_fslb_via_serve_stream() {
+    init();
+    let relay = start_relay().await;
+    let url = relay.url("127.0.0.1");
+
+    let server = Arc::new(start_endpoint(&url).await);
+    let client = Arc::new(start_endpoint(&url).await);
+
+    let blob = deterministic_bytes(256 * 1024, 0xB105_0002);
+    let want_hash = hex::encode(Sha256::digest(&blob));
+    let source = Arc::new(MapBlobSource::new().with_blob(
+        want_hash.clone(),
+        Some("application/octet-stream".to_owned()),
+        blob.clone(),
+    ));
+
+    let serving = {
+        let server = server.clone();
+        let source = source.clone();
+        tokio::spawn(async move {
+            while let Ok(session) = server.accept().await {
+                let source = source.clone();
+                tokio::spawn(async move {
+                    while let Ok(mut stream) = session.accept_stream().await {
+                        let source = source.clone();
+                        tokio::spawn(async move {
+                            let mut prefix = [0u8; 4];
+                            if stream.recv.read_exact(&mut prefix).await.is_err() {
+                                return;
+                            }
+                            if prefix == *b"FSLB" {
+                                let _ = serve_stream(stream, source.as_ref(), &prefix).await;
+                            }
+                        });
+                    }
+                });
+            }
+        })
+    };
+
+    let resolver = Arc::new(MapCardResolver::new().with_card(card_of(&server)));
+    let fetcher = LinkFetcher::new(client, resolver);
+    let node = server.node_id().to_base32();
+    let source_url = Url::parse(&format!("fsl://{node}/{want_hash}")).expect("valid fsl url");
+    let fetched = fetcher
+        .fetch(FetchRequest {
+            source: source_url,
+            sha256: want_hash.clone(),
+            expected_size: Some(blob.len() as u64),
+        })
+        .await
+        .expect("the demultiplexed fetch succeeds");
+
+    let mut hasher = Sha256::new();
+    let mut body = fetched.body;
+    while let Some(chunk) = body.try_next().await.expect("a body chunk") {
+        hasher.update(&chunk);
+    }
+    assert_eq!(
+        hex::encode(hasher.finalize()),
+        want_hash,
+        "the demultiplexed body hashes to the expected sha256"
     );
 
     serving.abort();
