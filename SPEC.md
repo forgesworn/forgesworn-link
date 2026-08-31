@@ -211,9 +211,12 @@ pinned certificate is reachable only from configuration.
   A newer registration wins: the relay sends the oldest holder `close` with
   reason `2` and ends that session, so a node that reconnected before its
   previous session died is not left with a dead route, and nothing is
-  silently replaced.  A client that receives reason `2` waits 30 seconds
-  before it reconnects, because two live instances of one node ID would
-  otherwise supersede each other in a loop.
+  silently replaced.  In identity mode the superseded client stops: retrying
+  lets two live processes steal the same node-ID slot from each other every
+  backoff interval and violates newest-wins.  A tag-mode client cannot know
+  which endpoint a third holder of an anonymous pair tag replaced, so it waits
+  30 seconds before retrying; the delay prevents a hot eviction loop while the
+  legitimate two ends converge.
 - **What the relay learns.**  Node IDs of registered endpoints and who they
   talk to, source IP addresses of WSS sessions, timing and byte counts.  It
   must log only routing tokens and counters, and must not persist node IDs past
@@ -521,3 +524,8 @@ byte, the epoch and erasure rules, and the six frozen known-answer vectors
 authenticated relay protocol of §3.1 is superseded by tag registration when
 the rendezvous wire change lands behind its version bump; until then §3.1
 remains the deployed behaviour and `SECURITY.md` states the gap.
+
+The proposed pairing-secret case `0x03` is deliberately separate at
+[`docs/PAIRING-RENDEZVOUS-DRAFT.md`](docs/PAIRING-RENDEZVOUS-DRAFT.md). It is
+implemented for review but is not part of this accepted section until both
+owners ratify that exact extension.

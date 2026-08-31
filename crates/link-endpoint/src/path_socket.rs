@@ -357,6 +357,16 @@ impl Paths {
         driver
     }
 
+    /// Copy the relay driver learnt for a local provisional route onto the
+    /// Ed25519 key presented by its completed handshake.  The synthetic route
+    /// remains in place for that QUIC connection; this only gives the bounded
+    /// pairing session honest relay status under the presented key.
+    pub(crate) fn copy_relay_route(&self, route: NodeId, peer: NodeId) {
+        let mut inner = self.inner.lock().expect("paths");
+        let driver = inner.peers.get(&route).and_then(|entry| entry.driver);
+        inner.peers.entry(peer).or_default().driver = driver;
+    }
+
     /// A datagram from `peer` arrived on `driver`: answer on the same relay,
     /// which is how the accepting side follows the dialer's choice.
     fn heard_on(&self, peer: NodeId, driver: u64) {

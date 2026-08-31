@@ -54,6 +54,12 @@ fn check_pinned(expected: NodeId, presented: &CertificateDer<'_>) -> Result<Node
     Ok(presented)
 }
 
+fn check_ed25519_raw_key(presented: &CertificateDer<'_>) -> Result<NodeId, TlsError> {
+    node_id_from_spki(presented.as_ref()).ok_or(TlsError::InvalidCertificate(
+        rustls::CertificateError::BadEncoding,
+    ))
+}
+
 fn verify_signature(
     provider: &CryptoProvider,
     message: &[u8],
@@ -128,10 +134,9 @@ impl ServerCertVerifier for PinnedServerVerifier {
 }
 
 /// Server side: client authentication is mandatory and the pin is too.  The
-/// expected node ID is always known ahead of the handshake, because quinn hands
-/// over the synthetic source address before `accept_with` builds this verifier.
-/// There is deliberately no unpinned mode: an endpoint that does not yet know
-/// who it is accepting uses [`RefusingClientVerifier`] and completes nothing.
+/// expected node ID is always known ahead of an ordinary handshake, because
+/// quinn hands over the synthetic source address before `accept_with` builds
+/// this verifier.
 #[derive(Debug)]
 pub struct PinnedClientVerifier {
     expected: NodeId,
@@ -143,6 +148,26 @@ impl PinnedClientVerifier {
     pub fn new(expected: NodeId) -> Arc<Self> {
         Arc::new(PinnedClientVerifier {
             expected,
+            provider: provider(),
+            empty: Vec::new(),
+        })
+    }
+}
+
+/// Pairing-only server verifier.  It accepts any well-formed Ed25519 raw key
+/// and verifies CertificateVerify under that same key, but grants no identity
+/// or application authority.  It is used only on the separate pairing ALPN,
+/// over a short-lived pairing-secret route; the product must prove the raw
+/// secret inside the server-pinned TLS request before reading its body.
+#[derive(Debug)]
+pub struct ProvisionalClientVerifier {
+    provider: Arc<CryptoProvider>,
+    empty: Vec<DistinguishedName>,
+}
+
+impl ProvisionalClientVerifier {
+    pub fn new() -> Arc<Self> {
+        Arc::new(ProvisionalClientVerifier {
             provider: provider(),
             empty: Vec::new(),
         })
@@ -262,6 +287,59 @@ impl ClientCertVerifier for PinnedClientVerifier {
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, TlsError> {
         check_pinned(self.expected, cert)?;
+        verify_signature(&self.provider, message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![SignatureScheme::ED25519]
+    }
+
+    fn requires_raw_public_keys(&self) -> bool {
+        true
+    }
+}
+
+impl ClientCertVerifier for ProvisionalClientVerifier {
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &self.empty
+    }
+
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        true
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, TlsError> {
+        check_ed25519_raw_key(end_entity)?;
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        Err(TlsError::PeerIncompatible(
+            rustls::PeerIncompatible::Tls12NotOffered,
+        ))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        check_ed25519_raw_key(cert)?;
         verify_signature(&self.provider, message, cert, dss)
     }
 

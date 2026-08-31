@@ -439,7 +439,7 @@ async fn serve_session(
             }
             Mode::Identity(node_id)
         }
-        Some(Frame::Register { tags }) => {
+        Some(Frame::Register { tags }) if !tags.is_empty() => {
             register_tags(&registry, session_id, &tx, &[], &tags);
             Mode::Tags(tags)
         }

@@ -184,7 +184,7 @@ impl Frame {
                 }
                 let count = u16::from_be_bytes([body[0], body[1]]) as usize;
                 let rest = &body[2..];
-                if count == 0 || count > MAX_TAGS_PER_REGISTER || rest.len() != count * TAG_BYTES {
+                if count > MAX_TAGS_PER_REGISTER || rest.len() != count * TAG_BYTES {
                     return None;
                 }
                 // Length was checked above, so every 16-byte tag is whole.

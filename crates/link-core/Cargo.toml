@@ -16,6 +16,7 @@ rand.workspace = true
 rustls.workspace = true
 serde.workspace = true
 sha2.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

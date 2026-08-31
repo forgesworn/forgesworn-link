@@ -10,6 +10,7 @@ use std::fmt;
 
 use hkdf::Hkdf;
 use sha2::Sha256;
+use zeroize::Zeroizing;
 
 /// HKDF salt, `docs/RENDEZVOUS.md` section 2.
 pub const RENDEZVOUS_SALT: &[u8] = b"forgesworn-link/rendezvous/v1";
@@ -17,6 +18,11 @@ pub const RENDEZVOUS_SALT: &[u8] = b"forgesworn-link/rendezvous/v1";
 pub const EPOCH_SECONDS: u64 = 3600;
 /// A tag is 16 bytes.
 pub const TAG_BYTES: usize = 16;
+/// Pairing secrets are 16 raw bytes, encoded as 32 lowercase hex characters
+/// at the product boundary.  The ASCII spelling is never HKDF input.
+pub const PAIRING_SECRET_BYTES: usize = 16;
+/// Domain separator for a pairing-secret rendezvous tag.
+pub const PAIRING_CASE: u8 = 0x03;
 
 /// Which ephemeral mix the pair used.  Leads the ikm as a domain separator so
 /// the three modes can never be cross-interpreted.
@@ -86,11 +92,33 @@ pub fn derive_tag(
     relay_host: &str,
     epoch: u64,
 ) -> Tag {
-    let mut ikm = [0u8; 65];
+    let mut ikm = Zeroizing::new([0u8; 65]);
     ikm[0] = case.byte();
     ikm[1..33].copy_from_slice(static_x);
     ikm[33..65].copy_from_slice(eph_x);
-    let hk = Hkdf::<Sha256>::new(Some(RENDEZVOUS_SALT), &ikm);
+    derive_from_ikm(&ikm[..], relay_host, epoch)
+}
+
+/// The first-contact pairing tag.  It is reachability only: the relay sees
+/// registered tags, so end-to-end authority still requires the raw secret to
+/// be proved inside the box-pinned TLS request.
+///
+/// ```text
+/// ikm = 0x03 || pairing_secret // 17 bytes; secret is 16 raw bytes
+/// ```
+pub fn derive_pairing_tag(
+    pairing_secret: &[u8; PAIRING_SECRET_BYTES],
+    relay_host: &str,
+    epoch: u64,
+) -> Tag {
+    let mut ikm = Zeroizing::new([0u8; 1 + PAIRING_SECRET_BYTES]);
+    ikm[0] = PAIRING_CASE;
+    ikm[1..].copy_from_slice(pairing_secret);
+    derive_from_ikm(&ikm[..], relay_host, epoch)
+}
+
+fn derive_from_ikm(ikm: &[u8], relay_host: &str, epoch: u64) -> Tag {
+    let hk = Hkdf::<Sha256>::new(Some(RENDEZVOUS_SALT), ikm);
     let mut info = Vec::with_capacity(relay_host.len() + 1 + 8);
     info.extend_from_slice(relay_host.as_bytes());
     info.push(0);

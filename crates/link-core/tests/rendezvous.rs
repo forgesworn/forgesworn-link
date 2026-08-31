@@ -4,7 +4,8 @@
 use std::path::PathBuf;
 
 use link_core::rendezvous::{
-    EPOCH_SECONDS, TAG_BYTES, TagCase, derive_tag, ecdh_x, epoch_index, valid_compressed_point,
+    EPOCH_SECONDS, TAG_BYTES, TagCase, derive_pairing_tag, derive_tag, ecdh_x, epoch_index,
+    valid_compressed_point,
 };
 use serde_json::Value;
 
@@ -109,6 +110,24 @@ fn all_six_tags_reproduce() {
             "{name}"
         );
     }
+}
+
+#[test]
+fn pairing_secret_case_reproduces_the_independent_node_vector() {
+    let secret: [u8; 16] = hex::decode("000102030405060708090a0b0c0d0e0f")
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let tag = derive_pairing_tag(&secret, "relay.example.org", 498_216);
+    assert_eq!(hex::encode(tag.0), "66dac0233c5404c521a2b2200f1b8211");
+    assert_ne!(
+        tag,
+        derive_pairing_tag(&secret, "relay2.example.net", 498_216)
+    );
+    assert_ne!(
+        tag,
+        derive_pairing_tag(&secret, "relay.example.org", 498_217)
+    );
 }
 
 #[test]
