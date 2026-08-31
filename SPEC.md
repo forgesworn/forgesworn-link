@@ -525,7 +525,8 @@ authenticated relay protocol of §3.1 is superseded by tag registration when
 the rendezvous wire change lands behind its version bump; until then §3.1
 remains the deployed behaviour and `SECURITY.md` states the gap.
 
-The proposed pairing-secret case `0x03` is deliberately separate at
-[`docs/PAIRING-RENDEZVOUS-DRAFT.md`](docs/PAIRING-RENDEZVOUS-DRAFT.md). It is
-implemented for review but is not part of this accepted section until both
-owners ratify that exact extension.
+The pairing-secret case `0x03` is deliberately specified separately at
+[`docs/PAIRING-RENDEZVOUS-DRAFT.md`](docs/PAIRING-RENDEZVOUS-DRAFT.md). Both
+owners ratified the exact normative text at commit `e69c3cd` on 2026-08-31;
+implementation is therefore authorised, while final acceptance and freeze
+remain gated by that document's §5 evidence.

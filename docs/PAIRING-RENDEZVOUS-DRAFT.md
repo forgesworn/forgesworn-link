@@ -1,10 +1,11 @@
 # Pairing rendezvous, case `0x03`
 
-**Status: DRAFT — Tally/Quill technical agreement, owner ratification still
-required.** This extends the frozen
-[`RENDEZVOUS.md`](./RENDEZVOUS.md) contract and therefore does not amend that
-text until both named owners accept it. The implementation is isolated on the
-pairing branch for the same reason.
+**Status: RATIFIED FOR IMPLEMENTATION — accepted by both named owners on
+2026-08-31; acceptance evidence in §5 remains pending.** This extends the
+frozen [`RENDEZVOUS.md`](./RENDEZVOUS.md) contract. The exact normative text
+accepted by the owners is commit `e69c3cd`; this follow-up changes only its
+status and ratification record. It does not claim the hostile-client,
+transition or phone-to-box evidence required before final freeze.
 
 Normative words MUST / MUST NOT / SHOULD / MAY are RFC 2119.
 
@@ -106,8 +107,10 @@ contract can be frozen, it needs:
 
 ## 6. Ratification
 
-- Bothy owner (decented): **pending against this exact text**.
-- ForgeSworn owner (TheCryptoDonkey): **pending against this exact text**.
+- Bothy owner (decented): **ratified the exact `e69c3cd` text**.
+- ForgeSworn owner (TheCryptoDonkey): **ratified the exact `e69c3cd` text**.
 
-Agent agreement and green CI are evidence for the owners; neither substitutes
-for their acceptance of a frozen security contract.
+Ratification was recorded on 2026-08-31 when decented confirmed it directly to
+Quill after the owner-to-owner discussion with TheCryptoDonkey. Tally/Quill
+technical agreement and green verification remain evidence, not substitutes
+for that owner acceptance.
