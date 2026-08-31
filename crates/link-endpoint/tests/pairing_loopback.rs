@@ -103,10 +103,14 @@ async fn two_nodes_meet_from_the_pairing_secret_alone() {
         "closed() waits for the real connection close, not merely the response finishing",
     );
     keeper.close().await;
+    // Product teardown removes the QR admission immediately. The established
+    // connection has switched to TLS-exported routing material, so this cannot
+    // strand the close packet that is still draining through Quinn.
+    drop(keeper_registration);
     tokio::time::timeout(Duration::from_secs(2), box_session.closed())
         .await
-        .expect("the listener observes the peer's close");
-    drop((box_registration, keeper_registration));
+        .expect("the listener observes the close after admission is removed");
+    drop(box_registration);
     relay.shutdown();
 }
 

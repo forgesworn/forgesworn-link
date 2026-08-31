@@ -31,6 +31,12 @@ pub const MAX_MTU: u16 = 1350;
 const ALPN: &[u8] = b"fsl/0";
 /// Separate protocol identity for a bounded, unpinned first-contact session.
 const PAIRING_ALPN: &[u8] = b"fsl-pair/0";
+/// A completed provisional handshake switches from its admitting QR secret to
+/// this connection-local TLS exporter.  The relay still sees only an opaque
+/// case-0x03 tag, while dropping the QR registration can no longer strand the
+/// connection's final packets.
+const PAIRING_ROUTE_EXPORT_LABEL: &[u8] = b"EXPORTER-FSL-pair-route-v1";
+static NEXT_PAIRING_ROUTE_GENERATION: AtomicU64 = AtomicU64::new(1);
 /// Pairing secrets are product-level ten-minute capabilities, never a general
 /// anonymous-listener mode.
 pub const MAX_PAIRING_LIFETIME: Duration = Duration::from_secs(10 * 60);
@@ -67,11 +73,23 @@ pub struct PairingSession {
 }
 
 impl PairingSession {
-    fn new(session: Session) -> Self {
+    fn new(session: Session, book: Arc<TagBook>, route: NodeId, generation: u64) -> Self {
         let connection = session.connection();
+        let lifetime_connection = connection.clone();
         tokio::spawn(async move {
             tokio::time::sleep(MAX_PAIRING_SESSION_LIFETIME).await;
-            connection.close(VarInt::from_u32(3), b"pairing lifetime");
+            lifetime_connection.close(VarInt::from_u32(3), b"pairing lifetime");
+        });
+        tokio::spawn(async move {
+            let reason = connection.closed().await;
+            if matches!(reason, quinn::ConnectionError::LocallyClosed) {
+                // Quinn reports a local close before its CONNECTION_CLOSE has
+                // drained. Keep only the TLS-exported route (never the QR
+                // admission secret) for one full provisional-session bound so
+                // retransmission cannot be cut off by product handle teardown.
+                tokio::time::sleep(MAX_PAIRING_SESSION_LIFETIME).await;
+            }
+            book.remove_live_pairing(route, generation);
         });
         PairingSession {
             session,
@@ -116,6 +134,13 @@ impl PairingSession {
         self.session.accept_stream().await
     }
 
+    /// Close this provisional connection locally.
+    ///
+    /// Once the TLS handshake completed, its datagrams switched from the QR
+    /// admission tag to connection-local exporter material. The caller may
+    /// therefore drop its `PairingRegistration` immediately after this
+    /// returns: Link retains only that authority-free live route while Quinn
+    /// drains the close.
     pub async fn close(&self) {
         self.session.close(3).await;
     }
@@ -297,9 +322,12 @@ impl Endpoint {
     }
 
     /// Register a short-lived first-contact tag derived from 16 raw secret
-    /// bytes.  The returned handle owns the registration lifetime; dropping
-    /// it removes Link's zeroising copy immediately.  Expiry also removes it,
-    /// even if the product accidentally retains the handle.
+    /// bytes.  The returned handle owns the admission lifetime; dropping it
+    /// removes Link's zeroising copy immediately. Expiry does the same even if
+    /// the product accidentally retains the handle. A completed provisional
+    /// connection has already switched to separate TLS-exported routing
+    /// material, which grants no admission authority and is cleaned up with
+    /// the bounded session.
     pub fn register_pairing_secret(
         &self,
         secret: [u8; PAIRING_SECRET_BYTES],
@@ -563,6 +591,15 @@ impl Endpoint {
             reason
         })?;
 
+        let generation = match promote_pairing_route(book, route, &connection) {
+            Ok(generation) => generation,
+            Err(reason) => {
+                connection.close(VarInt::from_u32(3), b"pairing route");
+                self.paths.end_session(peer, session_id);
+                return Err(reason);
+            }
+        };
+
         let session = Session::start(
             peer,
             true,
@@ -573,7 +610,12 @@ impl Endpoint {
             (session_id, superseded),
         )
         .await;
-        Ok(PairingSession::new(session))
+        Ok(PairingSession::new(
+            session,
+            book.clone(),
+            route,
+            generation,
+        ))
     }
 
     /// Accept an ordinary pinned session.  A pairing arrival is closed rather
@@ -644,6 +686,18 @@ impl Endpoint {
                     conn.close(VarInt::from_u32(1), b"identity");
                     continue;
                 }
+                let Some(book) = self.book.as_ref() else {
+                    conn.close(VarInt::from_u32(3), b"pairing route");
+                    continue;
+                };
+                let generation = match promote_pairing_route(book, route, &conn) {
+                    Ok(generation) => generation,
+                    Err(reason) => {
+                        warn!(%route, %reason, "pairing route promotion failed");
+                        conn.close(VarInt::from_u32(3), b"pairing route");
+                        continue;
+                    }
+                };
                 self.paths.register_peer(presented);
                 self.paths.copy_relay_route(route, presented);
                 let (session_id, superseded) = self.paths.begin_session(presented);
@@ -657,7 +711,12 @@ impl Endpoint {
                     (session_id, superseded),
                 )
                 .await;
-                return Ok(AcceptedSession::Pairing(PairingSession::new(session)));
+                return Ok(AcceptedSession::Pairing(PairingSession::new(
+                    session,
+                    book.clone(),
+                    route,
+                    generation,
+                )));
             }
 
             let (session_id, superseded) = ordinary_slot.expect("ordinary route has a slot");
@@ -694,6 +753,22 @@ fn presented_node_id(conn: &quinn::Connection) -> Option<NodeId> {
         .ok()?;
     // RFC 7250: the one entry of the peer's "certificate" list is its SPKI.
     node_id_from_spki(chain.first()?.as_ref())
+}
+
+fn promote_pairing_route(
+    book: &Arc<TagBook>,
+    route: NodeId,
+    connection: &quinn::Connection,
+) -> Result<u64, FailReason> {
+    let mut secret = [0u8; link_core::rendezvous::PAIRING_SECRET_BYTES];
+    connection
+        .export_keying_material(&mut secret, PAIRING_ROUTE_EXPORT_LABEL, b"")
+        .map_err(|_| FailReason::Relay)?;
+    let generation = NEXT_PAIRING_ROUTE_GENERATION.fetch_add(1, Ordering::Relaxed);
+    if !book.promote_pairing(route, secret, generation, now_unix()) {
+        return Err(FailReason::Rendezvous);
+    }
+    Ok(generation)
 }
 
 fn classify(error: &quinn::ConnectionError) -> FailReason {
