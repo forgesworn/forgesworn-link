@@ -35,6 +35,10 @@ const CONNECTION_RECEIVE_WINDOW: u64 = 4 << 20;
 #[derive(Clone, Debug)]
 pub struct EndpointConfig {
     pub key: TransportKey,
+    /// Highest card serial this transport key has already signed.  The shell
+    /// persists it for the lifetime of the key and updates it after every
+    /// card.  `None` is suitable only for a newly minted key.
+    pub serial_seed: Option<u64>,
     pub relays: Vec<RelaySpec>,
     /// Owner consent for direct paths.  Relay-only is a first-class configuration.
     pub allow_direct: bool,
@@ -53,6 +57,9 @@ pub struct EndpointConfig {
     /// the spec: it exists so a test can prove the relay carried a transfer
     /// before the upgrade, and so a product can defer probing.
     pub probe_delay: Duration,
+    /// Maximum time `connect` waits for a relay welcome.  This bounds DNS,
+    /// TCP, TLS, WebSocket and registration stalls before QUIC starts.
+    pub rendezvous_timeout: Duration,
     /// Tag-mode rendezvous material per peer, spec 9.  `Some` switches every
     /// relay session to tag registration, so no node ID, Nostr key or
     /// signature ever reaches a relay; `None` keeps the deployed identity
@@ -65,12 +72,14 @@ impl EndpointConfig {
     pub fn new(key: TransportKey) -> Self {
         EndpointConfig {
             key,
+            serial_seed: None,
             relays: Vec::new(),
             allow_direct: true,
             bind: "0.0.0.0:0".parse().expect("literal"),
             reflector: None,
             net_poll: Duration::from_secs(5),
             probe_delay: Duration::ZERO,
+            rendezvous_timeout: Duration::from_secs(30),
             rendezvous: None,
         }
     }
@@ -90,6 +99,10 @@ pub struct Endpoint {
 impl Endpoint {
     /// Bind the sockets and start the relay driver.  Does not wait for a relay.
     pub async fn open(config: EndpointConfig) -> anyhow::Result<Endpoint> {
+        anyhow::ensure!(
+            config.serial_seed != Some(u64::MAX),
+            "card serial seed is exhausted"
+        );
         let book = config
             .rendezvous
             .clone()
@@ -132,10 +145,11 @@ impl Endpoint {
             Arc::new(quinn::TokioRuntime),
         )?;
 
-        let serial_seed = SystemTime::now()
+        let wall_clock = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        let serial_seed = config.serial_seed.unwrap_or(0).max(wall_clock);
 
         let endpoint = Endpoint {
             key: config.key.clone(),
@@ -211,11 +225,10 @@ impl Endpoint {
         extra.truncate(link_core::card::MAX_HINTS);
         hints.truncate(link_core::card::MAX_HINTS - extra.len());
         hints.extend(extra);
-        // Strictly increasing while the process lives: the counter ratchets to
-        // max(last + 1, now), so a clock jump ahead of the counter cannot
-        // repeat a serial within one second.  A restart inside the same second
-        // still can, which only a persisted high-water mark closes -- that
-        // belongs to the shell and stays a SPEC open problem.
+        // Strictly increasing across both clock movement and process restarts:
+        // the counter starts at max(the shell's persisted high-water mark,
+        // wall clock) and ratchets to max(last + 1, now).  The shell persists
+        // the returned serial before it distributes the card.
         let last = self
             .serial
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |last| {
@@ -227,13 +240,16 @@ impl Endpoint {
     }
 
     /// Wait for a relay welcome on `driver`, spec 4.3 Rendezvous.
-    async fn rendezvous(driver: &RelayDriver) -> Result<String, FailReason> {
+    async fn rendezvous(driver: &RelayDriver, deadline: Duration) -> Result<String, FailReason> {
         match driver.status() {
             RelayStatus::Up(url) => return Ok(url),
             RelayStatus::Failed => return Err(FailReason::Relay),
             _ => {}
         }
-        driver.wait_up().await.ok_or(FailReason::Relay)
+        tokio::time::timeout(deadline, driver.wait_up())
+            .await
+            .map_err(|_| FailReason::Timeout)?
+            .ok_or(FailReason::Relay)
     }
 
     /// Verify nothing here: `Card` can only exist verified or freshly signed.
@@ -241,6 +257,10 @@ impl Endpoint {
         let peer = card.node_id;
         if peer == self.node_id() {
             return Err(FailReason::Identity);
+        }
+        if self.book.as_ref().is_some_and(|book| !book.contains(peer)) {
+            warn!(%peer, "connect refused: no rendezvous material for peer");
+            return Err(FailReason::Rendezvous);
         }
         self.paths.register_peer(peer);
         // Spec 4.3: one QUIC connection per peer, newest wins.  Take the slot
@@ -257,7 +277,14 @@ impl Endpoint {
             .map(RelaySpec::plain)
             .collect();
         let driver = self.paths.set_peer_relays(peer, &hints);
-        let relay = Self::rendezvous(&driver).await?;
+        let relay = match Self::rendezvous(&driver, self.config.rendezvous_timeout).await {
+            Ok(relay) => relay,
+            Err(reason) => {
+                warn!(%peer, %reason, "rendezvous failed before QUIC");
+                self.paths.end_session(peer, session_id);
+                return Err(reason);
+            }
+        };
         info!(%peer, %relay, "rendezvous ready, starting QUIC over the relay");
 
         let mut client_crypto = rustls::ClientConfig::builder_with_provider(Arc::new(

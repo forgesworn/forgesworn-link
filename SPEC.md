@@ -415,7 +415,7 @@ pub struct Session;            // one QUIC connection to one peer
 pub struct Stream;             // one bidirectional QUIC stream
 
 pub enum PathStatus { Idle, Rendezvous, Relayed, Probing, Direct, Reconnecting, Failed(FailReason) }
-pub enum FailReason { Relay, Identity, Timeout, Superseded }
+pub enum FailReason { Relay, Rendezvous, Identity, Timeout, Superseded }
 pub struct PathReport {
     pub status: PathStatus,
     pub relay: Option<String>,      // the relay URL in use, as text
@@ -500,10 +500,12 @@ restated here so they cannot drift.
 - Multipath or simultaneous relay plus direct sending.
 - Anything about tiers, claims, quotas or repair.  The lane moves bytes.
 
-Open problems the spike surfaced, to settle before Phase 1:
-
-- Card serials come from the wall clock in the spike; a node must persist its
-  highest issued serial or a clock step can reissue a stale one.
+`EndpointConfig.serial_seed` is the highest serial the transport key has
+already signed.  The shell MUST persist each returned card serial before it
+distributes that card and provide the high-water mark after restart.  A missing
+tag-mode peer fails as `Rendezvous` before session state changes; waiting for a
+relay welcome is bounded by `EndpointConfig.rendezvous_timeout` and expires as
+`Timeout`.
 
 ## 9. Rendezvous-tag routing
 

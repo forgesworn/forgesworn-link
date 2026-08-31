@@ -85,6 +85,13 @@ impl TagBook {
         self.peers.lock().expect("book").is_empty()
     }
 
+    /// Whether this book can derive an outbound rendezvous tag for `peer`.
+    /// Callers use this before starting a session so a missing shell-side
+    /// pairing cannot become a silent wait for a relay welcome.
+    pub fn contains(&self, peer: NodeId) -> bool {
+        self.peers.lock().expect("book").contains_key(&peer)
+    }
+
     fn window(&self, now_unix: u64) -> Vec<u64> {
         let current = epoch_index(now_unix);
         EPOCH_WINDOW
@@ -239,5 +246,16 @@ mod tests {
             first,
             "new material, new tag"
         );
+    }
+
+    #[test]
+    fn contains_tracks_upsert_and_remove() {
+        let peer = node(5);
+        let book = TagBook::new(HashMap::new());
+        assert!(!book.contains(peer));
+        book.upsert(peer, material(50));
+        assert!(book.contains(peer));
+        book.remove(peer);
+        assert!(!book.contains(peer));
     }
 }
