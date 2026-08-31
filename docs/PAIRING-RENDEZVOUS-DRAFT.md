@@ -59,9 +59,17 @@ provisional TLS key grants nothing by itself.
   `AcceptedSession::Pairing`.
 - `PairingSession` is relay-only, exposes exactly one application stream, has
   no direct-path API and is forcibly closed after 60 seconds.
-- A pairing registration is valid for 1 to 600 seconds. Link holds its secret
+- A pairing admission is valid for 1 to 600 seconds. Link holds its QR secret
   in zeroising memory. Dropping the `PairingRegistration`, or reaching expiry,
-  removes the route and clears Link's send cache.
+  removes that admission and clears Link's send cache.
+- Once provisional TLS completes, both endpoints derive connection-local
+  routing material with TLS exporter label `EXPORTER-FSL-pair-route-v1` and
+  switch the live QUIC route to it. This material cannot admit a new
+  provisional handshake, is never exposed to the product, and is removed by a
+  generation-bound cleanup when the bounded session ends. A locally initiated
+  Quinn close reports completion before its close packet has drained, so Link
+  retains only this authority-free route for one further 60-second session
+  bound in that case. The QR admission is still removed immediately.
 - A repeated `Register` with zero tags is an explicit empty replacement set.
   The relay MUST accept it only after a non-empty initial registration and
   MUST remove the session's previous tags immediately. An empty first
@@ -69,9 +77,10 @@ provisional TLS key grants nothing by itself.
 
 The product MUST retain the registration handle until the claim response has
 finished over the provisional connection. It then closes the connection and
-drops the handle. Removing the tag before the response completes can cut the
-only return route; retaining it afterwards needlessly extends first-contact
-reachability.
+drops the handle. Removing the admission before the response completes can cut
+the only return route. Retaining it afterwards needlessly extends first-contact
+reachability; the exporter-derived route is Link's transport drain state, not
+first-contact authority.
 
 ## 4. Transition to ordinary tags
 
@@ -86,7 +95,9 @@ The product performs this order:
 5. drop the pairing registration and zeroise the product's secret.
 
 Later connections use the ordinary pinned `fsl/0` path. No authority or route
-state is promoted from the provisional connection.
+state is promoted into that durable path. The provisional connection's
+exporter-derived drain route dies with the bounded session and cannot admit a
+later connection.
 
 ## 5. Acceptance evidence
 
@@ -100,8 +111,9 @@ contract can be frozen, it needs:
   initial registration is refused;
 - a hostile provisional TLS client that knows the tag but not the raw secret,
   proving Bothy refuses it before reading the claim body;
-- a transition test proving the response completes before the pairing tag is
-  removed and the next connection uses ordinary pinned tags;
+- a transition test proving the response completes before the pairing
+  admission is removed, the listener still observes the close after that
+  removal, and the next connection uses ordinary pinned tags;
 - the phone-to-box run that originally exposed the deadlock, repeated without
   either book being hand-seeded.
 
@@ -109,6 +121,10 @@ contract can be frozen, it needs:
 
 - Bothy owner (decented): **ratified the exact `e69c3cd` text**.
 - ForgeSworn owner (TheCryptoDonkey): **ratified the exact `e69c3cd` text**.
+- The 2026-09-01 exporter-drain clarification is engineering-accepted but
+  amends that exact text. Its wording MUST be included in the pending
+  `FINAL-FREEZE` ratification by both named owners; this draft does not
+  misstate engineering agreement as an owner signature.
 
 Ratification was recorded on 2026-08-31 when decented confirmed it directly to
 Quill after the owner-to-owner discussion with TheCryptoDonkey. Tally/Quill

@@ -50,13 +50,33 @@ pub struct TagBook {
 }
 
 struct PairingRoute {
+    /// The QR secret admits a new provisional handshake.  Dropping the
+    /// product's registration removes this immediately.
+    admission: Option<ExpiringSecret>,
+    /// Once the handshake is complete, both endpoints switch the established
+    /// QUIC connection to a TLS-exported tag.  It carries no pairing authority
+    /// and may outlive `admission` while QUIC drains a close packet.
+    live: Option<LivePairingRoute>,
+}
+
+struct ExpiringSecret {
     secret: Zeroizing<[u8; PAIRING_SECRET_BYTES]>,
     expires_at: u64,
 }
 
-/// A live pairing-tag registration.  Dropping it removes and zeroises Link's
-/// copy of the secret.  The product retains its own separately for the
-/// end-to-end request proof; this handle never exposes Link's copy.
+struct LivePairingRoute {
+    generation: u64,
+    secret: Zeroizing<[u8; PAIRING_SECRET_BYTES]>,
+}
+
+/// A live pairing admission.  Dropping it removes and zeroises Link's copy of
+/// the QR secret.  The product retains its own separately for the end-to-end
+/// request proof; this handle never exposes Link's copy.
+///
+/// A connection that completed its provisional TLS handshake has already
+/// switched to separate exporter-derived routing material. That material has
+/// no admission authority and is owned by the bounded `PairingSession`, so
+/// dropping this handle cannot cut off the connection's final packets.
 pub struct PairingRegistration {
     route: NodeId,
     expires_at: u64,
@@ -166,8 +186,11 @@ impl TagBook {
         self.pairing.lock().expect("pairing book").insert(
             route,
             PairingRoute {
-                secret: Zeroizing::new(secret),
-                expires_at,
+                admission: Some(ExpiringSecret {
+                    secret: Zeroizing::new(secret),
+                    expires_at,
+                }),
+                live: None,
             },
         );
         self.bump();
@@ -179,12 +202,73 @@ impl TagBook {
     }
 
     pub(crate) fn remove_pairing(&self, route: NodeId) -> bool {
-        let removed = self
-            .pairing
-            .lock()
-            .expect("pairing book")
-            .remove(&route)
+        let mut pairing = self.pairing.lock().expect("pairing book");
+        let removed = pairing
+            .get_mut(&route)
+            .and_then(|route| route.admission.take())
             .is_some();
+        if pairing
+            .get(&route)
+            .is_some_and(|route| route.live.is_none())
+        {
+            pairing.remove(&route);
+        }
+        drop(pairing);
+        if removed {
+            self.bump();
+        }
+        removed
+    }
+
+    /// Replace an admitting pairing tag with a TLS-exported route for the
+    /// established connection.  The admission remains independently owned by
+    /// `PairingRegistration`; its drop cannot strand this live connection.
+    pub(crate) fn promote_pairing(
+        &self,
+        route: NodeId,
+        secret: [u8; PAIRING_SECRET_BYTES],
+        generation: u64,
+        now_unix: u64,
+    ) -> bool {
+        self.prune_expired(now_unix);
+        let mut pairing = self.pairing.lock().expect("pairing book");
+        let Some(entry) = pairing.get_mut(&route) else {
+            return false;
+        };
+        if entry.admission.is_none() {
+            return false;
+        }
+        entry.live = Some(LivePairingRoute {
+            generation,
+            secret: Zeroizing::new(secret),
+        });
+        drop(pairing);
+        self.bump();
+        true
+    }
+
+    /// Forget only the live route installed by `generation`.  A superseding
+    /// connection on the same admission route is left untouched.
+    pub(crate) fn remove_live_pairing(&self, route: NodeId, generation: u64) -> bool {
+        let mut pairing = self.pairing.lock().expect("pairing book");
+        let removed = pairing
+            .get_mut(&route)
+            .and_then(|route| {
+                route
+                    .live
+                    .as_ref()
+                    .is_some_and(|live| live.generation == generation)
+                    .then(|| route.live.take())
+                    .flatten()
+            })
+            .is_some();
+        if pairing
+            .get(&route)
+            .is_some_and(|route| route.admission.is_none() && route.live.is_none())
+        {
+            pairing.remove(&route);
+        }
+        drop(pairing);
         if removed {
             self.bump();
         }
@@ -194,8 +278,19 @@ impl TagBook {
     fn prune_expired(&self, now_unix: u64) {
         let mut pairing = self.pairing.lock().expect("pairing book");
         let before = pairing.len();
-        pairing.retain(|_, route| now_unix < route.expires_at);
-        let changed = pairing.len() != before;
+        let mut changed = false;
+        pairing.retain(|_, route| {
+            if route
+                .admission
+                .as_ref()
+                .is_some_and(|secret| now_unix >= secret.expires_at)
+            {
+                route.admission = None;
+                changed = true;
+            }
+            route.admission.is_some() || route.live.is_some()
+        });
+        changed |= pairing.len() != before;
         drop(pairing);
         if changed {
             self.bump();
@@ -207,13 +302,19 @@ impl TagBook {
         self.pairing
             .lock()
             .expect("pairing book")
-            .contains_key(&route)
+            .get(&route)
+            .is_some_and(|route| route.admission.is_some())
     }
 
     #[cfg(test)]
     fn pairing_count(&self, now_unix: u64) -> usize {
         self.prune_expired(now_unix);
-        self.pairing.lock().expect("pairing book").len()
+        self.pairing
+            .lock()
+            .expect("pairing book")
+            .values()
+            .filter(|route| route.admission.is_some())
+            .count()
     }
 
     /// How many send tags are cached right now.
@@ -270,8 +371,15 @@ impl TagBook {
             }
         }
         for route in pairing.values() {
-            for epoch in &epochs {
-                tags.push(derive_pairing_tag(&route.secret, relay_host, *epoch));
+            if let Some(admission) = &route.admission {
+                for epoch in &epochs {
+                    tags.push(derive_pairing_tag(&admission.secret, relay_host, *epoch));
+                }
+            }
+            if let Some(live) = &route.live {
+                for epoch in &epochs {
+                    tags.push(derive_pairing_tag(&live.secret, relay_host, *epoch));
+                }
             }
         }
         tags
@@ -294,9 +402,17 @@ impl TagBook {
         }
         let tag = if let Some(tag) = {
             let pairing = self.pairing.lock().expect("pairing book");
-            pairing
-                .get(&peer)
-                .map(|route| derive_pairing_tag(&route.secret, relay_host, epoch))
+            pairing.get(&peer).and_then(|route| {
+                route
+                    .live
+                    .as_ref()
+                    .map(|live| derive_pairing_tag(&live.secret, relay_host, epoch))
+                    .or_else(|| {
+                        route.admission.as_ref().map(|admission| {
+                            derive_pairing_tag(&admission.secret, relay_host, epoch)
+                        })
+                    })
+            })
         } {
             tag
         } else {
@@ -342,7 +458,13 @@ impl TagBook {
         let pairing = self.pairing.lock().expect("pairing book");
         for (route_id, route) in pairing.iter() {
             for epoch in &epochs {
-                if derive_pairing_tag(&route.secret, relay_host, *epoch) == *tag {
+                let admission_matches = route.admission.as_ref().is_some_and(|admission| {
+                    derive_pairing_tag(&admission.secret, relay_host, *epoch) == *tag
+                });
+                let live_matches = route.live.as_ref().is_some_and(|live| {
+                    derive_pairing_tag(&live.secret, relay_host, *epoch) == *tag
+                });
+                if admission_matches || live_matches {
                     return Some(*route_id);
                 }
             }
@@ -452,6 +574,47 @@ mod tests {
         drop(registration);
         assert_eq!(book.pairing_count(now), 0);
         assert!(book.registration("relay.example.org", now).is_empty());
+    }
+
+    #[test]
+    fn a_live_pairing_route_outlives_admission_and_cleans_by_generation() {
+        let now = 1_793_588_888;
+        let host = "relay.example.org";
+        let book = Arc::new(TagBook::new(HashMap::new()));
+        let registration = book.register_pairing([0x42; PAIRING_SECRET_BYTES], now + 600);
+        let route = registration.route();
+        let admission_tag = book.tag_for_send(route, host, now).expect("admission tag");
+
+        assert!(book.promote_pairing(route, [0x81; PAIRING_SECRET_BYTES], 7, now));
+        let live_tag = book.tag_for_send(route, host, now).expect("live tag");
+        assert_ne!(admission_tag, live_tag);
+        assert_eq!(
+            book.registration(host, now).len(),
+            6,
+            "admission and live route each cover three epochs",
+        );
+
+        drop(registration);
+        assert!(
+            !book.pairing_active(route, now),
+            "no new handshake is admitted"
+        );
+        assert_eq!(
+            book.registration(host, now).len(),
+            3,
+            "only the live route remains"
+        );
+        assert_eq!(book.resolve(&admission_tag, host, now), None);
+        assert_eq!(book.resolve(&live_tag, host, now), Some(route));
+        assert_eq!(book.tag_for_send(route, host, now), Some(live_tag));
+
+        assert!(
+            !book.remove_live_pairing(route, 6),
+            "a stale cleanup is ignored"
+        );
+        assert_eq!(book.resolve(&live_tag, host, now), Some(route));
+        assert!(book.remove_live_pairing(route, 7));
+        assert!(book.registration(host, now).is_empty());
     }
 
     #[test]
