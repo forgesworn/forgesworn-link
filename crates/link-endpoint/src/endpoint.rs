@@ -87,6 +87,18 @@ impl PairingSession {
         self.session.history()
     }
 
+    /// The Ed25519 transport key presented by the peer in this provisional
+    /// session's TLS handshake.
+    ///
+    /// This is connection-local consistency only. It is **not** a keeper
+    /// identity, is not backed by a card/claim chain on the accepting side,
+    /// and grants no product authority. A pairing product may use it to bind
+    /// a card carried inside the separately secret-authenticated request to
+    /// the key that actually completed this handshake.
+    pub fn peer(&self) -> NodeId {
+        self.session.peer()
+    }
+
     fn take_application_stream(&self) -> anyhow::Result<()> {
         if self.application_stream_used.swap(true, Ordering::SeqCst) {
             anyhow::bail!("a pairing session exposes exactly one application stream");
@@ -106,6 +118,16 @@ impl PairingSession {
 
     pub async fn close(&self) {
         self.session.close(3).await;
+    }
+
+    /// Wait until this provisional QUIC connection is actually closed.
+    ///
+    /// A product uses this after finishing its one response when the peer is
+    /// responsible for closing the provisional connection. The pairing
+    /// session's 60-second hard lifetime still bounds this wait if the peer
+    /// disappears without closing cleanly.
+    pub async fn closed(&self) -> quinn::ConnectionError {
+        self.session.connection().closed().await
     }
 }
 

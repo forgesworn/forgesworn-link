@@ -58,12 +58,26 @@ async fn two_nodes_meet_from_the_pairing_secret_alone() {
         .connect_pairing(&box_card, &keeper_registration)
         .await
         .expect("pairing connect");
-    let box_session = accepting.await.expect("accept task");
+    let box_session = Arc::new(accepting.await.expect("accept task"));
 
     assert!(box_session.path().direct.is_none());
+    assert_eq!(
+        box_session.peer(),
+        keeper_endpoint.node_id(),
+        "the listener sees the transport key that completed the provisional handshake",
+    );
+    assert_eq!(
+        keeper.peer(),
+        box_card.node_id,
+        "the dialler still sees the box key pinned by its verified card",
+    );
 
+    let serving_session = box_session.clone();
     let serving = tokio::spawn(async move {
-        let mut stream = box_session.accept_stream().await.expect("one claim stream");
+        let mut stream = serving_session
+            .accept_stream()
+            .await
+            .expect("one claim stream");
         let mut request = [0u8; 5];
         stream.read_exact(&mut request).await.expect("claim bytes");
         assert_eq!(&request, b"claim");
@@ -82,7 +96,16 @@ async fn two_nodes_meet_from_the_pairing_secret_alone() {
         keeper.open_stream().await.is_err(),
         "a provisional connection exposes no second application stream"
     );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), box_session.closed())
+            .await
+            .is_err(),
+        "closed() waits for the real connection close, not merely the response finishing",
+    );
     keeper.close().await;
+    tokio::time::timeout(Duration::from_secs(2), box_session.closed())
+        .await
+        .expect("the listener observes the peer's close");
     drop((box_registration, keeper_registration));
     relay.shutdown();
 }
