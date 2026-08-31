@@ -58,3 +58,35 @@ async fn serials_stay_strictly_increasing_when_the_clock_runs_ahead() {
     );
     endpoint.close().await;
 }
+
+#[tokio::test]
+async fn a_persisted_high_water_mark_survives_a_restart_and_clock_rollback() {
+    let key = TransportKey::generate();
+    let high_water = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 10_000;
+    let mut config = EndpointConfig::new(key);
+    config.serial_seed = Some(high_water);
+    config.allow_direct = false;
+    config.bind = "127.0.0.1:0".parse().unwrap();
+    let endpoint = Endpoint::open(config).await.expect("endpoint opens");
+
+    let card = endpoint.card(Duration::from_secs(300), Vec::new());
+    assert_eq!(card.serial, high_water + 1);
+    endpoint.close().await;
+}
+
+#[tokio::test]
+async fn an_exhausted_serial_seed_is_refused_at_open() {
+    let mut config = EndpointConfig::new(TransportKey::generate());
+    config.serial_seed = Some(u64::MAX);
+    config.allow_direct = false;
+    config.bind = "127.0.0.1:0".parse().unwrap();
+    let error = match Endpoint::open(config).await {
+        Ok(_) => panic!("an exhausted key cannot sign a fresh card"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("serial seed is exhausted"));
+}

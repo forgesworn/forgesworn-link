@@ -86,6 +86,10 @@ pub enum RelayStatus {
     Connecting,
     Up(String),
     Reconnecting,
+    /// This identity-mode driver lost its node-ID slot to a newer process and
+    /// has stopped permanently. Tag mode cannot attribute an eviction and
+    /// therefore reports `Reconnecting` instead.
+    Superseded,
     Failed,
 }
 
@@ -336,7 +340,7 @@ impl RelayDriver {
         loop {
             match &*rx.borrow_and_update() {
                 RelayStatus::Up(url) => return Some(url.clone()),
-                RelayStatus::Failed => return None,
+                RelayStatus::Superseded | RelayStatus::Failed => return None,
                 _ => {}
             }
             if rx.changed().await.is_err() {
@@ -486,8 +490,19 @@ async fn driver(
                     PumpEnd::Lost => warn!(relay = %spec.url, "relay session lost"),
                     PumpEnd::Superseded => warn!(
                         relay = %spec.url,
-                        "a newer session registered this node ID or tag; backing off before reconnecting"
+                        "a newer session registered this node ID or tag"
                     ),
+                }
+                if end == PumpEnd::Superseded && book.is_none() {
+                    // Identity mode can attribute the replacement exactly: a
+                    // newer process with this node ID won.  Retrying made two
+                    // live processes steal the slot from each other every 30
+                    // seconds, contradicting newest-wins and stalling long
+                    // transfers.  The superseded instance stops; a deliberate
+                    // restart creates a new endpoint and may take the slot.
+                    set_status(&status, &events, RelayStatus::Superseded);
+                    readiness.wake_all();
+                    return;
                 }
                 set_status(&status, &events, RelayStatus::Reconnecting);
                 down_since = Some(std::time::Instant::now());
@@ -495,8 +510,9 @@ async fn driver(
                 // Spec 4.3: next configured relay, then the same one.
                 index += 1;
                 if end == PumpEnd::Superseded {
-                    // Spec 3.1: a superseded client waits the full interval,
-                    // so two live instances of one identity do not fight.
+                    // Tag mode cannot tell which endpoint a third holder of
+                    // one pair tag replaced.  Back off before retrying so the
+                    // legitimate two ends can converge without a hot loop.
                     tokio::time::sleep(BACKOFF_MAX).await;
                 }
                 continue;
@@ -527,8 +543,8 @@ enum PumpEnd {
     /// was malformed: reconnect on the usual backoff.
     Lost,
     /// The relay said a newer session registered this node ID or tag (spec
-    /// 3.1, close reason 2): back off for the full interval first, or two
-    /// live instances of one identity would supersede each other in a loop.
+    /// 3.1, close reason 2). Identity mode stops; anonymous tag mode backs off
+    /// because it cannot attribute a third registration to either endpoint.
     Superseded,
 }
 
@@ -622,6 +638,11 @@ async fn pump(
     refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_epoch = link_core::rendezvous::epoch_index(now_unix());
     let mut last_version = book.map(TagBook::version).unwrap_or(0);
+    // A dummy sender keeps identity mode's receiver pending forever.  Tag
+    // mode replaces it with the book's broadcast state, so removals reach
+    // every relay driver immediately, including an empty replacement set.
+    let (_idle_changes, idle_rx) = watch::channel(0u64);
+    let mut book_changes = book.map(TagBook::subscribe).unwrap_or(idle_rx);
     let mut nonce = [0u8; 8];
     loop {
         tokio::select! {
@@ -639,13 +660,21 @@ async fn pump(
                     last_epoch = current;
                     last_version = version;
                     let tags = book.registration(host, now_unix());
-                    // A book emptied at runtime has nothing to register; the
-                    // old tags age out with the epoch window.
-                    if !tags.is_empty()
-                        && ws.send(Message::Binary(Frame::Register { tags }.encode())).await.is_err()
-                    {
+                    if ws.send(Message::Binary(Frame::Register { tags }.encode())).await.is_err() {
                         return PumpEnd::Lost;
                     }
+                }
+            }
+            changed = book_changes.changed(), if book.is_some() => {
+                if changed.is_err() {
+                    return PumpEnd::Lost;
+                }
+                let Some(book) = book else { continue };
+                last_epoch = link_core::rendezvous::epoch_index(now_unix());
+                last_version = book.version();
+                let tags = book.registration(host, now_unix());
+                if ws.send(Message::Binary(Frame::Register { tags }.encode())).await.is_err() {
+                    return PumpEnd::Lost;
                 }
             }
             frame = outbound.recv() => {

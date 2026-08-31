@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use harness::*;
 use link_core::path::{FailReason, PathStatus};
-use link_endpoint::{RelaySpec, TransportKey};
+use link_endpoint::{RelaySpec, RelayStatus, TransportKey};
 
 /// A settle delay long enough that probing only happens when a test asks for it.
 const NEVER: Duration = Duration::from_secs(3600);
@@ -682,6 +682,7 @@ async fn a_reconnecting_node_supersedes_its_old_session_and_does_not_stall() {
     // which is what a crash or a kill looks like to bob.
     let alice_key = TransportKey::generate();
     let first = start_endpoint_with_key(options(), alice_key.clone()).await;
+    let first_relay = first.paths().relay().home();
     let accepting = {
         let bob = bob.clone();
         tokio::spawn(async move { bob.accept().await })
@@ -710,6 +711,20 @@ async fn a_reconnecting_node_supersedes_its_old_session_and_does_not_stall() {
 
     // Alice's second process, same node ID, before the first has idled out.
     let second = start_endpoint_with_key(options(), alice_key).await;
+    let mut first_relay_status = first_relay.watch();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if *first_relay_status.borrow_and_update() == RelayStatus::Superseded {
+                break;
+            }
+            first_relay_status
+                .changed()
+                .await
+                .expect("the old relay driver reports its terminal state");
+        }
+    })
+    .await
+    .expect("the old process stops instead of reclaiming the node-ID slot");
     let accepting = {
         let bob = bob.clone();
         tokio::spawn(async move { bob.accept().await })

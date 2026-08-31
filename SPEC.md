@@ -211,9 +211,12 @@ pinned certificate is reachable only from configuration.
   A newer registration wins: the relay sends the oldest holder `close` with
   reason `2` and ends that session, so a node that reconnected before its
   previous session died is not left with a dead route, and nothing is
-  silently replaced.  A client that receives reason `2` waits 30 seconds
-  before it reconnects, because two live instances of one node ID would
-  otherwise supersede each other in a loop.
+  silently replaced.  In identity mode the superseded client stops: retrying
+  lets two live processes steal the same node-ID slot from each other every
+  backoff interval and violates newest-wins.  A tag-mode client cannot know
+  which endpoint a third holder of an anonymous pair tag replaced, so it waits
+  30 seconds before retrying; the delay prevents a hot eviction loop while the
+  legitimate two ends converge.
 - **What the relay learns.**  Node IDs of registered endpoints and who they
   talk to, source IP addresses of WSS sessions, timing and byte counts.  It
   must log only routing tokens and counters, and must not persist node IDs past
@@ -415,7 +418,7 @@ pub struct Session;            // one QUIC connection to one peer
 pub struct Stream;             // one bidirectional QUIC stream
 
 pub enum PathStatus { Idle, Rendezvous, Relayed, Probing, Direct, Reconnecting, Failed(FailReason) }
-pub enum FailReason { Relay, Identity, Timeout, Superseded }
+pub enum FailReason { Relay, Rendezvous, Identity, Timeout, Superseded }
 pub struct PathReport {
     pub status: PathStatus,
     pub relay: Option<String>,      // the relay URL in use, as text
@@ -500,10 +503,12 @@ restated here so they cannot drift.
 - Multipath or simultaneous relay plus direct sending.
 - Anything about tiers, claims, quotas or repair.  The lane moves bytes.
 
-Open problems the spike surfaced, to settle before Phase 1:
-
-- Card serials come from the wall clock in the spike; a node must persist its
-  highest issued serial or a clock step can reissue a stale one.
+`EndpointConfig.serial_seed` is the highest serial the transport key has
+already signed.  The shell MUST persist each returned card serial before it
+distributes that card and provide the high-water mark after restart.  A missing
+tag-mode peer fails as `Rendezvous` before session state changes; waiting for a
+relay welcome is bounded by `EndpointConfig.rendezvous_timeout` and expires as
+`Timeout`.
 
 ## 9. Rendezvous-tag routing
 
@@ -519,3 +524,9 @@ byte, the epoch and erasure rules, and the six frozen known-answer vectors
 authenticated relay protocol of §3.1 is superseded by tag registration when
 the rendezvous wire change lands behind its version bump; until then §3.1
 remains the deployed behaviour and `SECURITY.md` states the gap.
+
+The pairing-secret case `0x03` is deliberately specified separately at
+[`docs/PAIRING-RENDEZVOUS-DRAFT.md`](docs/PAIRING-RENDEZVOUS-DRAFT.md). Both
+owners ratified the exact normative text at commit `e69c3cd` on 2026-08-31;
+implementation is therefore authorised, while final acceptance and freeze
+remain gated by that document's §5 evidence.
