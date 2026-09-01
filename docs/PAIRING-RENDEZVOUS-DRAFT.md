@@ -64,12 +64,21 @@ provisional TLS key grants nothing by itself.
   removes that admission and clears Link's send cache.
 - Once provisional TLS completes, both endpoints derive connection-local
   routing material with TLS exporter label `EXPORTER-FSL-pair-route-v1` and
-  switch the live QUIC route to it. This material cannot admit a new
+  register it beside the admission tag. This material cannot admit a new
   provisional handshake, is never exposed to the product, and is removed by a
   generation-bound cleanup when the bounded session ends. A locally initiated
   Quinn close reports completion before its close packet has drained, so Link
   retains only this authority-free route for one further 60-second session
   bound in that case. The QR admission is still removed immediately.
+- Datagrams on the pairing route carry the admission tag for as long as the
+  admission is registered; the exporter-derived route carries only what is
+  left after the admission is dropped, that is the close drain. The exporter
+  route is per connection and outlives its connection's close, so it MUST NOT
+  be preferred while the admission stands: a second provisional dial on the
+  same admission (a keeper retrying after a refused or unanswered claim) would
+  otherwise be stamped with a generation the peer has already forgotten and
+  the relay would drop every handshake packet. Found and fixed 2026-09-01;
+  `pairing_retry.rs` proves four sequential dials on one registration.
 - A repeated `Register` with zero tags is an explicit empty replacement set.
   The relay MUST accept it only after a non-empty initial registration and
   MUST remove the session's previous tags immediately. An empty first
