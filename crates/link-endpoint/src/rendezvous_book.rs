@@ -402,15 +402,24 @@ impl TagBook {
         }
         let tag = if let Some(tag) = {
             let pairing = self.pairing.lock().expect("pairing book");
+            // The admission tag first, for as long as the admission is
+            // registered; the exporter-derived live route only carries what is
+            // left after the admission is dropped (the close drain).  A live
+            // route is per connection and outlives its connection's close by a
+            // whole session bound, so preferring it would stamp a NEW dial on
+            // the same admission route with a generation the peer has already
+            // forgotten -- the relay then drops every handshake packet and the
+            // keeper's retry after a refused claim never comes up.
             pairing.get(&peer).and_then(|route| {
                 route
-                    .live
+                    .admission
                     .as_ref()
-                    .map(|live| derive_pairing_tag(&live.secret, relay_host, epoch))
+                    .map(|admission| derive_pairing_tag(&admission.secret, relay_host, epoch))
                     .or_else(|| {
-                        route.admission.as_ref().map(|admission| {
-                            derive_pairing_tag(&admission.secret, relay_host, epoch)
-                        })
+                        route
+                            .live
+                            .as_ref()
+                            .map(|live| derive_pairing_tag(&live.secret, relay_host, epoch))
                     })
             })
         } {
@@ -586,13 +595,23 @@ mod tests {
         let admission_tag = book.tag_for_send(route, host, now).expect("admission tag");
 
         assert!(book.promote_pairing(route, [0x81; PAIRING_SECRET_BYTES], 7, now));
-        let live_tag = book.tag_for_send(route, host, now).expect("live tag");
+        let live_tag = derive_pairing_tag(&[0x81; PAIRING_SECRET_BYTES], host, epoch_index(now));
         assert_ne!(admission_tag, live_tag);
         assert_eq!(
             book.registration(host, now).len(),
             6,
             "admission and live route each cover three epochs",
         );
+        // Sends keep the admission tag while the admission is registered: a
+        // live route is per connection and lingers for a whole session bound
+        // after its close, so a NEW dial on this route must not be stamped
+        // with it (the peer may already have forgotten that generation).
+        assert_eq!(
+            book.tag_for_send(route, host, now),
+            Some(admission_tag),
+            "the admission tag carries every send until the admission is dropped",
+        );
+        assert_eq!(book.resolve(&live_tag, host, now), Some(route));
 
         drop(registration);
         assert!(
