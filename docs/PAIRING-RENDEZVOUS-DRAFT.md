@@ -117,6 +117,16 @@ contract can be frozen, it needs:
 - the phone-to-box run that originally exposed the deadlock, repeated without
   either book being hand-seeded.
 
+Device update, 2026-09-01: the pairing half of the final bullet is now observed
+twice on a signed release Bothy APK on a Pixel 8. A fresh scanned code moved the
+initially peerless phone onto the laptop box's relay and the app reported
+`Paired — claim pending signer`, without either ordinary book being hand-seeded.
+The [exact device record](https://github.com/forgesworn/bothy-node/blob/main/docs/2026-09-01-b1-release-phone-evidence.md)
+also states the boundary: the ADB form driver never submitted `begin_claim`, so
+the provisional QUIC connection, claim response and post-claim ordinary path
+were not observed on the phone. The final bullet therefore remains pending;
+pairing-only evidence is not rounded up to the complete phone-to-box run.
+
 ## 6. Ratification
 
 - Bothy owner (decented): **ratified the exact `e69c3cd` text**.
