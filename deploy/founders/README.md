@@ -6,10 +6,17 @@ does not require a new VPS for each keeper. Bothy can configure other Link
 relays; this service remains an availability dependency for clients using
 the default. A different architecture is outside this deployment.
 
-**Host selection is pending.** Do not deploy to DigitalOcean or to the
-retired `95.217.39.110` destination from the original draft. In particular,
-`144.126.230.165` is DigitalOcean and is excluded.
-There is deliberately no default deployment host in the workflow.
+**Selected host: `stall`, `62.238.98.53` (Hetzner Online GmbH, Helsinki).**
+The existing app host has x86-64 Ubuntu, systemd and Caddy; its Caddyfile
+imports `/etc/caddy/conf.d/*.Caddyfile`. Install this vhost as
+`/etc/caddy/conf.d/link1.Caddyfile`, with a dedicated `link-relay-deploy`
+account. This adds a service to the existing host and requires no new VPS.
+Provider and host configuration were verified on 2026-09-05; setup is
+complete only after the deployment and public checks below pass.
+
+DigitalOcean and the retired `95.217.39.110` destination from the original
+draft are excluded. In particular, `144.126.230.165` is DigitalOcean.
+The workflow still requires an explicitly configured deployment host.
 
 ## Topology and limits
 
