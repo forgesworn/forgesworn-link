@@ -3,11 +3,28 @@
 
 import base64
 import hashlib
+import http.client
 import os
 import socket
 import ssl
 
 HOST = "link1.forgesworn.dev"
+
+# These responses explain the protocol; only the upgrade below proves
+# that Caddy can reach the relay. A static HTTP response is not health proof.
+for path, expected_status in [("/", 404), ("/link", 426)]:
+    connection = http.client.HTTPSConnection(HOST, timeout=15)
+    try:
+        connection.request("GET", path)
+        response = connection.getresponse()
+        if response.status != expected_status:
+            raise SystemExit(f"Public {path} returned {response.status}; expected {expected_status}")
+        if path == "/link" and response.getheader("Upgrade", "").lower() != "websocket":
+            raise SystemExit("Public /link did not advertise the required WebSocket upgrade")
+    finally:
+        connection.close()
+print("link1.forgesworn.dev: ordinary HTTP requests returned 404 / and 426 /link")
+
 key = base64.b64encode(os.urandom(16)).decode("ascii")
 expected = base64.b64encode(hashlib.sha1(
     (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
