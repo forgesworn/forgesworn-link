@@ -20,8 +20,23 @@
 # it writes none.
 
 link1.forgesworn.dev {
-	reverse_proxy 127.0.0.1:7443 {
-		flush_interval -1
+	handle /link {
+		@websocket header_regexp Upgrade (?i)^websocket$
+		handle @websocket {
+			reverse_proxy 127.0.0.1:7443 {
+				flush_interval -1
+			}
+		}
+
+		# The upstream speaks WebSocket only. An ordinary HTTP request
+		# makes it close the connection, which Caddy would report as 502.
+		handle {
+			respond "WebSocket upgrade required; use wss://link1.forgesworn.dev/link." 400
+		}
+	}
+
+	handle {
+		respond "Not found. The Link relay uses wss://link1.forgesworn.dev/link." 404
 	}
 
 	log {

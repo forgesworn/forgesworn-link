@@ -26,6 +26,16 @@ loopback only. UDP 7450 reaches the reflector directly; Caddy does not
 proxy it. Use DNS-only records, with an A record for the approved IPv4
 address and an AAAA record only after proving service on IPv6.
 
+An ordinary HTTPS request to `/link` returns `400 Bad Request` with a
+message explaining the required WebSocket upgrade; `/` and other paths
+return `404`. These responses omit the connection-specific `Upgrade`
+header, which HTTP/2 forbids. Caddy supplies
+these explanatory responses because the relay closes non-WebSocket
+requests without an HTTP response, which an unrestricted proxy reports
+as `502 Bad Gateway`. These static responses do not prove backend health:
+the public check must also complete a real `101` WebSocket handshake, and
+the transfer check below must pass before calling the data path live.
+
 The unit uses a dynamic unprivileged user, read-only system files, no
 capabilities, a 256 MiB memory ceiling, 64 tasks and at most one CPU's time.
 The binary has 128 total sessions, 16 sessions per TCP source, a 5 MB/s
@@ -122,11 +132,13 @@ paths disabled and a two-minute deadline. It verifies a public relay path
 from one test host; it does not test real phones or different NATs. Normal
 CI compiles this test but never contacts the public service.
 
-The manual `Check public founders' relay` workflow verifies trusted TLS,
-the WebSocket upgrade and a nonce-checked UDP reflector reply from a GitHub
-runner. It changes no service or DNS state and needs no deployment secrets.
+The manual `Check public founders' relay` workflow verifies the ordinary
+HTTP/1.1 and HTTP/2 responses, trusted TLS, the WebSocket upgrade and a
+nonce-checked UDP reflector reply from a GitHub runner. It changes no service or DNS state
+and needs no deployment secrets.
 Use it to distinguish a problem on the operator's network from public
 ingress failure. It is never triggered by ordinary pushes or pull requests.
+The endpoint probe requires Python 3 and curl with HTTP/2 support.
 
 For a failed public check after a successful service start, the operator
 must diagnose DNS/TLS/ingress or restore the previous root-owned release
