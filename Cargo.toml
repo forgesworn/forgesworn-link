@@ -35,7 +35,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-shelter-kit = { git = "https://github.com/forgesworn/shelter-kit", tag = "v0.2.2" }
+shelter-kit = { git = "https://github.com/forgesworn/shelter-kit", tag = "v0.4.0" }
 thiserror = "2"
 url = "2"
 webpki-roots = "0.26"
