@@ -23,6 +23,9 @@ const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// Reconnecting for longer than this is `Failed(Relay)`, spec 4.3.
 const RECONNECT_DEADLINE: Duration = Duration::from_secs(60);
+/// Bounds the whole TCP/TLS/WebSocket/registration exchange, including a
+/// peer which accepts TCP but never completes its TLS or HTTP handshake.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Well inside the relay's 90 second idle close.
 const PING_INTERVAL: Duration = Duration::from_secs(20);
 
@@ -90,6 +93,9 @@ pub enum RelayStatus {
     /// has stopped permanently. Tag mode cannot attribute an eviction and
     /// therefore reports `Reconnecting` instead.
     Superseded,
+    /// The current outage exceeded the session retry budget. The endpoint
+    /// keeps trying its configured relays so a later operation can connect;
+    /// sessions which have already failed are never resumed.
     Failed,
 }
 
@@ -164,6 +170,7 @@ pub struct RelayDriver {
     /// The lowercase host of the relay the session is on, memoised against
     /// its URL, so a tag-mode datagram costs no URL parse.
     host_memo: Arc<Mutex<Option<(String, String)>>>,
+    stop: watch::Sender<bool>,
 }
 
 /// At most this many drivers beyond the home driver; past it a peer's hints
@@ -191,6 +198,15 @@ pub struct RelayClient {
 }
 
 impl RelayClient {
+    /// End every driver, including idle or failed drivers retrying in the
+    /// background. A closed endpoint must not reconnect to its relays.
+    pub fn close(&self) {
+        let _extra = self.extra.lock().expect("drivers");
+        for driver in self.by_id.lock().expect("drivers").values() {
+            driver.stop.send_replace(true);
+        }
+    }
+
     /// The driver over this endpoint's own configured relays.
     pub fn home(&self) -> RelayDriver {
         self.home.clone()
@@ -215,6 +231,9 @@ impl RelayClient {
             return self.home.clone();
         }
         let mut extra = self.extra.lock().expect("drivers");
+        if *self.home.stop.borrow() {
+            return self.home.clone();
+        }
         if let Some(driver) = extra.get(&urls) {
             return driver.clone();
         }
@@ -392,18 +411,31 @@ fn spawn_driver(
     let (outbound_tx, outbound_rx) = mpsc::channel::<Frame>(MAX_QUEUED_FRAMES);
     let (status_tx, status_rx) = watch::channel(RelayStatus::Connecting);
     let (events_tx, _) = broadcast::channel(EVENT_CAPACITY);
+    let (stop_tx, mut stop_rx) = watch::channel(false);
     let urls: Vec<String> = relays.iter().map(|spec| spec.url.clone()).collect();
-    tokio::spawn(driver(
+    let work = driver(
         id,
         key,
         relays,
         inbound,
         outbound_rx,
-        status_tx,
+        status_tx.clone(),
         events_tx.clone(),
         readiness.clone(),
         book.clone(),
-    ));
+    );
+    let stopped_events = events_tx.clone();
+    let stopped_readiness = readiness.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            _ = stop_rx.changed() => {
+                set_status(&status_tx, &stopped_events, RelayStatus::Failed);
+                stopped_readiness.wake_all();
+            }
+            _ = work => {}
+        }
+    });
     RelayDriver {
         id,
         urls: Arc::new(urls),
@@ -413,6 +445,7 @@ fn spawn_driver(
         readiness,
         book,
         host_memo: Arc::new(Mutex::new(None)),
+        stop: stop_tx,
     }
 }
 
@@ -465,7 +498,11 @@ async fn driver(
             continue;
         }
         let spec = relays[index % relays.len()].clone();
-        match connect(&key, &spec, book.as_deref()).await {
+        let attempt = tokio::time::timeout(CONNECT_TIMEOUT, connect(&key, &spec, book.as_deref()))
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|result| result);
+        match attempt {
             Ok(ws) => {
                 backoff = BACKOFF_MIN;
                 // Drop anything queued while the previous relay was down.  Those
@@ -519,12 +556,15 @@ async fn driver(
             }
             Err(e) => {
                 debug!(relay = %spec.url, error = %e, "relay connect failed");
-                set_status(&status, &events, RelayStatus::Reconnecting);
                 let since = *down_since.get_or_insert_with(std::time::Instant::now);
                 if since.elapsed() > RECONNECT_DEADLINE {
-                    warn!("no relay within 60 s");
+                    if *status.borrow() != RelayStatus::Failed {
+                        warn!("no relay within 60 s; sessions fail, endpoint keeps reconnecting");
+                    }
                     set_status(&status, &events, RelayStatus::Failed);
-                    return;
+                    readiness.wake_all();
+                } else {
+                    set_status(&status, &events, RelayStatus::Reconnecting);
                 }
                 index += 1;
                 tokio::time::sleep(backoff).await;
