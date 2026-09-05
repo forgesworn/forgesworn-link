@@ -3,7 +3,7 @@
 //! pin the codec until then.
 
 use link_core::rendezvous::Tag;
-use link_core::wire::{FRAME_REGISTER, Frame, MAX_DATAGRAM, MAX_TAGS_PER_REGISTER};
+use link_core::wire::{Frame, MAX_DATAGRAM, MAX_TAGS_PER_REGISTER};
 
 fn tag(byte: u8) -> Tag {
     Tag([byte; 16])
@@ -21,9 +21,11 @@ fn register_round_trips_and_bounds_hold() {
     };
     assert_eq!(Frame::decode(&max.encode()), Some(max));
 
-    // Zero tags, over-max tags, and a count that disagrees with the body all
-    // decode to None, which closes the session as malformed.
-    assert_eq!(Frame::decode(&[FRAME_REGISTER, 0, 0]), None);
+    // An empty replacement explicitly unregisters every tag after a session
+    // is established.  The relay rejects it only as the first frame.
+    let empty = Frame::Register { tags: Vec::new() };
+    assert_eq!(Frame::decode(&empty.encode()), Some(empty));
+    // Over-max tags and a count that disagrees with the body are malformed.
     let over = Frame::Register {
         tags: (0..=MAX_TAGS_PER_REGISTER).map(|i| tag(i as u8)).collect(),
     };

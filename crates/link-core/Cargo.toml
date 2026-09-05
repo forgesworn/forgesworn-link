@@ -13,11 +13,10 @@ hkdf.workspace = true
 hmac.workspace = true
 k256.workspace = true
 rand.workspace = true
-rcgen.workspace = true
 rustls.workspace = true
 serde.workspace = true
 sha2.workspace = true
-x509-parser.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

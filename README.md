@@ -12,8 +12,7 @@ nodes discover a route, how they attempt a direct connection, how they fall back
 to a relay, and how a transport plugs into the same Blossom store -- and nothing
 beneath the socket.  Every cryptographic primitive, the TLS stack and the QUIC
 stack come from standard, independently maintained crates: `quinn`, `rustls`,
-`rcgen`, `ed25519-dalek`, `sha2`, `x509-parser`, `tokio`, `tokio-tungstenite`.
-Licensed MIT.
+`ed25519-dalek`, `sha2`, `hkdf`, `tokio`, `tokio-tungstenite`.  Licensed MIT.
 
 The design is the Phase 0 specification: the `FSL-CARD-1` address card, the
 WebSocket relay and UDP reflector, the path socket with its synthetic addressing
@@ -26,12 +25,13 @@ it uses for Tor and HTTPS.
 ## Status
 
 The Phase 0 contract passed on loopback and on the open internet.  The
-real-network acceptance record is in [`acceptance/`](acceptance/): direct-path
-upgrades from a home NAT and from a commercial VPN egress to a public host, a
-direct LAN path, relay-only by choice, relay failover killed mid-transfer and
-recovered on the second relay in 258 ms, a UDP-blocked network falling back to
-the relay, flat memory across a four-times-larger transfer, and zero plaintext
-in a capture of a deliberately unencrypted relay hop.  What is still not proven
+real-network acceptance records are in [`acceptance/`](acceptance/): direct-path
+upgrades from a home NAT, from a venue NAT and from a commercial VPN egress to a
+public host, a direct LAN path, relay-only by choice, relay failover killed
+mid-transfer and recovered on the second relay in 258 ms (27 Aug) and 239 ms
+(30 Aug), a UDP-blocked network falling back to the relay, a same-key reconnect
+with no stall, flat memory across a four-times-larger transfer, and zero
+plaintext in two captures of a deliberately unencrypted relay hop.  What is still not proven
 is listed under [What this does NOT prove](#what-this-does-not-prove).
 
 ## Crates
@@ -144,6 +144,8 @@ demo.  These are the only runs behind any claim in this repository.
 | Peak RSS, 8 MiB then 64 MiB in one process | 15,400,960 bytes then 17,235,968 bytes, growth 1,835,008 bytes, roughly 1.75 MiB for an eightfold larger transfer |
 | Release CLI, 256 MiB over a proved direct path | 7.1 s, digests matched on both sides |
 | Relay counters, 64 MiB relayed transfer | 58,259 frames in, 78,133,920 bytes, 584 dropped by the relay's 64-frame outbound bound; QUIC recovered all of them |
+| MTU 1452 against 1350, release CLI, 256 MiB direct, five runs each (F11 of the 30 Aug review) | 1452: 181.6 MiB/s mean (1.39-1.44 s); 1350: 173.4 MiB/s mean (1.43-1.52 s).  About 5% on loopback, and getting it means raising the relay frame bound too, with no path MTU discovery to protect a sub-1500 path.  Kept at 1350 |
+| Same key reconnecting, release CLI, 256 MiB, three `send` runs against one server | Before the supersede rule: 1.5 s, 22.5 s, 22.5 s.  After: all three under 3 s |
 | Flake hunt | Five concurrent runs of the whole suite: 5 of 5 passed.  Three serial runs with `--test-threads=1`: 3 of 3 passed.  Before the two defects above were fixed, the same five concurrent runs gave 0 of 5 |
 
 ## Running this on real machines
@@ -192,9 +194,21 @@ as a no-go, not as a pass.
 
 ## What this does NOT prove
 
-The `acceptance/` runs cover a home NAT, a commercial VPN egress, a LAN pair, a
-UDP-blocked host and a mid-transfer relay failover, across macOS and Linux.
-They do not cover:
+The relay endpoint keeps reconnecting after the sixty-second session retry
+budget expires. Existing transfers remain failed; a later explicit operation
+can use the recovered relay without restarting the endpoint. Closing the
+endpoint cancels its relay drivers, including pending handshakes and backoff.
+`tests/relay_restart.rs` exercises a real relay restart after that deadline,
+exact peer bytes after recovery, stalled-handshake failover and cancellation.
+This is source/loopback evidence for the Android observation in issue #37;
+the phone's own relay-restart acceptance still needs a recorded device run.
+
+The `acceptance/` runs cover a home NAT, a venue NAT, a commercial VPN egress,
+a LAN pair, a UDP-blocked host, a same-key reconnect and a mid-transfer relay
+failover, across macOS and Linux; the 30 August record re-ran the public-host
+rows on the current design (session-keyed probes, relay hints, raw public
+keys, one session per peer) and added the venue-NAT and reconnect rows.  They
+do not cover:
 
 - **Two hostile NATs at once.**  Every direct path proved so far is either
   inside one home LAN or to a host with a public address.  A direct hole-punch
@@ -215,7 +229,7 @@ They do not cover:
   so the LAN address that would have worked never reached the peer.  Every
   interface of the socket's family is offered now (`local_addresses`,
   loopback last, at most eight), and the row has not been re-run on a real
-  VPN since.
+  VPN since; the 30 August run had no VPN and no LAN peer to hand.
 
 ## Deviations from the spec
 
@@ -295,6 +309,29 @@ convenience alone.
     drains below half.  When no relay session is up, the datagram is dropped as
     loss, so a reconnect can never deadlock the QUIC driver.
 
+12. **The dialer follows the card's relay hints.**  `connect` starts a relay
+    session on the relays the peer's card names (hint `0x01`) and the accepting
+    side answers on the relay the dialer's datagrams arrived on, so two nodes
+    with different relay configurations meet without agreeing a list.  The
+    endpoint's own configured list stays its home relay for accepting and for
+    peers whose card names no relay.  Per-peer sessions are bounded at sixteen.
+    A hint is a URL only, so a hinted `wss://` relay is verified against the
+    WebPKI roots; a relay that needs a pin is reachable only from configuration.
+13. **Raw public keys, not certificates.**  The spike presented a self-signed
+    X.509 leaf whose SPKI was the node key and ignored everything else in it.
+    The endpoint now presents the SPKI itself (RFC 7250, 44 bytes), which is
+    the same rule with nothing to ignore, needs no certificate generation per
+    connection, and drops `rcgen` and `x509-parser` from the identity path.
+    Any other key, or an X.509 certificate, fails closed.
+
+14. **A newer session from the same node supersedes the old one.**  Path state
+    is kept per peer, and a session that reconnected within the idle window
+    used to inherit the old session's direct proof, which pointed at the old
+    process's socket.  The slot is now taken at dial or accept time, before
+    the handshake: the old session fails once with `superseded` and is closed,
+    and the new session starts with clean path state.  `FailReason` gains
+    `Superseded`.
+
 ## Defects the spike found in itself
 
 Both were invisible in a quiet single run and showed up only when five copies of
@@ -324,13 +361,20 @@ the suite ran at once.  Both are spec lessons, not only code fixes.
    driven by the tick.  **The spec should say the relay transition is observed,
    not polled.**
 
+3. **Per-peer path state outlived the session that built it.**  Running the
+   release CLI three times with the *same* key against one serving endpoint
+   took 1.5 s, 22.5 s and 22.5 s for 256 MiB: the second and third `send`
+   inherited the first session's direct proof on the server, which pointed
+   at the first process's closed socket, and the server's replies went there
+   until the proof aged out.  With the first process still alive it was worse:
+   the handshake never completed.  The tests never saw it because every test
+   minted a fresh key per endpoint.  **The rule is now in the spec: one
+   session per peer, newest wins, and the slot is taken before the
+   handshake.**  Lesson: run the binary with the keys a real deployment would
+   reuse, not the keys a test finds convenient.
+
 ## Open problems
 
-- **Relay convergence is by convention.**  Each endpoint keeps one relay session
-  at a time and both sides walk the same configured list in the same order, so
-  they converge.  Nothing forces that.  A real deployment needs per-peer relay
-  selection from the peer's card hints, or endpoints registered on several
-  relays at once.  The spec does not decide this.
 - **No adversarial TLS handshake test.**  The one identity rule is exercised in
   the positive direction end to end and asserted directly on the verifier.  A
   test that drives a handshake where the presented key differs from the pin
@@ -339,7 +383,3 @@ the suite ran at once.  Both are spec lessons, not only code fixes.
 - **Inbound queue overflow is silent.**  The path socket's inbound queue is 512
   datagrams; a full queue drops, which QUIC treats as loss.  There is no counter
   for it, so a saturated receiver looks like a lossy network.
-- **Card serials come from the wall clock.**  `Endpoint::card` seeds the serial
-  from Unix seconds and increments.  A clock that goes backwards across a
-  restart produces a card that a verifier will reject under rule 8, correctly
-  but confusingly.  Persisting the last serial is the real answer.

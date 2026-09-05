@@ -193,6 +193,60 @@ async fn a_later_register_replaces_the_tag_set() {
 }
 
 #[tokio::test]
+async fn an_empty_replacement_unregisters_the_last_tag_without_closing() {
+    let relay = start_relay().await;
+    let url = relay.url("127.0.0.1");
+    let shared = tag(30);
+    let mut a = open_tags(&url, vec![shared]).await;
+    let mut b = open_tags(&url, vec![shared]).await;
+
+    b.send(Message::Binary(
+        Frame::Register { tags: Vec::new() }.encode(),
+    ))
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    a.send(Message::Binary(
+        Frame::SendTag {
+            tag: shared,
+            datagram: vec![3],
+        }
+        .encode(),
+    ))
+    .await
+    .unwrap();
+    assert!(silent(&mut b, Duration::from_millis(300)).await);
+
+    b.send(Message::Binary(Frame::Ping([4; 8]).encode()))
+        .await
+        .unwrap();
+    assert_eq!(next_frame(&mut b).await, Some(Frame::Pong([4; 8])));
+    relay.shutdown();
+}
+
+#[tokio::test]
+async fn an_empty_initial_registration_is_refused() {
+    let relay = start_relay().await;
+    let url = relay.url("127.0.0.1");
+    let mut ws = connect(&url).await;
+    assert!(matches!(
+        next_frame(&mut ws).await,
+        Some(Frame::Challenge(_))
+    ));
+    ws.send(Message::Binary(
+        Frame::Register { tags: Vec::new() }.encode(),
+    ))
+    .await
+    .unwrap();
+    match next_frame(&mut ws).await {
+        Some(Frame::Close(reason)) => assert_eq!(reason, 1),
+        None => {}
+        other => panic!("expected a malformed close, got {other:?}"),
+    }
+    relay.shutdown();
+}
+
+#[tokio::test]
 async fn identity_sessions_still_work_beside_tag_sessions() {
     let relay = start_relay().await;
     let url = relay.url("127.0.0.1");

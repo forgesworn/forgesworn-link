@@ -35,7 +35,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-shelter-kit = { git = "https://github.com/forgesworn/shelter-kit", tag = "v0.1.2" }
+shelter-kit = { git = "https://github.com/forgesworn/shelter-kit", tag = "v0.4.1" }
 thiserror = "2"
 url = "2"
 webpki-roots = "0.26"
@@ -43,4 +43,4 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 tokio-tungstenite = "0.24"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-x509-parser = "0.16"
+zeroize = "1"

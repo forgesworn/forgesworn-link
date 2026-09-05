@@ -29,4 +29,4 @@ pub use source::{BlobBytes, BlobSource, MapBlobSource};
 pub use wire::{Request, ResponseHeader, WireError};
 
 #[cfg(feature = "shelter-kit")]
-pub use client::{CardResolver, LinkFetcher, MapCardResolver};
+pub use client::{CardResolver, LinkFetcher, MapCardResolver, fetch_blob_over};

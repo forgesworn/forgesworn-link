@@ -63,15 +63,19 @@ discovery, this design takes them by bumping a dependency.
   re-encode to the same string, so that each node has exactly one textual name.
   Without this, 16 spellings decode to one node and any allowlist, cache or
   dedup keyed on the text is bypassable.
-- **TLS binding.**  Every QUIC endpoint presents a self-signed X.509 leaf whose
-  SubjectPublicKeyInfo is exactly the Ed25519 node public key
-  (`id-Ed25519`, OID 1.3.101.112, RFC 8410).  Verification, on both client and
-  server sides, is one rule: **the presented SPKI byte-equals the expected node
-  ID's SPKI, and the TLS 1.3 CertificateVerify signature validates under that
-  key.**  Chain, names, validity dates and extensions are ignored; card expiry
-  governs freshness.  An endpoint that presents any other key fails closed.
-  RFC 7250 raw public keys satisfy the same rule and may replace X.509 later
-  without changing the contract.
+- **TLS binding.**  Every QUIC endpoint presents, in place of a certificate,
+  its raw public key (RFC 7250): the SubjectPublicKeyInfo of the Ed25519 node
+  key (`id-Ed25519`, OID 1.3.101.112, RFC 8410), 44 bytes, as the single entry
+  of the TLS `Certificate` message, negotiated with the
+  `client_certificate_type` and `server_certificate_type` extensions.
+  Verification, on both client and server sides, is one rule: **the presented
+  SPKI byte-equals the expected node ID's SPKI, and the TLS 1.3
+  CertificateVerify signature validates under that key.**  There is no chain,
+  name, validity window or extension to ignore, because none is sent; card
+  expiry governs freshness.  An endpoint that presents any other key, or an
+  X.509 certificate, fails closed.  (Version 0 of this document allowed a
+  self-signed X.509 leaf carrying the same SPKI; the rule was the same and the
+  bytes on the wire were 44 rather than a few hundred.)
 - **Rotation.**  A new transport key is a new node ID.  It requires a new card
   and re-pairing; it does not change any stored blob claim, which belong to
   Nostr signers, not transport keys.
@@ -155,6 +159,17 @@ One self-hostable binary, `link-relay`, offers two services.  Operators may
 run several from different organisations; a client may remove every
 ForgeSworn-operated instance and still work.
 
+A node keeps one session on its own configured relay list (its **home**
+relay, with the failover of 4.3) and, per peer, a session on the relays the
+peer's card names (hint `0x01`), started when the node dials that peer.  The
+accepting side answers on whichever relay the dialer's datagrams arrived on.
+Two nodes therefore need no shared configuration to meet: the dialer chooses,
+the acceptor follows.  A card with no relay hint means the dialer's own relay.
+Per-peer sessions are bounded (sixteen beyond the home session; past that a
+peer is dialled on the home relay).  A hint carries a URL only, so a hinted
+`wss://` relay is verified against the WebPKI roots; a relay that needs a
+pinned certificate is reachable only from configuration.
+
 ### 3.1 Relay session over WebSocket Secure
 
 - The node opens a WSS connection outbound.  Every home firewall and carrier
@@ -196,9 +211,12 @@ ForgeSworn-operated instance and still work.
   A newer registration wins: the relay sends the oldest holder `close` with
   reason `2` and ends that session, so a node that reconnected before its
   previous session died is not left with a dead route, and nothing is
-  silently replaced.  A client that receives reason `2` waits 30 seconds
-  before it reconnects, because two live instances of one node ID would
-  otherwise supersede each other in a loop.
+  silently replaced.  In identity mode the superseded client stops: retrying
+  lets two live processes steal the same node-ID slot from each other every
+  backoff interval and violates newest-wins.  A tag-mode client cannot know
+  which endpoint a third holder of an anonymous pair tag replaced, so it waits
+  30 seconds before retrying; the delay prevents a hot eviction loop while the
+  legitimate two ends converge.
 - **What the relay learns.**  Node IDs of registered endpoints and who they
   talk to, source IP addresses of WSS sessions, timing and byte counts.  It
   must log only routing tokens and counters, and must not persist node IDs past
@@ -345,11 +363,29 @@ Relayed | Direct
 Reconnecting
   new relay welcome ----------------> previous state
   no relay within 60 s -------------> Failed(relay)
+any state
+  a newer session from the same node ID arrives -> Failed(superseded)
+                                       (this one is closed; the new one
+                                        starts with clean path state)
 Failed(reason)
   application is told once, with the reason.  Nothing is retried on its
   behalf; the standard Blossom-over-Tor/HTTPS route is a separate decision
   above this layer.
 ```
+
+*One session per peer, newest wins.*  Section 0 says two nodes talk over one
+QUIC connection.  When a node dials a peer it already has a session with, or
+accepts a new connection from one, the earlier session is superseded: it is
+told once (`Failed(superseded)`), closed, and the peer's path state
+(candidates, learnt addresses, pending probes, the direct proof) starts clean
+for the new session.  The slot is taken before the handshake, not after it,
+because the handshake's own packets are routed by that path state: a proof
+built by the old session points at a socket the new one does not own, and a
+reply sent there is lost.  *Spike finding:* without this rule a node that
+restarted within the 30 second idle window (an app restart, a relay flap)
+either stalled for the 15 seconds the stale proof stayed fresh -- a 256 MiB
+transfer that took 1.5 s took 22 s -- or, when the old process was still
+alive, never completed the handshake at all.
 
 *Spike findings on the diagram.*  `Idle` exists before `connect()` and is a
 reportable status.  `Probing` can be too brief to observe: the socket sends
@@ -382,7 +418,7 @@ pub struct Session;            // one QUIC connection to one peer
 pub struct Stream;             // one bidirectional QUIC stream
 
 pub enum PathStatus { Idle, Rendezvous, Relayed, Probing, Direct, Reconnecting, Failed(FailReason) }
-pub enum FailReason { Relay, Identity, Timeout }
+pub enum FailReason { Relay, Rendezvous, Identity, Timeout, Superseded }
 pub struct PathReport {
     pub status: PathStatus,
     pub relay: Option<String>,      // the relay URL in use, as text
@@ -467,13 +503,12 @@ restated here so they cannot drift.
 - Multipath or simultaneous relay plus direct sending.
 - Anything about tiers, claims, quotas or repair.  The lane moves bytes.
 
-Open problems the spike surfaced, to settle before Phase 1:
-
-- Relay convergence is by convention: both sides walk the same relay list in
-  the same order.  Nothing enforces it, and per-peer relay selection from a
-  card's hints is undecided.
-- Card serials come from the wall clock in the spike; a node must persist its
-  highest issued serial or a clock step can reissue a stale one.
+`EndpointConfig.serial_seed` is the highest serial the transport key has
+already signed.  The shell MUST persist each returned card serial before it
+distributes that card and provide the high-water mark after restart.  A missing
+tag-mode peer fails as `Rendezvous` before session state changes; waiting for a
+relay welcome is bounded by `EndpointConfig.rendezvous_timeout` and expires as
+`Timeout`.
 
 ## 9. Rendezvous-tag routing
 
@@ -489,3 +524,9 @@ byte, the epoch and erasure rules, and the six frozen known-answer vectors
 authenticated relay protocol of §3.1 is superseded by tag registration when
 the rendezvous wire change lands behind its version bump; until then §3.1
 remains the deployed behaviour and `SECURITY.md` states the gap.
+
+The pairing-secret case `0x03` is deliberately specified separately at
+[`docs/PAIRING-RENDEZVOUS-DRAFT.md`](docs/PAIRING-RENDEZVOUS-DRAFT.md). Both
+owners ratified the exact normative text at commit `e69c3cd` on 2026-08-31;
+implementation is therefore authorised, while final acceptance and freeze
+remain gated by that document's §5 evidence.

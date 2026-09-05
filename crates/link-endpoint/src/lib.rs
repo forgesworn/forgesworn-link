@@ -11,11 +11,14 @@ mod relay_tls;
 pub mod rendezvous_book;
 pub mod session;
 
-pub use endpoint::{Endpoint, EndpointConfig};
+pub use endpoint::{
+    AcceptedSession, Endpoint, EndpointConfig, MAX_PAIRING_LIFETIME, MAX_PAIRING_SESSION_LIFETIME,
+    PairingError, PairingSession,
+};
 pub use link_core::card::{Card, Hint, VerifyContext};
 pub use link_core::id::{NodeId, TransportKey};
 pub use link_core::path::{FailReason, PathReport, PathStatus};
 pub use link_core::rendezvous::TagCase;
 pub use relay_client::{RelaySpec, RelayStatus};
-pub use rendezvous_book::{RendezvousPeer, TagBook};
+pub use rendezvous_book::{PairingRegistration, RendezvousPeer, TagBook};
 pub use session::{Session, Stream};

@@ -8,11 +8,17 @@
 //! and the peer an inbound tag belongs to.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use link_core::id::NodeId;
-use link_core::rendezvous::{Tag, TagCase, derive_tag, epoch_index};
+use link_core::rendezvous::{
+    PAIRING_SECRET_BYTES, Tag, TagCase, derive_pairing_tag, derive_tag, epoch_index,
+};
+use rand::RngCore;
+use tokio::sync::watch;
+use zeroize::Zeroizing;
 
 /// One pair's rendezvous material, as computed by the shell from the current
 /// cards.  `eph_x` is 32 zero bytes for `TagCase::None`.
@@ -28,13 +34,94 @@ const EPOCH_WINDOW: [i64; 3] = [-1, 0, 1];
 
 pub struct TagBook {
     peers: Mutex<HashMap<NodeId, RendezvousPeer>>,
+    /// Short-lived first-contact routes.  Their random local route IDs are
+    /// never sent on the relay wire and are not authenticated identities.
+    pairing: Mutex<HashMap<NodeId, PairingRoute>>,
     /// Bumped on every change, so the relay pump re-registers within its next
     /// refresh tick instead of waiting for the epoch to turn.
     version: AtomicU64,
+    /// Every relay driver watches this, so removals (including the last tag)
+    /// are registered immediately rather than waiting for the minute tick.
+    changes: watch::Sender<u64>,
     /// Send tags by (peer, epoch) for the relay host the session is on, so a
     /// datagram costs a hash lookup rather than an HKDF.  Cleared whenever
     /// the material changes or the session moves to another relay.
     send_cache: Mutex<SendCache>,
+}
+
+struct PairingRoute {
+    /// The QR secret admits a new provisional handshake.  Dropping the
+    /// product's registration removes this immediately.
+    admission: Option<ExpiringSecret>,
+    /// Once the handshake is complete, both endpoints switch the established
+    /// QUIC connection to a TLS-exported tag.  It carries no pairing authority
+    /// and may outlive `admission` while QUIC drains a close packet.
+    live: Option<LivePairingRoute>,
+}
+
+struct ExpiringSecret {
+    secret: Zeroizing<[u8; PAIRING_SECRET_BYTES]>,
+    expires_at: u64,
+}
+
+struct LivePairingRoute {
+    generation: u64,
+    secret: Zeroizing<[u8; PAIRING_SECRET_BYTES]>,
+}
+
+/// A live pairing admission.  Dropping it removes and zeroises Link's copy of
+/// the QR secret.  The product retains its own separately for the end-to-end
+/// request proof; this handle never exposes Link's copy.
+///
+/// A connection that completed its provisional TLS handshake has already
+/// switched to separate exporter-derived routing material. That material has
+/// no admission authority and is owned by the bounded `PairingSession`, so
+/// dropping this handle cannot cut off the connection's final packets.
+pub struct PairingRegistration {
+    route: NodeId,
+    expires_at: u64,
+    book: Weak<TagBook>,
+}
+
+impl fmt::Debug for PairingRegistration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PairingRegistration")
+            .field("route", &"redacted")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+impl PairingRegistration {
+    pub fn expires_at(&self) -> u64 {
+        self.expires_at
+    }
+
+    pub fn is_active(&self, now_unix: u64) -> bool {
+        now_unix < self.expires_at
+            && self
+                .book
+                .upgrade()
+                .is_some_and(|book| book.pairing_active(self.route, now_unix))
+    }
+
+    pub(crate) fn route(&self) -> NodeId {
+        self.route
+    }
+
+    pub(crate) fn belongs_to(&self, book: &Arc<TagBook>) -> bool {
+        self.book
+            .upgrade()
+            .is_some_and(|ours| Arc::ptr_eq(&ours, book))
+    }
+}
+
+impl Drop for PairingRegistration {
+    fn drop(&mut self) {
+        if let Some(book) = self.book.upgrade() {
+            book.remove_pairing(self.route);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -49,11 +136,20 @@ const SEND_CACHE_CAP: usize = 4096;
 
 impl TagBook {
     pub fn new(peers: HashMap<NodeId, RendezvousPeer>) -> Self {
+        let (changes, _) = watch::channel(0);
         TagBook {
             peers: Mutex::new(peers),
+            pairing: Mutex::new(HashMap::new()),
             version: AtomicU64::new(0),
+            changes,
             send_cache: Mutex::new(SendCache::default()),
         }
+    }
+
+    fn bump(&self) {
+        let version = self.version.fetch_add(1, Ordering::Relaxed) + 1;
+        self.changes.send_replace(version);
+        self.send_cache.lock().expect("send cache").tags.clear();
     }
 
     /// Replace one pair's material, e.g. after a card rotation.  The relay
@@ -61,14 +157,164 @@ impl TagBook {
     /// seam.
     pub fn upsert(&self, peer: NodeId, material: RendezvousPeer) {
         self.peers.lock().expect("book").insert(peer, material);
-        self.version.fetch_add(1, Ordering::Relaxed);
-        self.send_cache.lock().expect("send cache").tags.clear();
+        self.bump();
     }
 
     pub fn remove(&self, peer: NodeId) {
         self.peers.lock().expect("book").remove(&peer);
-        self.version.fetch_add(1, Ordering::Relaxed);
-        self.send_cache.lock().expect("send cache").tags.clear();
+        self.bump();
+    }
+
+    /// Add one short-lived first-contact route.  The returned random node-shaped
+    /// value is only a local synthetic routing key; it is never a claimed peer
+    /// identity.  The secret is zeroised on removal or expiry.
+    pub(crate) fn register_pairing(
+        self: &Arc<Self>,
+        secret: [u8; PAIRING_SECRET_BYTES],
+        expires_at: u64,
+    ) -> PairingRegistration {
+        let route = loop {
+            let mut bytes = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut bytes);
+            let candidate = NodeId(bytes);
+            let peers = self.peers.lock().expect("book");
+            let pairing = self.pairing.lock().expect("pairing book");
+            if !peers.contains_key(&candidate) && !pairing.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+        self.pairing.lock().expect("pairing book").insert(
+            route,
+            PairingRoute {
+                admission: Some(ExpiringSecret {
+                    secret: Zeroizing::new(secret),
+                    expires_at,
+                }),
+                live: None,
+            },
+        );
+        self.bump();
+        PairingRegistration {
+            route,
+            expires_at,
+            book: Arc::downgrade(self),
+        }
+    }
+
+    pub(crate) fn remove_pairing(&self, route: NodeId) -> bool {
+        let mut pairing = self.pairing.lock().expect("pairing book");
+        let removed = pairing
+            .get_mut(&route)
+            .and_then(|route| route.admission.take())
+            .is_some();
+        if pairing
+            .get(&route)
+            .is_some_and(|route| route.live.is_none())
+        {
+            pairing.remove(&route);
+        }
+        drop(pairing);
+        if removed {
+            self.bump();
+        }
+        removed
+    }
+
+    /// Replace an admitting pairing tag with a TLS-exported route for the
+    /// established connection.  The admission remains independently owned by
+    /// `PairingRegistration`; its drop cannot strand this live connection.
+    pub(crate) fn promote_pairing(
+        &self,
+        route: NodeId,
+        secret: [u8; PAIRING_SECRET_BYTES],
+        generation: u64,
+        now_unix: u64,
+    ) -> bool {
+        self.prune_expired(now_unix);
+        let mut pairing = self.pairing.lock().expect("pairing book");
+        let Some(entry) = pairing.get_mut(&route) else {
+            return false;
+        };
+        if entry.admission.is_none() {
+            return false;
+        }
+        entry.live = Some(LivePairingRoute {
+            generation,
+            secret: Zeroizing::new(secret),
+        });
+        drop(pairing);
+        self.bump();
+        true
+    }
+
+    /// Forget only the live route installed by `generation`.  A superseding
+    /// connection on the same admission route is left untouched.
+    pub(crate) fn remove_live_pairing(&self, route: NodeId, generation: u64) -> bool {
+        let mut pairing = self.pairing.lock().expect("pairing book");
+        let removed = pairing
+            .get_mut(&route)
+            .and_then(|route| {
+                route
+                    .live
+                    .as_ref()
+                    .is_some_and(|live| live.generation == generation)
+                    .then(|| route.live.take())
+                    .flatten()
+            })
+            .is_some();
+        if pairing
+            .get(&route)
+            .is_some_and(|route| route.admission.is_none() && route.live.is_none())
+        {
+            pairing.remove(&route);
+        }
+        drop(pairing);
+        if removed {
+            self.bump();
+        }
+        removed
+    }
+
+    fn prune_expired(&self, now_unix: u64) {
+        let mut pairing = self.pairing.lock().expect("pairing book");
+        let before = pairing.len();
+        let mut changed = false;
+        pairing.retain(|_, route| {
+            if route
+                .admission
+                .as_ref()
+                .is_some_and(|secret| now_unix >= secret.expires_at)
+            {
+                route.admission = None;
+                changed = true;
+            }
+            route.admission.is_some() || route.live.is_some()
+        });
+        changed |= pairing.len() != before;
+        drop(pairing);
+        if changed {
+            self.bump();
+        }
+    }
+
+    pub(crate) fn pairing_active(&self, route: NodeId, now_unix: u64) -> bool {
+        self.prune_expired(now_unix);
+        self.pairing
+            .lock()
+            .expect("pairing book")
+            .get(&route)
+            .is_some_and(|route| route.admission.is_some())
+    }
+
+    #[cfg(test)]
+    fn pairing_count(&self, now_unix: u64) -> usize {
+        self.prune_expired(now_unix);
+        self.pairing
+            .lock()
+            .expect("pairing book")
+            .values()
+            .filter(|route| route.admission.is_some())
+            .count()
     }
 
     /// How many send tags are cached right now.
@@ -81,8 +327,20 @@ impl TagBook {
         self.version.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.peers.lock().expect("book").is_empty()
+            && self.pairing.lock().expect("pairing book").is_empty()
+    }
+
+    /// Whether this book can derive an outbound rendezvous tag for `peer`.
+    /// Callers use this before starting a session so a missing shell-side
+    /// pairing cannot become a silent wait for a relay welcome.
+    pub fn contains(&self, peer: NodeId) -> bool {
+        self.peers.lock().expect("book").contains_key(&peer)
     }
 
     fn window(&self, now_unix: u64) -> Vec<u64> {
@@ -96,9 +354,11 @@ impl TagBook {
     /// Every tag this endpoint registers with `relay_host` right now: three
     /// epochs per pair.
     pub fn registration(&self, relay_host: &str, now_unix: u64) -> Vec<Tag> {
+        self.prune_expired(now_unix);
         let peers = self.peers.lock().expect("book");
         let epochs = self.window(now_unix);
-        let mut tags = Vec::with_capacity(peers.len() * epochs.len());
+        let pairing = self.pairing.lock().expect("pairing book");
+        let mut tags = Vec::with_capacity((peers.len() + pairing.len()) * epochs.len());
         for material in peers.values() {
             for epoch in &epochs {
                 tags.push(derive_tag(
@@ -110,12 +370,25 @@ impl TagBook {
                 ));
             }
         }
+        for route in pairing.values() {
+            if let Some(admission) = &route.admission {
+                for epoch in &epochs {
+                    tags.push(derive_pairing_tag(&admission.secret, relay_host, *epoch));
+                }
+            }
+            if let Some(live) = &route.live {
+                for epoch in &epochs {
+                    tags.push(derive_pairing_tag(&live.secret, relay_host, *epoch));
+                }
+            }
+        }
         tags
     }
 
     /// The current-epoch tag for an outbound datagram to `peer`.  Derived once
     /// per (peer, relay, epoch) and served from the cache after that.
     pub fn tag_for_send(&self, peer: NodeId, relay_host: &str, now_unix: u64) -> Option<Tag> {
+        self.prune_expired(now_unix);
         let epoch = epoch_index(now_unix);
         let mut cache = self.send_cache.lock().expect("send cache");
         if cache.host != relay_host {
@@ -127,7 +400,31 @@ impl TagBook {
         if let Some(tag) = cache.tags.get(&(peer, epoch)) {
             return Some(*tag);
         }
-        let tag = {
+        let tag = if let Some(tag) = {
+            let pairing = self.pairing.lock().expect("pairing book");
+            // The admission tag first, for as long as the admission is
+            // registered; the exporter-derived live route only carries what is
+            // left after the admission is dropped (the close drain).  A live
+            // route is per connection and outlives its connection's close by a
+            // whole session bound, so preferring it would stamp a NEW dial on
+            // the same admission route with a generation the peer has already
+            // forgotten -- the relay then drops every handshake packet and the
+            // keeper's retry after a refused claim never comes up.
+            pairing.get(&peer).and_then(|route| {
+                route
+                    .admission
+                    .as_ref()
+                    .map(|admission| derive_pairing_tag(&admission.secret, relay_host, epoch))
+                    .or_else(|| {
+                        route
+                            .live
+                            .as_ref()
+                            .map(|live| derive_pairing_tag(&live.secret, relay_host, epoch))
+                    })
+            })
+        } {
+            tag
+        } else {
             let peers = self.peers.lock().expect("book");
             let material = peers.get(&peer)?;
             derive_tag(
@@ -149,6 +446,7 @@ impl TagBook {
     /// the registration covers.  `None` for a tag this endpoint never
     /// registered, which the caller drops.
     pub fn resolve(&self, tag: &Tag, relay_host: &str, now_unix: u64) -> Option<NodeId> {
+        self.prune_expired(now_unix);
         let peers = self.peers.lock().expect("book");
         let epochs = self.window(now_unix);
         for (peer, material) in peers.iter() {
@@ -162,6 +460,21 @@ impl TagBook {
                 );
                 if candidate == *tag {
                     return Some(*peer);
+                }
+            }
+        }
+        drop(peers);
+        let pairing = self.pairing.lock().expect("pairing book");
+        for (route_id, route) in pairing.iter() {
+            for epoch in &epochs {
+                let admission_matches = route.admission.as_ref().is_some_and(|admission| {
+                    derive_pairing_tag(&admission.secret, relay_host, *epoch) == *tag
+                });
+                let live_matches = route.live.as_ref().is_some_and(|live| {
+                    derive_pairing_tag(&live.secret, relay_host, *epoch) == *tag
+                });
+                if admission_matches || live_matches {
+                    return Some(*route_id);
                 }
             }
         }
@@ -239,5 +552,97 @@ mod tests {
             first,
             "new material, new tag"
         );
+    }
+
+    #[test]
+    fn contains_tracks_upsert_and_remove() {
+        let peer = node(5);
+        let book = TagBook::new(HashMap::new());
+        assert!(!book.contains(peer));
+        book.upsert(peer, material(50));
+        assert!(book.contains(peer));
+        book.remove(peer);
+        assert!(!book.contains(peer));
+    }
+
+    #[test]
+    fn a_pairing_registration_routes_then_disappears_on_drop() {
+        let now = 1_793_588_888;
+        let book = Arc::new(TagBook::new(HashMap::new()));
+        let registration = book.register_pairing([0x42; PAIRING_SECRET_BYTES], now + 600);
+        let route = registration.route();
+
+        assert!(book.pairing_active(route, now));
+        assert_eq!(book.pairing_count(now), 1);
+        assert_eq!(book.registration("relay.example.org", now).len(), 3);
+        let tag = book
+            .tag_for_send(route, "relay.example.org", now)
+            .expect("pairing route sends");
+        assert_eq!(book.resolve(&tag, "relay.example.org", now), Some(route));
+
+        drop(registration);
+        assert_eq!(book.pairing_count(now), 0);
+        assert!(book.registration("relay.example.org", now).is_empty());
+    }
+
+    #[test]
+    fn a_live_pairing_route_outlives_admission_and_cleans_by_generation() {
+        let now = 1_793_588_888;
+        let host = "relay.example.org";
+        let book = Arc::new(TagBook::new(HashMap::new()));
+        let registration = book.register_pairing([0x42; PAIRING_SECRET_BYTES], now + 600);
+        let route = registration.route();
+        let admission_tag = book.tag_for_send(route, host, now).expect("admission tag");
+
+        assert!(book.promote_pairing(route, [0x81; PAIRING_SECRET_BYTES], 7, now));
+        let live_tag = derive_pairing_tag(&[0x81; PAIRING_SECRET_BYTES], host, epoch_index(now));
+        assert_ne!(admission_tag, live_tag);
+        assert_eq!(
+            book.registration(host, now).len(),
+            6,
+            "admission and live route each cover three epochs",
+        );
+        // Sends keep the admission tag while the admission is registered: a
+        // live route is per connection and lingers for a whole session bound
+        // after its close, so a NEW dial on this route must not be stamped
+        // with it (the peer may already have forgotten that generation).
+        assert_eq!(
+            book.tag_for_send(route, host, now),
+            Some(admission_tag),
+            "the admission tag carries every send until the admission is dropped",
+        );
+        assert_eq!(book.resolve(&live_tag, host, now), Some(route));
+
+        drop(registration);
+        assert!(
+            !book.pairing_active(route, now),
+            "no new handshake is admitted"
+        );
+        assert_eq!(
+            book.registration(host, now).len(),
+            3,
+            "only the live route remains"
+        );
+        assert_eq!(book.resolve(&admission_tag, host, now), None);
+        assert_eq!(book.resolve(&live_tag, host, now), Some(route));
+        assert_eq!(book.tag_for_send(route, host, now), Some(live_tag));
+
+        assert!(
+            !book.remove_live_pairing(route, 6),
+            "a stale cleanup is ignored"
+        );
+        assert_eq!(book.resolve(&live_tag, host, now), Some(route));
+        assert!(book.remove_live_pairing(route, 7));
+        assert!(book.registration(host, now).is_empty());
+    }
+
+    #[test]
+    fn an_expired_pairing_registration_is_pruned() {
+        let now = 1_793_588_888;
+        let book = Arc::new(TagBook::new(HashMap::new()));
+        let registration = book.register_pairing([0x24; PAIRING_SECRET_BYTES], now + 1);
+        assert!(registration.is_active(now));
+        assert!(!registration.is_active(now + 1));
+        assert_eq!(book.pairing_count(now + 1), 0);
     }
 }

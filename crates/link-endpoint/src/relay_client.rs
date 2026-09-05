@@ -1,7 +1,8 @@
 //! The outbound WebSocket relay session of spec 3.1, with the failover of 4.3.
 
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::Waker;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -22,6 +23,9 @@ const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// Reconnecting for longer than this is `Failed(Relay)`, spec 4.3.
 const RECONNECT_DEADLINE: Duration = Duration::from_secs(60);
+/// Bounds the whole TCP/TLS/WebSocket/registration exchange, including a
+/// peer which accepts TCP but never completes its TLS or HTTP handshake.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Well inside the relay's 90 second idle close.
 const PING_INTERVAL: Duration = Duration::from_secs(20);
 
@@ -85,6 +89,13 @@ pub enum RelayStatus {
     Connecting,
     Up(String),
     Reconnecting,
+    /// This identity-mode driver lost its node-ID slot to a newer process and
+    /// has stopped permanently. Tag mode cannot attribute an eviction and
+    /// therefore reports `Reconnecting` instead.
+    Superseded,
+    /// The current outage exceeded the session retry budget. The endpoint
+    /// keeps trying its configured relays so a later operation can connect;
+    /// sessions which have already failed are never resumed.
     Failed,
 }
 
@@ -135,9 +146,20 @@ impl WriteReadiness {
 /// vanish from it; a broadcast queue keeps every distinct state in order.
 const EVENT_CAPACITY: usize = 64;
 
-/// A handle onto the single live relay session.
+/// A datagram a relay session delivered, with which driver it arrived on so
+/// the path socket can answer the peer on the same relay.
+pub struct RelayInbound {
+    pub source: NodeId,
+    pub datagram: Vec<u8>,
+    pub driver: u64,
+}
+
+/// A handle onto one relay driver: a single live session that walks its own
+/// relay list with failover, spec 4.3.
 #[derive(Clone)]
-pub struct RelayClient {
+pub struct RelayDriver {
+    id: u64,
+    urls: Arc<Vec<String>>,
     outbound: mpsc::Sender<Frame>,
     status: watch::Receiver<RelayStatus>,
     events: broadcast::Sender<RelayStatus>,
@@ -147,7 +169,97 @@ pub struct RelayClient {
     book: Option<Arc<TagBook>>,
     /// The lowercase host of the relay the session is on, memoised against
     /// its URL, so a tag-mode datagram costs no URL parse.
-    host_memo: Arc<std::sync::Mutex<Option<(String, String)>>>,
+    host_memo: Arc<Mutex<Option<(String, String)>>>,
+    stop: watch::Sender<bool>,
+}
+
+/// At most this many drivers beyond the home driver; past it a peer's hints
+/// are ignored and the home relay is used, so fan-out is bounded.
+const MAX_EXTRA_DRIVERS: usize = 16;
+
+/// The relay pool, spec 3.1: the **home** driver over this endpoint's own
+/// configured list, plus one driver per distinct relay list a peer's card
+/// names, started on demand.  The dialer sends to a peer on the relay the
+/// peer's card names and the acceptor answers on whichever driver the
+/// dialer's datagrams arrived on, so two nodes need no shared configuration
+/// to meet.
+#[derive(Clone)]
+pub struct RelayClient {
+    key: TransportKey,
+    book: Option<Arc<TagBook>>,
+    inbound: mpsc::Sender<RelayInbound>,
+    /// One write-readiness set for the whole pool: a drain on any driver
+    /// wakes quinn, which retries and is told again if its driver is full.
+    readiness: Arc<WriteReadiness>,
+    home: RelayDriver,
+    next_id: Arc<AtomicU64>,
+    extra: Arc<Mutex<HashMap<Vec<String>, RelayDriver>>>,
+    by_id: Arc<Mutex<HashMap<u64, RelayDriver>>>,
+}
+
+impl RelayClient {
+    /// End every driver, including idle or failed drivers retrying in the
+    /// background. A closed endpoint must not reconnect to its relays.
+    pub fn close(&self) {
+        let _extra = self.extra.lock().expect("drivers");
+        for driver in self.by_id.lock().expect("drivers").values() {
+            driver.stop.send_replace(true);
+        }
+    }
+
+    /// The driver over this endpoint's own configured relays.
+    pub fn home(&self) -> RelayDriver {
+        self.home.clone()
+    }
+
+    /// The pool's write-readiness set.
+    pub fn readiness(&self) -> &Arc<WriteReadiness> {
+        &self.readiness
+    }
+
+    /// The driver with this id, if it is still in the pool.
+    pub fn driver(&self, id: u64) -> Option<RelayDriver> {
+        self.by_id.lock().expect("drivers").get(&id).cloned()
+    }
+
+    /// A driver over `relays`, started now if none exists yet.  A list equal
+    /// to the home list is the home driver; an empty list is the home driver;
+    /// past the fan-out bound it is the home driver too.
+    pub fn driver_for(&self, relays: &[RelaySpec]) -> RelayDriver {
+        let urls: Vec<String> = relays.iter().map(|spec| spec.url.clone()).collect();
+        if urls.is_empty() || urls == *self.home.urls {
+            return self.home.clone();
+        }
+        let mut extra = self.extra.lock().expect("drivers");
+        if *self.home.stop.borrow() {
+            return self.home.clone();
+        }
+        if let Some(driver) = extra.get(&urls) {
+            return driver.clone();
+        }
+        if extra.len() >= MAX_EXTRA_DRIVERS {
+            warn!(
+                bound = MAX_EXTRA_DRIVERS,
+                "relay fan-out bound reached; using the home relay for this peer"
+            );
+            return self.home.clone();
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let driver = spawn_driver(
+            id,
+            self.key.clone(),
+            relays.to_vec(),
+            self.inbound.clone(),
+            self.book.clone(),
+            self.readiness.clone(),
+        );
+        extra.insert(urls, driver.clone());
+        self.by_id
+            .lock()
+            .expect("drivers")
+            .insert(id, driver.clone());
+        driver
+    }
 }
 
 /// What the path socket should do with a datagram it could not queue.
@@ -159,7 +271,17 @@ pub enum QueueOutcome {
     Dropped,
 }
 
-impl RelayClient {
+impl RelayDriver {
+    /// This driver's id, which inbound datagrams carry.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// The relay URLs this driver walks, in order.
+    pub fn urls(&self) -> &[String] {
+        &self.urls
+    }
+
     /// Queue a datagram for the relay.  Never blocks, so it is safe to call
     /// from quinn's driver.
     pub fn try_send(&self, destination: NodeId, datagram: &[u8]) -> QueueOutcome {
@@ -237,7 +359,7 @@ impl RelayClient {
         loop {
             match &*rx.borrow_and_update() {
                 RelayStatus::Up(url) => return Some(url.clone()),
-                RelayStatus::Failed => return None,
+                RelayStatus::Superseded | RelayStatus::Failed => return None,
                 _ => {}
             }
             if rx.changed().await.is_err() {
@@ -247,34 +369,83 @@ impl RelayClient {
     }
 }
 
-/// Start the relay driver.  Inbound datagrams are pushed to `inbound`.
+/// Start the pool with its home driver over `relays`.  Inbound datagrams
+/// from every driver are pushed to `inbound`.
 pub fn spawn(
     key: TransportKey,
     relays: Vec<RelaySpec>,
-    inbound: mpsc::Sender<(NodeId, Vec<u8>)>,
+    inbound: mpsc::Sender<RelayInbound>,
     book: Option<Arc<TagBook>>,
 ) -> RelayClient {
+    let readiness = Arc::new(WriteReadiness::default());
+    let home = spawn_driver(
+        0,
+        key.clone(),
+        relays,
+        inbound.clone(),
+        book.clone(),
+        readiness.clone(),
+    );
+    let by_id = HashMap::from([(0, home.clone())]);
+    RelayClient {
+        key,
+        book,
+        inbound,
+        readiness,
+        home,
+        next_id: Arc::new(AtomicU64::new(1)),
+        extra: Arc::new(Mutex::new(HashMap::new())),
+        by_id: Arc::new(Mutex::new(by_id)),
+    }
+}
+
+/// Start one driver over `relays` with the given id.
+fn spawn_driver(
+    id: u64,
+    key: TransportKey,
+    relays: Vec<RelaySpec>,
+    inbound: mpsc::Sender<RelayInbound>,
+    book: Option<Arc<TagBook>>,
+    readiness: Arc<WriteReadiness>,
+) -> RelayDriver {
     let (outbound_tx, outbound_rx) = mpsc::channel::<Frame>(MAX_QUEUED_FRAMES);
     let (status_tx, status_rx) = watch::channel(RelayStatus::Connecting);
-    let readiness = Arc::new(WriteReadiness::default());
     let (events_tx, _) = broadcast::channel(EVENT_CAPACITY);
-    tokio::spawn(driver(
+    let (stop_tx, mut stop_rx) = watch::channel(false);
+    let urls: Vec<String> = relays.iter().map(|spec| spec.url.clone()).collect();
+    let work = driver(
+        id,
         key,
         relays,
         inbound,
         outbound_rx,
-        status_tx,
+        status_tx.clone(),
         events_tx.clone(),
         readiness.clone(),
         book.clone(),
-    ));
-    RelayClient {
+    );
+    let stopped_events = events_tx.clone();
+    let stopped_readiness = readiness.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            _ = stop_rx.changed() => {
+                set_status(&status_tx, &stopped_events, RelayStatus::Failed);
+                stopped_readiness.wake_all();
+            }
+            _ = work => {}
+        }
+    });
+    RelayDriver {
+        id,
+        urls: Arc::new(urls),
         outbound: outbound_tx,
         status: status_rx,
         events: events_tx,
         readiness,
         book,
-        host_memo: Arc::new(std::sync::Mutex::new(None)),
+        host_memo: Arc::new(Mutex::new(None)),
+        stop: stop_tx,
     }
 }
 
@@ -294,9 +465,10 @@ fn set_status(
 
 #[allow(clippy::too_many_arguments)]
 async fn driver(
+    driver_id: u64,
     key: TransportKey,
     relays: Vec<RelaySpec>,
-    inbound: mpsc::Sender<(NodeId, Vec<u8>)>,
+    inbound: mpsc::Sender<RelayInbound>,
     mut outbound: mpsc::Receiver<Frame>,
     status: watch::Sender<RelayStatus>,
     events: broadcast::Sender<RelayStatus>,
@@ -312,8 +484,25 @@ async fn driver(
     let mut down_since: Option<std::time::Instant> = None;
 
     loop {
+        if let Some(book) = &book
+            && book.is_empty()
+        {
+            // A peerless tag node is idle, not failing: there is nothing to
+            // register yet, so the reconnect deadline must not run and the
+            // client must not die.  A fresh node learns its first pair from
+            // the shell (a Nostr claim) after opening; the first upsert lets
+            // the next pass connect and register within a second.
+            set_status(&status, &events, RelayStatus::Connecting);
+            down_since = None;
+            tokio::time::sleep(BACKOFF_MIN).await;
+            continue;
+        }
         let spec = relays[index % relays.len()].clone();
-        match connect(&key, &spec, book.as_deref()).await {
+        let attempt = tokio::time::timeout(CONNECT_TIMEOUT, connect(&key, &spec, book.as_deref()))
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|result| result);
+        match attempt {
             Ok(ws) => {
                 backoff = BACKOFF_MIN;
                 // Drop anything queued while the previous relay was down.  Those
@@ -325,6 +514,7 @@ async fn driver(
                 info!(relay = %spec.url, "relay session up");
                 let host = spec.host().unwrap_or_default();
                 let end = pump(
+                    driver_id,
                     ws,
                     &mut outbound,
                     &inbound,
@@ -337,8 +527,19 @@ async fn driver(
                     PumpEnd::Lost => warn!(relay = %spec.url, "relay session lost"),
                     PumpEnd::Superseded => warn!(
                         relay = %spec.url,
-                        "a newer session registered this node ID or tag; backing off before reconnecting"
+                        "a newer session registered this node ID or tag"
                     ),
+                }
+                if end == PumpEnd::Superseded && book.is_none() {
+                    // Identity mode can attribute the replacement exactly: a
+                    // newer process with this node ID won.  Retrying made two
+                    // live processes steal the slot from each other every 30
+                    // seconds, contradicting newest-wins and stalling long
+                    // transfers.  The superseded instance stops; a deliberate
+                    // restart creates a new endpoint and may take the slot.
+                    set_status(&status, &events, RelayStatus::Superseded);
+                    readiness.wake_all();
+                    return;
                 }
                 set_status(&status, &events, RelayStatus::Reconnecting);
                 down_since = Some(std::time::Instant::now());
@@ -346,20 +547,24 @@ async fn driver(
                 // Spec 4.3: next configured relay, then the same one.
                 index += 1;
                 if end == PumpEnd::Superseded {
-                    // Spec 3.1: a superseded client waits the full interval,
-                    // so two live instances of one identity do not fight.
+                    // Tag mode cannot tell which endpoint a third holder of
+                    // one pair tag replaced.  Back off before retrying so the
+                    // legitimate two ends can converge without a hot loop.
                     tokio::time::sleep(BACKOFF_MAX).await;
                 }
                 continue;
             }
             Err(e) => {
                 debug!(relay = %spec.url, error = %e, "relay connect failed");
-                set_status(&status, &events, RelayStatus::Reconnecting);
                 let since = *down_since.get_or_insert_with(std::time::Instant::now);
                 if since.elapsed() > RECONNECT_DEADLINE {
-                    warn!("no relay within 60 s");
+                    if *status.borrow() != RelayStatus::Failed {
+                        warn!("no relay within 60 s; sessions fail, endpoint keeps reconnecting");
+                    }
                     set_status(&status, &events, RelayStatus::Failed);
-                    return;
+                    readiness.wake_all();
+                } else {
+                    set_status(&status, &events, RelayStatus::Reconnecting);
                 }
                 index += 1;
                 tokio::time::sleep(backoff).await;
@@ -378,8 +583,8 @@ enum PumpEnd {
     /// was malformed: reconnect on the usual backoff.
     Lost,
     /// The relay said a newer session registered this node ID or tag (spec
-    /// 3.1, close reason 2): back off for the full interval first, or two
-    /// live instances of one identity would supersede each other in a loop.
+    /// 3.1, close reason 2). Identity mode stops; anonymous tag mode backs off
+    /// because it cannot attribute a third registration to either endpoint.
     Superseded,
 }
 
@@ -456,9 +661,10 @@ async fn next_frame(ws: &mut Socket) -> anyhow::Result<Option<Frame>> {
 }
 
 async fn pump(
+    driver_id: u64,
     mut ws: Socket,
     outbound: &mut mpsc::Receiver<Frame>,
-    inbound: &mpsc::Sender<(NodeId, Vec<u8>)>,
+    inbound: &mpsc::Sender<RelayInbound>,
     readiness: &WriteReadiness,
     book: Option<&TagBook>,
     host: &str,
@@ -472,6 +678,11 @@ async fn pump(
     refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_epoch = link_core::rendezvous::epoch_index(now_unix());
     let mut last_version = book.map(TagBook::version).unwrap_or(0);
+    // A dummy sender keeps identity mode's receiver pending forever.  Tag
+    // mode replaces it with the book's broadcast state, so removals reach
+    // every relay driver immediately, including an empty replacement set.
+    let (_idle_changes, idle_rx) = watch::channel(0u64);
+    let mut book_changes = book.map(TagBook::subscribe).unwrap_or(idle_rx);
     let mut nonce = [0u8; 8];
     loop {
         tokio::select! {
@@ -489,13 +700,21 @@ async fn pump(
                     last_epoch = current;
                     last_version = version;
                     let tags = book.registration(host, now_unix());
-                    // A book emptied at runtime has nothing to register; the
-                    // old tags age out with the epoch window.
-                    if !tags.is_empty()
-                        && ws.send(Message::Binary(Frame::Register { tags }.encode())).await.is_err()
-                    {
+                    if ws.send(Message::Binary(Frame::Register { tags }.encode())).await.is_err() {
                         return PumpEnd::Lost;
                     }
+                }
+            }
+            changed = book_changes.changed(), if book.is_some() => {
+                if changed.is_err() {
+                    return PumpEnd::Lost;
+                }
+                let Some(book) = book else { continue };
+                last_epoch = link_core::rendezvous::epoch_index(now_unix());
+                last_version = book.version();
+                let tags = book.registration(host, now_unix());
+                if ws.send(Message::Binary(Frame::Register { tags }.encode())).await.is_err() {
+                    return PumpEnd::Lost;
                 }
             }
             frame = outbound.recv() => {
@@ -518,7 +737,11 @@ async fn pump(
                                 return PumpEnd::Lost;
                             }
                             // A full inbound queue is loss, not backpressure.
-                            let _ = inbound.try_send((source, datagram));
+                            let _ = inbound.try_send(RelayInbound {
+                                source,
+                                datagram,
+                                driver: driver_id,
+                            });
                         }
                         Some(Frame::RecvTag { tag, datagram }) => {
                             let Some(book) = book else { return PumpEnd::Lost };
@@ -526,7 +749,11 @@ async fn pump(
                             // cannot resolve (a stale epoch, a removed pair) is
                             // dropped, which QUIC treats as loss.
                             if let Some(peer) = book.resolve(&tag, host, now_unix()) {
-                                let _ = inbound.try_send((peer, datagram));
+                                let _ = inbound.try_send(RelayInbound {
+                                    source: peer,
+                                    datagram,
+                                    driver: driver_id,
+                                });
                             }
                         }
                         Some(Frame::Pong(_)) => {}

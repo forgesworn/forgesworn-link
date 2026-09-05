@@ -9,11 +9,11 @@ mod harness;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use harness::*;
 use link_core::path::{FailReason, PathStatus};
-use link_endpoint::RelaySpec;
+use link_endpoint::{RelaySpec, RelayStatus, TransportKey};
 
 /// A settle delay long enough that probing only happens when a test asks for it.
 const NEVER: Duration = Duration::from_secs(3600);
@@ -590,5 +590,242 @@ async fn reannounce_resends_candidates() {
         wait_until(Duration::from_secs(5), || bob_session.punch_requests() >= 1).await,
         "a re-announcement is followed by a punch-now"
     );
+    relay.shutdown();
+}
+
+/// Two endpoints configured with different relays still meet: the card names
+/// the callee's relay, the caller dials it, and the callee replies on the
+/// relay the caller's datagrams arrived on.  Convergence needs no shared
+/// configuration, spec 3.1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peers_converge_on_the_callee_relay_hints() {
+    init_tracing();
+    let relay_a = start_relay().await;
+    let relay_b = start_relay().await;
+    let url_a = relay_a.url("127.0.0.1");
+    let url_b = relay_b.url("127.0.0.1");
+
+    let alice = start_endpoint(EndpointOptions {
+        relays: vec![RelaySpec::plain(url_a.clone())],
+        allow_direct: false,
+        probe_delay: NEVER,
+        reflector: None,
+    })
+    .await;
+    let bob = Arc::new(
+        start_endpoint(EndpointOptions {
+            relays: vec![RelaySpec::plain(url_b.clone())],
+            allow_direct: false,
+            probe_delay: NEVER,
+            reflector: None,
+        })
+        .await,
+    );
+    let card = exchange_card(&bob);
+    assert_eq!(
+        card.relay_urls(),
+        vec![url_b.clone()],
+        "bob's card names bob's relay"
+    );
+
+    let accepting = {
+        let bob = bob.clone();
+        tokio::spawn(async move { bob.accept().await })
+    };
+    let session = tokio::time::timeout(Duration::from_secs(20), alice.connect(&card))
+        .await
+        .expect("alice reaches bob within 20 s by dialing the relay his card names")
+        .expect("alice connects");
+    let bob_session = Arc::new(accepting.await.unwrap().expect("bob accepts"));
+    let sink = spawn_sink(bob_session.clone(), 1);
+
+    assert_eq!(
+        session.path().relay.as_deref(),
+        Some(url_b.as_str()),
+        "alice's session rides bob's relay, not her own"
+    );
+    assert_eq!(
+        bob_session.path().relay.as_deref(),
+        Some(url_b.as_str()),
+        "bob answers on the relay alice arrived on"
+    );
+    send_and_verify(&session, 0x5eed_0009, 8 * MIB)
+        .await
+        .expect("8 MiB over the converged relay");
+    assert_eq!(sink.await.expect("sink"), 1);
+    relay_a.shutdown();
+    relay_b.shutdown();
+}
+
+/// The same node reconnecting while its previous session is still alive on
+/// the other side (an app restart, a relay flap) must not stall.  Per-peer
+/// path state is keyed by node ID, so the old session's `direct_lost` used
+/// to drop the new session's proof and the new session's direct datagrams
+/// were then discarded as unproven: a 256 MiB transfer that took 1.5 s took
+/// 22 s.  The rule now: a new session from the same node ID supersedes the
+/// old one, which is closed, and the path state starts clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reconnecting_node_supersedes_its_old_session_and_does_not_stall() {
+    init_tracing();
+    let relay = start_relay().await;
+    let url = relay.url("127.0.0.1");
+    let options = || EndpointOptions {
+        relays: vec![RelaySpec::plain(url.clone())],
+        allow_direct: true,
+        probe_delay: Duration::ZERO,
+        reflector: Some(relay.udp_addr),
+    };
+    let bob = Arc::new(start_endpoint(options()).await);
+    let card = exchange_card(&bob);
+
+    // Alice's first process: connect, go direct, then vanish without closing,
+    // which is what a crash or a kill looks like to bob.
+    let alice_key = TransportKey::generate();
+    let first = start_endpoint_with_key(options(), alice_key.clone()).await;
+    let first_relay = first.paths().relay().home();
+    let accepting = {
+        let bob = bob.clone();
+        tokio::spawn(async move { bob.accept().await })
+    };
+    let session_1 = first.connect(&card).await.expect("first connect");
+    let bob_session_1 = Arc::new(accepting.await.unwrap().expect("bob accepts the first"));
+    let _sink_1 = spawn_sink(bob_session_1.clone(), 1);
+    wait_for_history(&session_1, Duration::from_secs(10), |h| {
+        saw(h, PathStatus::Direct)
+    })
+    .await;
+    assert!(
+        saw(&bob_session_1.history(), PathStatus::Direct)
+            || wait_for_history(&bob_session_1, Duration::from_secs(10), |h| saw(
+                h,
+                PathStatus::Direct
+            ))
+            .await
+            .iter()
+            .any(|r| r.status == PathStatus::Direct),
+        "the first session went direct on both sides"
+    );
+    // Vanish: drop the endpoint without closing the connection.
+    std::mem::forget(session_1);
+    drop(first);
+
+    // Alice's second process, same node ID, before the first has idled out.
+    let second = start_endpoint_with_key(options(), alice_key).await;
+    let mut first_relay_status = first_relay.watch();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if *first_relay_status.borrow_and_update() == RelayStatus::Superseded {
+                break;
+            }
+            first_relay_status
+                .changed()
+                .await
+                .expect("the old relay driver reports its terminal state");
+        }
+    })
+    .await
+    .expect("the old process stops instead of reclaiming the node-ID slot");
+    let accepting = {
+        let bob = bob.clone();
+        tokio::spawn(async move { bob.accept().await })
+    };
+    // Before the fix this connect timed out at 30 s: bob's handshake replies
+    // were routed by the proof of the first process's socket.
+    let dialled = Instant::now();
+    let session_2 = second.connect(&card).await.expect("second connect");
+    let handshake = dialled.elapsed();
+    assert!(
+        handshake < Duration::from_secs(5),
+        "the second handshake was not routed by a stale proof: took {handshake:?}"
+    );
+    let bob_session_2 = Arc::new(accepting.await.unwrap().expect("bob accepts the second"));
+    let sink_2 = spawn_sink(bob_session_2.clone(), 1);
+
+    // The old session on bob's side is told it was superseded and ends.
+    let old = wait_for_history(&bob_session_1, Duration::from_secs(10), saw_failed).await;
+    assert!(
+        old.last().is_some_and(
+            |r| matches!(r.status, PathStatus::Failed(_)) && r.cause.contains("supersed")
+        ),
+        "bob's first session with alice was superseded, history: {}",
+        describe(&old)
+    );
+
+    // The new session moves 64 MiB.  The bound is loose on purpose: what the
+    // defect broke was the handshake, asserted tightly above; a loaded CI
+    // runner has carried this transfer in 14 s over a direct path, which is
+    // slow but not the stall.
+    let started = Instant::now();
+    send_and_verify(&session_2, 0x5eed_0011, 64 * MIB)
+        .await
+        .expect("64 MiB on the second session");
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(30),
+        "the reconnected session did not stall: took {took:?}, history: {}",
+        describe(&session_2.history())
+    );
+    assert_eq!(sink_2.await.expect("sink"), 1);
+    relay.shutdown();
+}
+
+/// The same node reconnecting after a *clean* close, while bob's proof of its
+/// old socket is still fresh, must not stall either.  A new session never
+/// inherits path state: the proof pointed at a socket the new process does
+/// not own, and bob's handshake replies went there until it aged out, so a
+/// handshake that takes milliseconds took 21 s in the release CLI.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reconnect_after_a_clean_close_starts_with_clean_path_state() {
+    init_tracing();
+    let relay = start_relay().await;
+    let url = relay.url("127.0.0.1");
+    let options = || EndpointOptions {
+        relays: vec![RelaySpec::plain(url.clone())],
+        allow_direct: true,
+        probe_delay: Duration::ZERO,
+        reflector: Some(relay.udp_addr),
+    };
+    let bob = Arc::new(start_endpoint(options()).await);
+    let card = exchange_card(&bob);
+    let alice_key = TransportKey::generate();
+
+    let first = start_endpoint_with_key(options(), alice_key.clone()).await;
+    let accepting = {
+        let bob = bob.clone();
+        tokio::spawn(async move { bob.accept().await })
+    };
+    let session_1 = first.connect(&card).await.expect("first connect");
+    let bob_session_1 = Arc::new(accepting.await.unwrap().expect("bob accepts the first"));
+    let _sink_1 = spawn_sink(bob_session_1.clone(), 1);
+    wait_for_history(&bob_session_1, Duration::from_secs(10), |h| {
+        saw(h, PathStatus::Direct)
+    })
+    .await;
+    assert!(
+        bob.paths().proven_direct(first.node_id()).is_some(),
+        "bob holds a proof of alice's first socket"
+    );
+    // A clean close, then the process is gone; bob's proof is still fresh.
+    session_1.close(0).await;
+    drop(first);
+
+    let second = start_endpoint_with_key(options(), alice_key).await;
+    let accepting = {
+        let bob = bob.clone();
+        tokio::spawn(async move { bob.accept().await })
+    };
+    let started = Instant::now();
+    let session_2 = second.connect(&card).await.expect("second connect");
+    let handshake = started.elapsed();
+    let bob_session_2 = Arc::new(accepting.await.unwrap().expect("bob accepts the second"));
+    let sink_2 = spawn_sink(bob_session_2.clone(), 1);
+    assert!(
+        handshake < Duration::from_secs(5),
+        "the second handshake was not routed by the stale proof: took {handshake:?}"
+    );
+    send_and_verify(&session_2, 0x5eed_0012, 8 * MIB)
+        .await
+        .expect("8 MiB on the second session");
+    assert_eq!(sink_2.await.expect("sink"), 1);
     relay.shutdown();
 }

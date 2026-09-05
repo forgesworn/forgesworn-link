@@ -1,0 +1,13 @@
+2026-08-30T16:42:59.633651Z  INFO link_endpoint::relay_client: relay session up relay=wss://<pub-host>:7443/link
+2026-08-30T16:42:59.749676Z  INFO link_endpoint::endpoint: endpoint open node=75eq5thily64edx55lpcjto3clc2kzmij63v46xjlgoevxfbrzvq synthetic=[fd00:3325:987f:4a8:ceed:94dc:1625:6197]:7 udp=0.0.0.0:50121 allow_direct=true
+2026-08-30T16:42:59.749759Z  INFO link_endpoint::endpoint: rendezvous ready, starting QUIC over the relay peer=pxiwp3j4nhb72qlyximzjecl3f3jfw7hx3xbivsrvelqeyl37uwa relay=wss://<pub-host>:7443/link
+2026-08-30T16:42:59.775226Z  INFO link_endpoint::session: path transition peer=pxiwp3j4nhb72qlyximzjecl3f3jfw7hx3xbivsrvelqeyl37uwa from=rendezvous to=relayed cause=QUIC handshake over relay ok relay="wss://<pub-host>:7443/link" direct="none"
+{"event":"connected","path":{"cause":"QUIC handshake over relay ok","direct":null,"relay":"wss://<pub-host>:7443/link","since_ms":0,"status":"relayed"},"peer":"pxiwp3j4nhb72qlyximzjecl3f3jfw7hx3xbivsrvelqeyl37uwa"}
+2026-08-30T16:42:59.775463Z  INFO link_endpoint::session: sending candidates on the control stream peer=pxiwp3j4nhb72qlyximzjecl3f3jfw7hx3xbivsrvelqeyl37uwa count=2 allow_direct=true
+{"status":"relayed","relay":"wss://<pub-host>:7443/link","direct":null,"since_ms":0,"cause":"QUIC handshake over relay ok"}
+2026-08-30T16:42:59.796986Z  INFO link_endpoint::session: peer candidates received peer=pxiwp3j4nhb72qlyximzjecl3f3jfw7hx3xbivsrvelqeyl37uwa count=7
+2026-08-30T16:42:59.877357Z  INFO link_endpoint::session: path transition peer=pxiwp3j4nhb72qlyximzjecl3f3jfw7hx3xbivsrvelqeyl37uwa from=relayed to=probing cause=7 peer candidates, settle delay elapsed relay="wss://<pub-host>:7443/link" direct="none"
+{"status":"probing","relay":"wss://<pub-host>:7443/link","direct":null,"since_ms":100,"cause":"7 peer candidates, settle delay elapsed"}
+sent_sha256 3bb3da20bf0497b9440423cfe3e0ddc00b76eaecaac969b521514f9d7cfb41d3
+peer_sha256 3bb3da20bf0497b9440423cfe3e0ddc00b76eaecaac969b521514f9d7cfb41d3
+{"bytes":25165824,"digest_match":true,"event":"final","path":{"cause":"7 peer candidates, settle delay elapsed","direct":null,"relay":"wss://<pub-host>:7443/link","since_ms":2719,"status":"probing"}}

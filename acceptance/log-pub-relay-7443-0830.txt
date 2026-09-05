@@ -1,0 +1,10 @@
+2026-08-30T16:41:17.978440Z  INFO link_relay: relay listening ws_addr=0.0.0.0:7443 udp_addr=0.0.0.0:7450
+relay_url wss://<pub-host>:7443/link
+reflector 0.0.0.0:7450
+tls_sha256 cb4cc2532b44cda3550a9b39c55f03e39f74bc631a543d219ffdd0c3856957d1
+2026-08-30T16:41:19.037750Z  INFO link_relay: relay session up token=2c1c41fd2fb2fc14926bf081d6df4cf1
+2026-08-30T16:41:54.129889Z  INFO link_relay: relay session up token=25587442af06e2607cd9b7ddcd746b61
+2026-08-30T16:42:04.468720Z  INFO link_relay: relay session up token=859ed58a5562603c8ca47949d0428ccf
+2026-08-30T16:42:10.990305Z  INFO link_relay: relay session up token=5e997a47d7407a76b1ddee2c7fc0b053
+2026-08-30T16:42:59.706746Z  INFO link_relay: relay session up token=115964c5df7819486fd9450638921252
+2026-08-30T16:43:50.400813Z  INFO link_relay: relay session up token=e6124bc6c6a4155c897fe0f7d00fb6eb

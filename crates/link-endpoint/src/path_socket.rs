@@ -21,10 +21,10 @@ use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, UdpPoller};
 use rand::RngCore;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tracing::{debug, trace};
 
-use crate::relay_client::QueueOutcome;
+use crate::relay_client::{QueueOutcome, RelayDriver, RelayInbound, RelaySpec};
 
 /// A direct path counts as usable only while its proof is this fresh, spec 4.1.
 pub const DIRECT_FRESH: Duration = Duration::from_secs(15);
@@ -74,11 +74,24 @@ struct Peer {
     /// The session's probe key and its id, from the TLS exporter, spec 4.2.
     probe_key: Option<(ProbeKeyId, ProbeKey)>,
     direct: Option<Proven>,
+    /// The relay driver this peer is reached on: the one its card named
+    /// when this side dialed, or the one its datagrams last arrived on.
+    driver: Option<u64>,
+}
+
+/// The live session for a peer and the handle that tells it when a newer
+/// session from the same node takes over.
+struct SessionSlot {
+    id: u64,
+    superseded: Arc<Notify>,
 }
 
 #[derive(Default)]
 struct Inner {
     peers: HashMap<NodeId, Peer>,
+    /// One live session per peer, spec 4.3: the newest wins.
+    sessions: HashMap<NodeId, SessionSlot>,
+    next_session: u64,
     by_synthetic: HashMap<SocketAddr, NodeId>,
     by_direct: HashMap<SocketAddr, NodeId>,
     /// Which peer's session a probe key id belongs to.
@@ -184,13 +197,72 @@ impl Paths {
             .and_then(|p| p.direct)
     }
 
-    /// Forget the direct path, which puts the peer back on the relay.
-    pub fn drop_direct(&self, peer: NodeId) {
+    /// Forget the direct path, which puts the peer back on the relay.  Only
+    /// the peer's current session may do this: a superseded session that
+    /// lost its proof must not take the new session's proof with it.
+    pub fn drop_direct(&self, peer: NodeId, session: u64) {
         let mut inner = self.inner.lock().expect("paths");
+        if inner
+            .sessions
+            .get(&peer)
+            .is_none_or(|slot| slot.id != session)
+        {
+            return;
+        }
         if let Some(entry) = inner.peers.get_mut(&peer)
             && let Some(proven) = entry.direct.take()
         {
             inner.by_direct.remove(&proven.addr);
+        }
+    }
+
+    /// Register a new session with `peer` as the one live session, spec 4.3.
+    /// A previous session, if still alive, is told it was superseded; either
+    /// way the peer's path state (candidates, learnt addresses, pending
+    /// probes, the direct proof) starts clean, because a proof an earlier
+    /// session built points at a socket the new one does not own.  Returns the session's id and the
+    /// handle a later takeover will signal.
+    pub fn begin_session(&self, peer: NodeId) -> (u64, Arc<Notify>) {
+        let mut inner = self.inner.lock().expect("paths");
+        let id = inner.next_session;
+        inner.next_session += 1;
+        let superseded = Arc::new(Notify::new());
+        let slot = SessionSlot {
+            id,
+            superseded: superseded.clone(),
+        };
+        if let Some(previous) = inner.sessions.insert(peer, slot) {
+            previous.superseded.notify_one();
+        }
+        // A new session never inherits path state, whether or not an older
+        // session is still alive: after a clean close the proof of the old
+        // socket stays fresh for 15 s, and handshake replies routed by it go
+        // to a socket nobody owns.  Measured with the release CLI: a
+        // reconnect's handshake took 21 s instead of milliseconds.
+        let stale = inner.peers.get_mut(&peer).and_then(|entry| {
+            entry.candidates.clear();
+            entry.learned.clear();
+            entry.pending.clear();
+            entry.last_ping.clear();
+            entry.last_pong.clear();
+            entry.direct.take()
+        });
+        if let Some(proven) = stale {
+            inner.by_direct.remove(&proven.addr);
+        }
+        (id, superseded)
+    }
+
+    /// A session ended on its own; if it was still the live one, the slot is
+    /// freed so nothing is left to supersede.
+    pub fn end_session(&self, peer: NodeId, session: u64) {
+        let mut inner = self.inner.lock().expect("paths");
+        if inner
+            .sessions
+            .get(&peer)
+            .is_some_and(|slot| slot.id == session)
+        {
+            inner.sessions.remove(&peer);
         }
     }
 
@@ -254,6 +326,54 @@ impl Paths {
             entry
                 .learned
                 .retain(|_, seen| now.duration_since(*seen) < LEARNED_TTL);
+        }
+    }
+
+    /// The relay driver `peer` is reached on, spec 3.1: the driver its card
+    /// named, or the one its datagrams last arrived on, or the home driver.
+    pub fn relay_for(&self, peer: NodeId) -> RelayDriver {
+        let id = self
+            .inner
+            .lock()
+            .expect("paths")
+            .peers
+            .get(&peer)
+            .and_then(|entry| entry.driver);
+        id.and_then(|id| self.relay.driver(id))
+            .unwrap_or_else(|| self.relay.home())
+    }
+
+    /// Dial `peer` on the relays its card names, starting a driver for them
+    /// if none exists.  An empty list means the home relay.
+    pub fn set_peer_relays(&self, peer: NodeId, relays: &[RelaySpec]) -> RelayDriver {
+        let driver = self.relay.driver_for(relays);
+        self.inner
+            .lock()
+            .expect("paths")
+            .peers
+            .entry(peer)
+            .or_default()
+            .driver = Some(driver.id());
+        driver
+    }
+
+    /// Copy the relay driver learnt for a local provisional route onto the
+    /// Ed25519 key presented by its completed handshake.  The synthetic route
+    /// remains in place for that QUIC connection; this only gives the bounded
+    /// pairing session honest relay status under the presented key.
+    pub(crate) fn copy_relay_route(&self, route: NodeId, peer: NodeId) {
+        let mut inner = self.inner.lock().expect("paths");
+        let driver = inner.peers.get(&route).and_then(|entry| entry.driver);
+        inner.peers.entry(peer).or_default().driver = driver;
+    }
+
+    /// A datagram from `peer` arrived on `driver`: answer on the same relay,
+    /// which is how the accepting side follows the dialer's choice.
+    fn heard_on(&self, peer: NodeId, driver: u64) {
+        let mut inner = self.inner.lock().expect("paths");
+        let entry = inner.peers.entry(peer).or_default();
+        if entry.driver != Some(driver) {
+            entry.driver = Some(driver);
         }
     }
 
@@ -509,6 +629,8 @@ pub fn local_addresses(v4: bool) -> Vec<IpAddr> {
 pub struct PathSocket {
     paths: Arc<Paths>,
     inbound_rx: Mutex<mpsc::Receiver<Inbound>>,
+    /// The driver whose full queue last refused a send; see `Poller`.
+    blocked_on: Arc<Mutex<Option<u64>>>,
 }
 
 impl std::fmt::Debug for PathSocket {
@@ -529,8 +651,7 @@ pub async fn build(
     let udp = Arc::new(UdpSocket::bind(bind).await?);
     let udp_local = udp.local_addr()?;
     let (inbound_tx, inbound_rx) = mpsc::channel::<Inbound>(INBOUND_CAPACITY);
-    let (relay_inbound_tx, mut relay_inbound_rx) =
-        mpsc::channel::<(NodeId, Vec<u8>)>(INBOUND_CAPACITY);
+    let (relay_inbound_tx, mut relay_inbound_rx) = mpsc::channel::<RelayInbound>(INBOUND_CAPACITY);
     let relay = crate::relay_client::spawn(key.clone(), relays, relay_inbound_tx, book);
 
     let local_synthetic = key.node_id().synthetic_addr();
@@ -552,8 +673,14 @@ pub async fn build(
     {
         let paths = paths.clone();
         tokio::spawn(async move {
-            while let Some((source, datagram)) = relay_inbound_rx.recv().await {
+            while let Some(RelayInbound {
+                source,
+                datagram,
+                driver,
+            }) = relay_inbound_rx.recv().await
+            {
                 paths.register_peer(source);
+                paths.heard_on(source, driver);
                 paths.deliver(source.synthetic_addr(), &datagram);
             }
         });
@@ -621,6 +748,7 @@ pub async fn build(
     let socket = Arc::new(PathSocket {
         paths: paths.clone(),
         inbound_rx: Mutex::new(inbound_rx),
+        blocked_on: Arc::new(Mutex::new(None)),
     });
     Ok((socket, paths))
 }
@@ -630,6 +758,10 @@ pub async fn build(
 struct Poller {
     paths: Arc<Paths>,
     id: u64,
+    /// The driver whose full queue last refused a send, shared with the
+    /// socket.  Readiness is judged on it, so quinn is not told "ready" by
+    /// a driver it is not sending on.
+    blocked_on: Arc<Mutex<Option<u64>>>,
 }
 
 impl std::fmt::Debug for Poller {
@@ -651,12 +783,20 @@ impl UdpPoller for Poller {
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             Poll::Ready(Ok(())) => {}
         }
-        if self.paths.relay.has_capacity() {
+        let has_capacity = || match *self.blocked_on.lock().expect("blocked") {
+            Some(id) => self
+                .paths
+                .relay
+                .driver(id)
+                .is_none_or(|driver| driver.has_capacity()),
+            None => true,
+        };
+        if has_capacity() {
             return Poll::Ready(Ok(()));
         }
         self.paths.relay.readiness().register(self.id, cx.waker());
         // Re-check after registering so a concurrent drain cannot be missed.
-        if self.paths.relay.has_capacity() {
+        if has_capacity() {
             Poll::Ready(Ok(()))
         } else {
             Poll::Pending
@@ -670,6 +810,7 @@ impl AsyncUdpSocket for PathSocket {
         Box::pin(Poller {
             paths: self.paths.clone(),
             id,
+            blocked_on: self.blocked_on.clone(),
         })
     }
 
@@ -700,12 +841,23 @@ impl AsyncUdpSocket for PathSocket {
                 }
                 Ok(())
             }
-            None => match self.paths.relay.try_send(peer, transmit.contents) {
-                QueueOutcome::Queued | QueueOutcome::Dropped => Ok(()),
-                // Real backpressure while the relay is up, so nothing is buffered
-                // above the bounded queue and nothing is needlessly dropped.
-                QueueOutcome::WouldBlock => Err(io::ErrorKind::WouldBlock.into()),
-            },
+            None => {
+                let driver = self.paths.relay_for(peer);
+                match driver.try_send(peer, transmit.contents) {
+                    QueueOutcome::Queued | QueueOutcome::Dropped => {
+                        *self.blocked_on.lock().expect("blocked") = None;
+                        Ok(())
+                    }
+                    // Real backpressure while the relay is up, so nothing is
+                    // buffered above the bounded queue and nothing is
+                    // needlessly dropped.  Remember which driver refused, so
+                    // the poller judges readiness on that one.
+                    QueueOutcome::WouldBlock => {
+                        *self.blocked_on.lock().expect("blocked") = Some(driver.id());
+                        Err(io::ErrorKind::WouldBlock.into())
+                    }
+                }
+            }
         }
     }
 

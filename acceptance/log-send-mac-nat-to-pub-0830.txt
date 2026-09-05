@@ -1,0 +1,15 @@
+2026-08-30T16:41:54.059348Z  INFO link_endpoint::relay_client: relay session up relay=wss://<pub-host>:7443/link
+2026-08-30T16:41:54.177803Z  INFO link_endpoint::endpoint: endpoint open node=6bspvmg662g6r4qhrqs3m22bc3swm2vw3bse7x3l73hnybqdpdiq synthetic=[fd00:e701:7fe3:3b9e:313a:bb0a:54fc:4922]:7 udp=0.0.0.0:58878 allow_direct=true
+2026-08-30T16:41:54.177898Z  INFO link_endpoint::endpoint: rendezvous ready, starting QUIC over the relay peer=pxiwp3j4nhb72qlyximzjecl3f3jfw7hx3xbivsrvelqeyl37uwa relay=wss://<pub-host>:7443/link
+2026-08-30T16:41:54.199199Z  INFO link_endpoint::session: path transition peer=pxiwp3j4nhb72qlyximzjecl3f3jfw7hx3xbivsrvelqeyl37uwa from=rendezvous to=relayed cause=QUIC handshake over relay ok relay="wss://<pub-host>:7443/link" direct="none"
+{"event":"connected","path":{"cause":"QUIC handshake over relay ok","direct":null,"relay":"wss://<pub-host>:7443/link","since_ms":0,"status":"relayed"},"peer":"pxiwp3j4nhb72qlyximzjecl3f3jfw7hx3xbivsrvelqeyl37uwa"}
+{"status":"relayed","relay":"wss://<pub-host>:7443/link","direct":null,"since_ms":0,"cause":"QUIC handshake over relay ok"}
+2026-08-30T16:41:54.199556Z  INFO link_endpoint::session: sending candidates on the control stream peer=pxiwp3j4nhb72qlyximzjecl3f3jfw7hx3xbivsrvelqeyl37uwa count=3 allow_direct=true
+2026-08-30T16:41:54.222487Z  INFO link_endpoint::session: peer candidates received peer=pxiwp3j4nhb72qlyximzjecl3f3jfw7hx3xbivsrvelqeyl37uwa count=7
+2026-08-30T16:41:54.300687Z  INFO link_endpoint::session: path transition peer=pxiwp3j4nhb72qlyximzjecl3f3jfw7hx3xbivsrvelqeyl37uwa from=relayed to=probing cause=7 peer candidates, settle delay elapsed relay="wss://<pub-host>:7443/link" direct="none"
+{"status":"probing","relay":"wss://<pub-host>:7443/link","direct":null,"since_ms":101,"cause":"7 peer candidates, settle delay elapsed"}
+2026-08-30T16:41:54.402076Z  INFO link_endpoint::session: path transition peer=pxiwp3j4nhb72qlyximzjecl3f3jfw7hx3xbivsrvelqeyl37uwa from=probing to=direct cause=signed pong proved <pub-host>:7460 relay="wss://<pub-host>:7443/link" direct="<pub-host>:7460"
+{"status":"direct","relay":"wss://<pub-host>:7443/link","direct":"<pub-host>:7460","since_ms":100,"cause":"signed pong proved <pub-host>:7460"}
+sent_sha256 267ba0172f6932ce7aca255347fe0345c06607e6a30ba52d98e859bd4f79aa9e
+peer_sha256 267ba0172f6932ce7aca255347fe0345c06607e6a30ba52d98e859bd4f79aa9e
+{"bytes":67108864,"digest_match":true,"event":"final","path":{"cause":"signed pong proved <pub-host>:7460","direct":"<pub-host>:7460","relay":"wss://<pub-host>:7443/link","since_ms":9673,"status":"direct"}}

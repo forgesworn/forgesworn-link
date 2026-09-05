@@ -9,16 +9,25 @@ use serde::Serialize;
 #[serde(rename_all = "lowercase")]
 pub enum FailReason {
     Relay,
+    /// Tag mode has no rendezvous material for the requested peer.  This is
+    /// local routing state, not a relay outage or an identity failure.
+    Rendezvous,
     Identity,
     Timeout,
+    /// A newer session from the same node ID arrived and took over, spec
+    /// 4.3: one QUIC connection per peer, newest wins.  This session was
+    /// closed so its stale path state cannot sabotage the new one.
+    Superseded,
 }
 
 impl std::fmt::Display for FailReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FailReason::Relay => f.write_str("relay"),
+            FailReason::Rendezvous => f.write_str("rendezvous"),
             FailReason::Identity => f.write_str("identity"),
             FailReason::Timeout => f.write_str("timeout"),
+            FailReason::Superseded => f.write_str("superseded"),
         }
     }
 }

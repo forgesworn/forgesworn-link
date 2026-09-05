@@ -14,7 +14,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::TryStreamExt;
-use link_blossom::{LinkFetcher, MapBlobSource, MapCardResolver, serve, serve_stream};
+use link_blossom::{
+    LinkFetcher, MapBlobSource, MapCardResolver, fetch_blob_over, serve, serve_stream,
+};
 use link_core::card::{Card, VerifyContext};
 use link_endpoint::{Endpoint, EndpointConfig, RelaySpec, TransportKey};
 use link_relay::{RelayConfig, RelayHandle};
@@ -194,6 +196,65 @@ async fn fetch_over_link_round_trips_a_5_mib_blob() {
     assert!(
         matches!(unsupported, Err(FetchError::UnsupportedSource)),
         "a non-fsl source is unsupported, got {unsupported:?}"
+    );
+
+    serving.abort();
+    relay.shutdown();
+}
+
+/// The held-session path: the caller connects once, fetches several blobs over
+/// that one session with `fetch_blob_over`, and the session stays open and
+/// usable afterwards — under newest-session-wins, a per-blob dial would have
+/// superseded it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn several_fetches_share_one_caller_owned_session() {
+    init();
+    let relay = start_relay().await;
+    let url = relay.url("127.0.0.1");
+
+    let server = Arc::new(start_endpoint(&url).await);
+    let client = start_endpoint(&url).await;
+
+    let first = deterministic_bytes(256 * 1024, 0xB105_0003);
+    let second = deterministic_bytes(64 * 1024, 0xB105_0004);
+    let first_hash = hex::encode(Sha256::digest(&first));
+    let second_hash = hex::encode(Sha256::digest(&second));
+    let source = Arc::new(
+        MapBlobSource::new()
+            .with_blob(first_hash.clone(), None, first.clone())
+            .with_blob(second_hash.clone(), None, second.clone()),
+    );
+    let serving = tokio::spawn(serve(server.clone(), source));
+
+    let card = card_of(&server);
+    let session = Arc::new(client.connect(&card).await.expect("one session"));
+
+    for (bytes, hash) in [(&first, &first_hash), (&second, &second_hash)] {
+        let raw: [u8; 32] = hex::decode(hash).unwrap().try_into().unwrap();
+        let fetched = fetch_blob_over(&session, raw, Some(bytes.len() as u64))
+            .await
+            .expect("fetch over the held session");
+        let mut hasher = Sha256::new();
+        let mut body = fetched.body;
+        while let Some(chunk) = body.try_next().await.expect("a body chunk") {
+            hasher.update(&chunk);
+        }
+        assert_eq!(&hex::encode(hasher.finalize()), hash);
+    }
+
+    // The session survived both bodies: a third exchange still works, which a
+    // close-on-drain would have made impossible.
+    let raw: [u8; 32] = hex::decode(&first_hash).unwrap().try_into().unwrap();
+    let again = fetch_blob_over(&session, raw, Some(first.len() as u64))
+        .await
+        .expect("the session is still open");
+    drop(again);
+
+    // And a wrong expected size is refused before any body byte.
+    let miss = fetch_blob_over(&session, raw, Some(1)).await;
+    assert!(
+        matches!(miss, Err(FetchError::Unreachable(_))),
+        "a declared-size mismatch is refused, got {miss:?}"
     );
 
     serving.abort();

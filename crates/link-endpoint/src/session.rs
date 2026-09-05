@@ -11,9 +11,9 @@ use link_core::card::{Hint, to_ipv6};
 use link_core::id::NodeId;
 use link_core::path::{FailReason, PathReport, PathStatus};
 use link_core::wire::{PROBE_EXPORT_BYTES, PROBE_EXPORT_LABEL, PROBE_ID_BYTES, PROBE_KEY_BYTES};
+use quinn::VarInt;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::broadcast;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, broadcast, mpsc};
 use tracing::{info, warn};
 
 use crate::path_socket::{DIRECT_FRESH, Paths};
@@ -85,6 +85,9 @@ impl tokio::io::AsyncWrite for Stream {
 
 pub(crate) struct SessionInner {
     peer: NodeId,
+    /// `None` for a provisional pairing key: it routes this connection but
+    /// must not become a durable identity in operator logs.
+    log_peer: Option<NodeId>,
     conn: quinn::Connection,
     paths: Arc<Paths>,
     allow_direct: bool,
@@ -99,12 +102,22 @@ pub(crate) struct SessionInner {
     punch_requests: AtomicU32,
     /// The probe key id this session registered, to forget when it ends.
     probe_key_id: Option<[u8; PROBE_ID_BYTES]>,
+    /// This session's id in the path socket's per-peer slot, spec 4.3.
+    session_id: u64,
+    /// Signalled when a newer session from the same node takes over.
+    superseded: Arc<Notify>,
 }
 
 impl SessionInner {
+    fn peer_log(&self) -> impl std::fmt::Display + '_ {
+        self.log_peer
+            .map(|peer| peer.to_string())
+            .unwrap_or_else(|| "provisional".to_owned())
+    }
+
     fn transition(&self, status: PathStatus, cause: impl Into<String>) {
         let cause = cause.into();
-        let relay = match self.paths.relay().status() {
+        let relay = match self.paths.relay_for(self.peer).status() {
             RelayStatus::Up(url) => Some(url),
             _ => None,
         };
@@ -121,7 +134,7 @@ impl SessionInner {
         }
         // Spec 4.3: every transition is logged with its cause.
         info!(
-            peer = %self.peer,
+            peer = %self.peer_log(),
             from = %report.status,
             to = %status,
             %cause,
@@ -163,12 +176,15 @@ pub struct Session {
 impl Session {
     pub(crate) async fn start(
         peer: NodeId,
+        log_peer: bool,
         conn: quinn::Connection,
         paths: Arc<Paths>,
         allow_direct: bool,
         probe_delay: Duration,
+        slot: (u64, Arc<Notify>),
     ) -> Session {
-        let relay = match paths.relay().status() {
+        let (session_id, superseded) = slot;
+        let relay = match paths.relay_for(peer).status() {
             RelayStatus::Up(url) => Some(url),
             _ => None,
         };
@@ -195,6 +211,11 @@ impl Session {
                 Some(key_id)
             }
             Err(e) => {
+                let peer = if log_peer {
+                    peer.to_string()
+                } else {
+                    "provisional".into()
+                };
                 warn!(%peer, error = ?e, "no exporter material: this session cannot probe");
                 None
             }
@@ -203,6 +224,7 @@ impl Session {
         let (control_tx, control_rx) = mpsc::channel::<ControlSend>(CONTROL_QUEUE);
         let inner = Arc::new(SessionInner {
             peer,
+            log_peer: log_peer.then_some(peer),
             conn,
             paths,
             allow_direct,
@@ -210,6 +232,8 @@ impl Session {
             control_tx,
             punch_requests: AtomicU32::new(0),
             probe_key_id,
+            session_id,
+            superseded,
             report: Mutex::new(initial.clone()),
             history: Mutex::new(vec![initial]),
         });
@@ -292,6 +316,10 @@ impl Session {
     pub async fn close(&self, reason: u32) {
         self.inner.conn.close(reason.into(), b"closed");
         self.inner.conn.closed().await;
+    }
+
+    pub(crate) fn connection(&self) -> quinn::Connection {
+        self.inner.conn.clone()
     }
 }
 
@@ -400,7 +428,7 @@ async fn control_initiator(
     };
     let first = candidates(&inner);
     info!(
-        peer = %inner.peer,
+        peer = %inner.peer_log(),
         count = first.len(),
         allow_direct = inner.allow_direct,
         "sending candidates on the control stream"
@@ -417,7 +445,7 @@ async fn control_initiator(
             request = requests.recv() => match request {
                 Some(ControlSend::Candidates) => {
                     let fresh = candidates(&inner);
-                    info!(peer = %inner.peer, count = fresh.len(), "re-announcing candidates");
+                    info!(peer = %inner.peer_log(), count = fresh.len(), "re-announcing candidates");
                     candidates_message(&fresh)
                 }
                 Some(ControlSend::PunchNow) => punch_now_message(),
@@ -454,7 +482,7 @@ async fn control_acceptor(
         }
         match parse_control(&body) {
             Some(Control::Candidates(candidates)) => {
-                info!(peer = %inner.peer, count = candidates.len(), "peer candidates received");
+                info!(peer = %inner.peer_log(), count = candidates.len(), "peer candidates received");
                 inner.paths.set_peer_candidates(inner.peer, candidates);
             }
             Some(Control::PunchNow) => {
@@ -500,17 +528,36 @@ async fn drive(inner: Arc<SessionInner>, probe_delay: Duration) {
     // failover can complete in tens of milliseconds, which a tick would step
     // straight over, and spec 4.3 requires the Reconnecting transition to be
     // recorded whatever its duration.
-    let mut events = inner.paths.relay().subscribe();
-    let mut relay_state = inner.paths.relay().status();
+    // The session follows the driver its peer is reached on, spec 3.1; that
+    // can change if the peer's datagrams start arriving on another relay,
+    // in which case the subscription moves with it.
+    let mut driver = inner.paths.relay_for(inner.peer);
+    let mut events = driver.subscribe();
+    let mut relay_state = driver.status();
 
     loop {
         let mut relay_event = None;
         tokio::select! {
+            _ = inner.superseded.notified() => {
+                // A newer session from the same node took the slot, spec 4.3.
+                // Close this one rather than let it linger until the idle
+                // timeout with path state that no longer belongs to it.
+                if let Some(key_id) = inner.probe_key_id {
+                    inner.paths.unregister_probe_key(key_id);
+                }
+                inner.transition(
+                    PathStatus::Failed(FailReason::Superseded),
+                    "superseded by a newer session from the same node",
+                );
+                inner.conn.close(VarInt::from_u32(2), b"superseded");
+                return;
+            }
             reason = inner.conn.closed() => {
                 // The probe key dies with the session, spec 4.2.
                 if let Some(key_id) = inner.probe_key_id {
                     inner.paths.unregister_probe_key(key_id);
                 }
+                inner.paths.end_session(inner.peer, inner.session_id);
                 let status = inner.status();
                 if !matches!(status, PathStatus::Failed(_)) {
                     match reason {
@@ -532,7 +579,7 @@ async fn drive(inner: Arc<SessionInner>, probe_delay: Duration) {
             event = events.recv() => relay_event = Some(event),
             changed = net.changed(), if net_alive => match changed {
                 Ok(()) => {
-                    info!(peer = %inner.peer, "interface change: re-querying the reflector");
+                    info!(peer = %inner.peer_log(), "interface change: re-querying the reflector");
                     inner.paths.requery_reflector();
                     reannounce_at = Some(Instant::now() + REFLECTOR_GRACE);
                 }
@@ -546,10 +593,17 @@ async fn drive(inner: Arc<SessionInner>, probe_delay: Duration) {
                 Ok(next) => relay_state = next,
                 Err(broadcast::error::RecvError::Lagged(missed)) => {
                     warn!(missed, "relay status events lagged, resynchronising");
-                    relay_state = inner.paths.relay().status();
+                    relay_state = driver.status();
                 }
                 Err(broadcast::error::RecvError::Closed) => {}
             }
+        }
+
+        let current = inner.paths.relay_for(inner.peer);
+        if current.id() != driver.id() {
+            driver = current;
+            events = driver.subscribe();
+            relay_state = driver.status();
         }
 
         let status = inner.status();
@@ -559,6 +613,13 @@ async fn drive(inner: Arc<SessionInner>, probe_delay: Duration) {
 
         // Relay availability first: it drives Reconnecting for both Relayed and Direct.
         match relay_state.clone() {
+            RelayStatus::Superseded => {
+                inner.transition(
+                    PathStatus::Failed(FailReason::Superseded),
+                    "relay node-ID slot taken by a newer process",
+                );
+                return;
+            }
             RelayStatus::Failed => {
                 inner.transition(
                     PathStatus::Failed(FailReason::Relay),
@@ -601,7 +662,7 @@ async fn drive(inner: Arc<SessionInner>, probe_delay: Duration) {
 
         if reannounce_at.is_some_and(|at| Instant::now() >= at) {
             reannounce_at = None;
-            info!(peer = %inner.peer, "interface change: re-announcing candidates");
+            info!(peer = %inner.peer_log(), "interface change: re-announcing candidates");
             let _ = inner.control_tx.try_send(ControlSend::Candidates);
             let _ = inner.control_tx.try_send(ControlSend::PunchNow);
             inner.probe_now.store(PROBE_LOCAL, Ordering::SeqCst);
@@ -685,7 +746,7 @@ async fn drive(inner: Arc<SessionInner>, probe_delay: Duration) {
                         }
                     }
                     _ => {
-                        inner.paths.drop_direct(inner.peer);
+                        inner.paths.drop_direct(inner.peer, inner.session_id);
                         next_probe_attempt = Instant::now() + PROBE_COOLDOWN;
                         inner.transition(
                             PathStatus::Relayed,

@@ -28,6 +28,11 @@
       "bytesHex": "0400027171717171717171717171717171717172727272727272727272727272727272"
     },
     {
+      "name": "register-empty-replacement",
+      "note": "valid only after a non-empty initial Register; removes every tag",
+      "bytesHex": "040000"
+    },
+    {
       "name": "send-tag",
       "bytesHex": "127171717171717171717171717171717164617461"
     },
@@ -76,10 +81,6 @@
     {
       "name": "send-tag-empty-datagram",
       "bytesHex": "1271717171717171717171717171717171"
-    },
-    {
-      "name": "register-zero-tags",
-      "bytesHex": "040000"
     },
     {
       "name": "register-count-mismatch",

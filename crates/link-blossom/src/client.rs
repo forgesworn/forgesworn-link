@@ -73,6 +73,15 @@ impl CardResolver for MapCardResolver {
 }
 
 /// A blob fetcher that carries bytes over the ForgeSworn Link native lane.
+///
+/// Each `fetch` dials a **fresh session** to the blob's node and closes it
+/// when the body ends.  Under the newest-session-wins rule (spec 4.3), that
+/// fresh session supersedes any other session this endpoint holds to the same
+/// peer — so an application that already holds a session to that peer (a
+/// booking, a live exchange) MUST NOT let this fetcher dial: fetch over the
+/// held session with [`fetch_blob_over`] instead.  The dial-per-blob shape is
+/// right for its actual caller, the repair sweep, which visits peers one blob
+/// at a time with no session of its own.
 pub struct LinkFetcher {
     endpoint: Arc<Endpoint>,
     resolver: Arc<dyn CardResolver>,
@@ -110,6 +119,66 @@ async fn fetch_over_link(
         FetchError::Unreachable(format!("link connect to {node} failed: {reason}"))
     })?;
 
+    let (stream, size, content_type) = open_blob_stream(&session, sha256).await?;
+
+    // Report the path the session actually proved, never inferred from the fact
+    // the transfer started.  Only a proven direct path is Direct; every other
+    // state, including a relay reconnect, is conservatively Relayed.  This lane
+    // never uses Tor, HTTPS or loopback, so those are never reported.
+    let path = match session.path().status {
+        PathStatus::Direct => FetchPath::Direct,
+        _ => FetchPath::Relayed,
+    };
+
+    let body = link_body(stream, BodySession::Owned(Some(session)), size);
+    Ok(FetchedBlob {
+        path,
+        size,
+        content_type,
+        body,
+    })
+}
+
+/// Fetch one blob over a session the caller already holds, leaving the
+/// session open — it stays the caller's to close.
+///
+/// This is the client-side twin of [`serve_stream`](crate::serve_stream), and
+/// the entry point for any application that holds a live session to the peer:
+/// under the newest-session-wins rule, letting [`LinkFetcher`] dial a fresh
+/// session would supersede the one the exchange is running on.  When
+/// `expected_size` is given, a response declaring a different size is refused
+/// before any body byte is read.  The caller verifies the delivered bytes'
+/// hash itself, exactly as the Blossom router does.
+pub async fn fetch_blob_over(
+    session: &Arc<Session>,
+    sha256: [u8; 32],
+    expected_size: Option<u64>,
+) -> Result<FetchedBlob, FetchError> {
+    let (stream, size, content_type) = open_blob_stream(session, sha256).await?;
+    if expected_size.is_some_and(|expected| expected != size) {
+        return Err(FetchError::Unreachable(format!(
+            "peer declared {size} bytes where {expected_size:?} were expected"
+        )));
+    }
+    let path = match session.path().status {
+        PathStatus::Direct => FetchPath::Direct,
+        _ => FetchPath::Relayed,
+    };
+    let body = link_body(stream, BodySession::Shared(session.clone()), size);
+    Ok(FetchedBlob {
+        path,
+        size,
+        content_type,
+        body,
+    })
+}
+
+/// One FSLB request/response exchange on a fresh stream of `session`,
+/// returning the stream positioned at the first body byte.
+async fn open_blob_stream(
+    session: &Session,
+    sha256: [u8; 32],
+) -> Result<(Stream, u64, Option<String>), FetchError> {
     let mut stream = session
         .open_stream()
         .await
@@ -131,23 +200,7 @@ async fn fetch_over_link(
         ResponseHeader::Error => return Err(FetchError::UnusableStatus(500)),
         ResponseHeader::UnsupportedVersion => return Err(FetchError::UnusableStatus(505)),
     };
-
-    // Report the path the session actually proved, never inferred from the fact
-    // the transfer started.  Only a proven direct path is Direct; every other
-    // state, including a relay reconnect, is conservatively Relayed.  This lane
-    // never uses Tor, HTTPS or loopback, so those are never reported.
-    let path = match session.path().status {
-        PathStatus::Direct => FetchPath::Direct,
-        _ => FetchPath::Relayed,
-    };
-
-    let body = link_body(stream, session, size);
-    Ok(FetchedBlob {
-        path,
-        size,
-        content_type,
-        body,
-    })
+    Ok((stream, size, content_type))
 }
 
 /// Split an `fsl` source into its node id and raw digest.
@@ -246,21 +299,41 @@ async fn read_response(stream: &mut Stream) -> Result<ResponseHeader, FetchError
 /// while the body is drained, and closes it once the body ends.  It reads
 /// exactly `size` bytes: it never yields more, and a short read is surfaced as
 /// [`FetchError::Stream`] rather than a silently truncated blob.
+/// How a body stream holds its session.  A fetcher-dialled session is closed
+/// when the body ends or errors — one blob to one connection, so a repair
+/// sweep leaves nothing lingering.  A caller-supplied session is only kept
+/// alive for the body's lifetime and is never closed here: it stays the
+/// caller's, which is the whole point of [`fetch_blob_over`].
+enum BodySession {
+    Owned(Option<Session>),
+    Shared(#[allow(dead_code)] Arc<Session>),
+}
+
+impl BodySession {
+    async fn finish(&mut self) {
+        if let BodySession::Owned(slot) = self
+            && let Some(session) = slot.take()
+        {
+            session.close(0).await;
+        }
+    }
+}
+
 fn link_body(
     stream: Stream,
-    session: Session,
+    session: BodySession,
     size: u64,
 ) -> BoxStream<'static, Result<Bytes, FetchError>> {
     struct State {
         stream: Stream,
-        session: Option<Session>,
+        session: BodySession,
         remaining: u64,
         errored: bool,
     }
 
     let state = State {
         stream,
-        session: Some(session),
+        session,
         remaining: size,
         errored: false,
     };
@@ -270,11 +343,7 @@ fn link_body(
             return None;
         }
         if state.remaining == 0 {
-            if let Some(session) = state.session.take() {
-                // One blob to one connection, closed once the body is drained,
-                // so a repair sweep does not leave connections lingering.
-                session.close(0).await;
-            }
+            state.session.finish().await;
             return None;
         }
         let want = state.remaining.min(CHUNK as u64) as usize;
@@ -286,9 +355,7 @@ fn link_body(
             }
             Err(error) => {
                 state.errored = true;
-                if let Some(session) = state.session.take() {
-                    session.close(0).await;
-                }
+                state.session.finish().await;
                 Some((
                     Err(FetchError::Stream(format!(
                         "link body read failed: {error}"
