@@ -7,23 +7,31 @@ import http.client
 import os
 import socket
 import ssl
+import subprocess
 
 HOST = "link1.forgesworn.dev"
 
 # These responses explain the protocol; only the upgrade below proves
 # that Caddy can reach the relay. A static HTTP response is not health proof.
-for path, expected_status in [("/", 404), ("/link", 426)]:
+for path, expected_status in [("/", 404), ("/link", 400)]:
     connection = http.client.HTTPSConnection(HOST, timeout=15)
     try:
         connection.request("GET", path)
         response = connection.getresponse()
         if response.status != expected_status:
             raise SystemExit(f"Public {path} returned {response.status}; expected {expected_status}")
-        if path == "/link" and response.getheader("Upgrade", "").lower() != "websocket":
-            raise SystemExit("Public /link did not advertise the required WebSocket upgrade")
     finally:
         connection.close()
-print("link1.forgesworn.dev: ordinary HTTP requests returned 404 / and 426 /link")
+    # Also reproduce ordinary browser/curl requests over HTTP/2. In
+    # particular, an Upgrade response header there is a protocol error.
+    result = subprocess.run([
+        "curl", "-q", "--http2", "--silent", "--show-error", "--max-time", "15",
+        "--output", os.devnull, "--write-out", "%{http_version} %{http_code}",
+        f"https://{HOST}{path}",
+    ], check=True, capture_output=True, text=True, timeout=20)
+    if result.stdout != f"2 {expected_status}":
+        raise SystemExit(f"Public HTTP/2 {path} returned unexpected protocol/status")
+print("link1.forgesworn.dev: HTTP/1.1 and HTTP/2 returned 404 / and 400 /link")
 
 key = base64.b64encode(os.urandom(16)).decode("ascii")
 expected = base64.b64encode(hashlib.sha1(

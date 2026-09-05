@@ -31,8 +31,7 @@ link1.forgesworn.dev {
 		# The upstream speaks WebSocket only. An ordinary HTTP request
 		# makes it close the connection, which Caddy would report as 502.
 		handle {
-			header Upgrade websocket
-			respond "WebSocket upgrade required; use wss://link1.forgesworn.dev/link." 426
+			respond "WebSocket upgrade required; use wss://link1.forgesworn.dev/link." 400
 		}
 	}
 
