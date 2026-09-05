@@ -122,6 +122,12 @@ paths disabled and a two-minute deadline. It verifies a public relay path
 from one test host; it does not test real phones or different NATs. Normal
 CI compiles this test but never contacts the public service.
 
+The manual `Check public founders' relay` workflow verifies trusted TLS,
+the WebSocket upgrade and a nonce-checked UDP reflector reply from a GitHub
+runner. It changes no service or DNS state and needs no deployment secrets.
+Use it to distinguish a problem on the operator's network from public
+ingress failure. It is never triggered by ordinary pushes or pull requests.
+
 For a failed public check after a successful service start, the operator
 must diagnose DNS/TLS/ingress or restore the previous root-owned release
 symlink and restart the service. Automatic receiver rollback covers a
