@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Root-owned receiver for a forced SSH command; accepts only one bounded binary."""
 
 import fcntl
@@ -84,14 +84,15 @@ def activate(base, release, restart, stop):
 
 
 def restart_service():
-    subprocess.run(["systemctl", "restart", "link-relay"], check=True, timeout=30)
+    subprocess.run(["/usr/bin/systemctl", "restart", "link-relay"], check=True, timeout=30)
     time.sleep(2)
-    subprocess.run(["systemctl", "is-active", "--quiet", "link-relay"], check=True, timeout=10)
+    subprocess.run(["/usr/bin/systemctl", "is-active", "--quiet", "link-relay"], check=True, timeout=10)
 
 
 def main():
     if os.geteuid() != 0 or len(sys.argv) != 1:
         raise ValueError("Receiver requires root and accepts no arguments")
+
     def deadline_elapsed(*_):
         raise TimeoutError("Upload deadline exceeded")
 
@@ -124,7 +125,7 @@ def main():
                 temporary.chmod(0o755)
                 temporary.rename(destination)
             activate(base, destination, restart_service, lambda: subprocess.run(
-                ["systemctl", "stop", "link-relay"], check=True, timeout=30))
+                ["/usr/bin/systemctl", "stop", "link-relay"], check=True, timeout=30))
             print(json.dumps({"installed": record, "service": "active"}, sort_keys=True))
         finally:
             if temporary.exists():

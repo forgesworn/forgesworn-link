@@ -48,7 +48,9 @@ the actual host's global logging configuration as well as this vhost.
 
 Confirm the approved host's provider, ownership, architecture, available
 resources, existing TLS service and firewall before changing it. This
-workflow builds **x86-64 Linux**; it is unsuitable for an ARM host.
+workflow builds **x86-64 Linux**; it is unsuitable for an ARM host. The
+receiver requires `/usr/bin/python3` and `/usr/bin/systemctl`, using fixed
+paths rather than searching a caller-controlled environment.
 
 On that host, using the operator's existing trusted administrative access:
 
