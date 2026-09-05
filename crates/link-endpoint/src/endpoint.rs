@@ -742,6 +742,7 @@ impl Endpoint {
 
     pub async fn close(&self) {
         self.quic.close(VarInt::from_u32(0), b"closing");
+        self.paths.relay().close();
         self.quic.wait_idle().await;
     }
 }

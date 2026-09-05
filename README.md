@@ -194,6 +194,15 @@ as a no-go, not as a pass.
 
 ## What this does NOT prove
 
+The relay endpoint keeps reconnecting after the sixty-second session retry
+budget expires. Existing transfers remain failed; a later explicit operation
+can use the recovered relay without restarting the endpoint. Closing the
+endpoint cancels its relay drivers, including pending handshakes and backoff.
+`tests/relay_restart.rs` exercises a real relay restart after that deadline,
+exact peer bytes after recovery, stalled-handshake failover and cancellation.
+This is source/loopback evidence for the Android observation in issue #37;
+the phone's own relay-restart acceptance still needs a recorded device run.
+
 The `acceptance/` runs cover a home NAT, a venue NAT, a commercial VPN egress,
 a LAN pair, a UDP-blocked host, a same-key reconnect and a mid-transfer relay
 failover, across macOS and Linux; the 30 August record re-ran the public-host
