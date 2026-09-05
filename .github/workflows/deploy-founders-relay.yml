@@ -1,0 +1,88 @@
+name: Deploy founders' relay
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Exact reviewed main commit to deploy
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-founders-relay
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Require reviewed source and an approved host
+        env:
+          REVIEWED_COMMIT: ${{ inputs.source_commit }}
+          DEPLOY_HOST: ${{ vars.LINK_RELAY_SSH_HOST }}
+        run: |
+          set -euo pipefail
+          test "$REVIEWED_COMMIT" = "$(git rev-parse HEAD)"
+          test -n "$DEPLOY_HOST"
+          case "$DEPLOY_HOST" in
+            95.217.39.110|144.126.230.165)
+              echo 'This retired or retiring destination is excluded.' >&2
+              exit 1 ;;
+          esac
+
+      - name: Install pinned Rust and musl tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup toolchain install 1.94.1 --profile minimal --target x86_64-unknown-linux-musl
+
+      - name: Check receiver and build static release
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s deploy/founders -p 'test_*.py' -v
+          cargo +1.94.1 build --locked -p link-relay --release --target x86_64-unknown-linux-musl
+          strip target/x86_64-unknown-linux-musl/release/link-relay
+
+      - name: Install through the restricted receiver
+        env:
+          DEPLOY_HOST: ${{ vars.LINK_RELAY_SSH_HOST }}
+          DEPLOY_USER: ${{ vars.LINK_RELAY_SSH_USER }}
+          DEPLOY_KEY: ${{ secrets.LINK_RELAY_DEPLOY_KEY }}
+          KNOWN_HOSTS: ${{ secrets.LINK_RELAY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$DEPLOY_USER"
+          test -n "$DEPLOY_KEY"
+          test -n "$KNOWN_HOSTS"
+          ssh_dir=$(mktemp -d)
+          trap 'rm -rf "$ssh_dir"' EXIT
+          printf '%s\n' "$DEPLOY_KEY" > "$ssh_dir/key"
+          printf '%s\n' "$KNOWN_HOSTS" > "$ssh_dir/known_hosts"
+          python3 deploy/founders/stream-release.py \
+            target/x86_64-unknown-linux-musl/release/link-relay "$GITHUB_SHA" | \
+            ssh -T -o BatchMode=yes -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes -o ConnectTimeout=15 \
+              -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+              -o UserKnownHostsFile="$ssh_dir/known_hosts" \
+              -i "$ssh_dir/key" "$DEPLOY_USER@$DEPLOY_HOST" | \
+            tee "$RUNNER_TEMP/link-relay-deployment.json"
+
+      - name: Verify public TLS and WebSocket upgrade
+        run: python3 deploy/founders/verify-endpoint.py
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: link-relay-deployment-${{ github.sha }}
+          path: ${{ runner.temp }}/link-relay-deployment.json
+          if-no-files-found: ignore
+          retention-days: 90

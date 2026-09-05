@@ -1,0 +1,30 @@
+# Founders' relay vhost for an approved shared host's Caddy instance.
+# Add this block to the box's running Caddyfile and reload Caddy; this
+# repository does not install it. See deploy/founders/README.md.
+#
+# `log { output discard }` disables the access log for this site so Caddy
+# keeps no record of who connected when — the relay itself never logs tags
+# (review point 5), and the vhost in front of it should not either. Marked
+# "to be confirmed by the box owner": check it against however logging is
+# already configured on that box (a global discard default would make this
+# line redundant, not wrong).
+
+# Review conditions (Wildbloom side, 2026-08-30): the /link WebSocket must
+# be proxied with no idle timeout under the relay's 20-second ping cadence
+# and with no buffering that delays frames. Caddy upgrades WebSockets on
+# reverse_proxy without configuration and applies no idle timeout to an
+# upgraded connection (the server's idle_timeout governs keep-alive between
+# requests, not a live upgrade); flush_interval -1 disables response
+# buffering so no frame waits in the proxy. Caddy still sees client IPs
+# in the moment as any TLS terminator does; with the access log discarded
+# it writes none.
+
+link1.forgesworn.dev {
+	reverse_proxy 127.0.0.1:7443 {
+		flush_interval -1
+	}
+
+	log {
+		output discard
+	}
+}

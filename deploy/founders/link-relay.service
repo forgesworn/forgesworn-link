@@ -1,0 +1,28 @@
+# Installed by the operator, never writable by the deployment key.
+# The forced receiver switches the root-owned current release symlink.
+
+[Unit]
+Description=ForgeSworn Link founders' relay (link-relay)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+CapabilityBoundingSet=
+MemoryMax=256M
+TasksMax=64
+CPUQuota=100%
+Restart=always
+RestartSec=5
+Environment=RUST_LOG=info
+Environment=TOKIO_WORKER_THREADS=2
+ExecStart=/opt/link-relay/current/link-relay --ws-bind 127.0.0.1:7443 --insecure-ws --host link1.forgesworn.dev --udp-bind 0.0.0.0:7450 --bytes-per-second 5000000 --max-sessions 128 --sessions-per-source 16 --reflector-per-second 20
+
+[Install]
+WantedBy=multi-user.target
