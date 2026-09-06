@@ -91,6 +91,57 @@ fn deterministic_bytes(len: usize, seed: u64) -> Vec<u8> {
     out
 }
 
+#[tokio::test]
+async fn relayed_bodies_refuse_extra_bytes_and_a_missing_fin() {
+    init();
+    for finish in [true, false] {
+        let relay = start_relay().await;
+        let url = relay.url("127.0.0.1");
+        let server = Arc::new(start_endpoint(&url).await);
+        let client = Arc::new(start_endpoint(&url).await);
+        let card = card_of(&server);
+        let serving = tokio::spawn(async move {
+            let session = server.accept().await.unwrap();
+            let mut stream = session.accept_stream().await.unwrap();
+            let mut request = [0; 37];
+            stream.recv.read_exact(&mut request).await.unwrap();
+            stream
+                .send
+                .write_all(
+                    &link_blossom::ResponseHeader::Ok {
+                        size: 5,
+                        content_type: None,
+                    }
+                    .encode(),
+                )
+                .await
+                .unwrap();
+            stream
+                .send
+                .write_all(if finish { b"right!" } else { b"right" })
+                .await
+                .unwrap();
+            if finish {
+                stream.send.finish().unwrap();
+            }
+            std::future::pending::<()>().await;
+        });
+        let session = Arc::new(client.connect(&card).await.unwrap());
+        let fetched = fetch_blob_over(&session, Sha256::digest(b"right").into(), Some(5))
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(13),
+            fetched.body.try_collect::<Vec<_>>(),
+        )
+        .await
+        .expect("waiting for the response FIN must be bounded");
+        assert!(matches!(result, Err(FetchError::Stream(_))));
+        serving.abort();
+        relay.shutdown();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fetch_over_link_round_trips_a_5_mib_blob() {
     init();

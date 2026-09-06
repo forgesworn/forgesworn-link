@@ -41,6 +41,11 @@ and its own experimental protocol identifiers. Owner review, application
 integration and the internet-disconnected physical-device journey remain open;
 the frozen relay-first contract is unchanged.
 
+The same opt-in feature in `link-blossom` adds bounded FSLB serving/fetching and
+a read-only Shelter Kit store adapter. Local tests cover signed upload, repair
+and recovery after the original endpoint stops. Native BUD-04 mirroring needs
+the separate Shelter Kit core fix described in the candidate guide.
+
 ## Crates
 
 | Crate | What it holds |

@@ -202,6 +202,81 @@ authentication, not an anonymity claim.
 
 ## Evidence and remaining gates
 
+### Blob transport adapter
+
+`link-blossom` now has an `experimental-lan` feature. Enable its separate
+`shelter-kit` feature for `LanFetcher`, `fetch_blob_over_lan` and
+`ShelterBlobSource`. The existing FSLB request, response and version bytes are
+reused; there is no new blob wire format. This adapter accepts ordinary admitted
+LAN sessions. Provisional pairing sessions cannot be passed to it.
+
+The shared framing work also fixes the existing relayed reader's final-length
+check: after its declared bytes it must receive FIN within ten seconds and
+reject any extra byte. This enforces the existing T6 contract; the regression
+test failed on the previous reader, which silently ignored trailing bytes.
+
+`serve_lan(endpoint, source, limits)` serves at most eight concurrent operations
+across the endpoint. `serve_lan_stream` supports an application which has
+already read the FSLB prefix. The request must finish at exactly 37 bytes before
+the source is consulted. Oversized source declarations fail before a body is
+sent. A source's complete returned length is enforced while streaming.
+
+`LanFetcher` takes a dedicated endpoint and locally selected `LanFetchPeer`
+entries, each containing an existing admission and one literal card address.
+Use one fetcher per dedicated endpoint. It does not discover peers, admit new
+keys or resolve relay hints. One fetch per peer may run at a time; another is
+refused without replacing the active session. Ending or dropping the returned
+body releases that operation. Applications which already hold a session use
+`fetch_blob_over_lan` to share it across streams and retain ownership.
+
+The source is the existing `fsl://<node-id>/<sha256>[.<ext>]` URL, with the
+transport selected by local configuration. The candidate refuses credentials,
+ports, queries, fragments, extra path segments and extensions outside 1–16
+ASCII letters/digits. The URL digest must equal the fetch request's digest.
+Unknown peers and impossible expected sizes fail before any socket send.
+
+Headers and bodies share one operation deadline. Defaults are one GiB per blob
+and five minutes per operation; explicit limits permit up to eight GiB and one
+hour. Body chunks are at most 64 KiB. Successful completion requires the exact
+length, FIN and requested SHA-256, so a peer cannot supply an oversized,
+truncated, corrupt or permanently unfinished response. The storage core still
+independently checks every byte and owns authorisation, quota and atomic commit.
+The native path is recorded as `FetchPath::Direct`; loopback test topology must
+remain attached to that evidence.
+
+`ShelterBlobSource` reads an existing store without creating claims, changing
+retention or updating verification time. At most eight local file/database
+operations or open bodies hold permits. Blocking operations retain their permit
+even if the async caller is cancelled. File reads use 64-KiB buffers; no complete
+blob is loaded. The transport emits no identifier logs, while a product must
+still account for the storage core's logging policy.
+
+The ordinary test suite exercises a signed BUD-02 upload streamed from LAN into
+a second disk store, source recording after verification, deliberate loss and
+repair, and recovery from the reopened replica after the original endpoint
+stops. This is local-process core integration, not daemon, device or installer
+acceptance.
+
+Shelter Kit v0.4.1, still pinned by this branch, rejects native sources in
+`PUT /mirror` even though joint contract T6 specifies them. The separate
+Shelter Kit 0.4.2 candidate restores that path with authorisation and HTTP(S)
+validation preserved. Its combined BUD-04 test is explicitly ignored on the
+older pinned dependency. To run it against that candidate in a disposable
+checkout, supply its absolute path as a local Cargo patch:
+
+```sh
+cargo --config 'patch."https://github.com/forgesworn/shelter-kit".shelter-kit.path="/absolute/path/to/shelter-kit"' \
+  test -p link-blossom --all-features --test native_lan \
+  native_bud04_mirror_and_repair_keep_authorisation_and_recover_after_original_loss -- --ignored
+```
+
+Record both exact source commits. The patch is local validation only; it is not
+a published dependency or a change to Bothy's manifests. The ordinary
+dependency pin must move to an available reviewed release before a product
+claims native BUD-04 support.
+
+### Transport and product gates
+
 Run `cargo test --workspace --all-features`, the all-target/all-feature Clippy
 check, and formatting checks. `native_lan.rs` covers fresh mutual admission,
 5 MiB + 31 bytes streamed with an exact digest, unknown clients, a real TLS
@@ -217,7 +292,8 @@ transferring, and verifies that the server itself enforces the absolute
 and traffic. They do not prove physical LAN operation or a Bothy claim journey.
 
 Remaining requirements include the agreed local offer and signer flow, exact
-owner review, app and Node/FSLB/Blossom integration, application authorisation,
+owner review, daemon/app wiring and the reviewed native-mirror core release,
+complete application authorisation,
 cancelled/interrupted product transactions, hostile-peer review, cross-platform
 and physical phone/Linux tests, and independent acquisition and recovery with
 ForgeSworn endpoints blocked. The internet-disconnected two-device journey and

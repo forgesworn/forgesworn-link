@@ -17,9 +17,13 @@
 //!   implements `shelter_kit::BlobFetcher` so a node can register it as one more
 //!   transport lane behind the Blossom router's mirror policy.
 
+mod exchange;
 pub mod server;
 pub mod source;
 pub mod wire;
+
+#[cfg(feature = "experimental-lan")]
+pub mod lan;
 
 #[cfg(feature = "shelter-kit")]
 pub mod client;

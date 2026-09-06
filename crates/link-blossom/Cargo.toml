@@ -15,6 +15,7 @@ futures-util = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+sha2 = { workspace = true }
 tracing = { workspace = true }
 shelter-kit = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
@@ -24,8 +25,15 @@ url = { workspace = true, optional = true }
 # feature.  The base crate carries the wire codec and the serving side, and does
 # not force a shelter-kit dependency on a node that only wants to serve.
 shelter-kit = ["dep:shelter-kit", "dep:url"]
+experimental-lan = ["link-endpoint/experimental-lan"]
 
 [dev-dependencies]
+axum = "0.8.9"
+base64 = { workspace = true }
+http-body-util = "0.1"
+nostr = { version = "0.45.3", features = ["os-rng"] }
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
 link-relay = { path = "../link-relay" }
 rustls = { workspace = true }
 serde_json = { workspace = true }

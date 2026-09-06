@@ -6,13 +6,11 @@
 
 use std::sync::Arc;
 
-use futures_util::StreamExt;
 use link_core::path::FailReason;
 use link_endpoint::{Endpoint, Session, Stream};
 use tracing::{debug, warn};
 
-use crate::source::{BlobBytes, BlobSource};
-use crate::wire::{CHUNK, REQUEST_LEN, Request, ResponseHeader, WireError};
+use crate::source::BlobSource;
 
 /// Accept sessions on `endpoint` and answer blob requests from `source`.
 ///
@@ -69,78 +67,7 @@ pub async fn serve_stream<S: BlobSource>(
     source: &S,
     preread: &[u8],
 ) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        preread.len() <= REQUEST_LEN,
-        "preread longer than the fixed request"
-    );
-    let mut request = [0u8; REQUEST_LEN];
-    request[..preread.len()].copy_from_slice(preread);
-    stream
-        .recv
-        .read_exact(&mut request[preread.len()..])
-        .await?;
-    let request = match Request::decode(&request) {
-        Ok(request) => request,
-        Err(WireError::BadVersion(version)) => {
-            // A future-version request gets a defined answer on the wire, not a
-            // silent stream reset, so a newer peer can tell "too new" from
-            // "broken".  Bad magic stays a reset: that is garbage, not a version.
-            stream
-                .send
-                .write_all(&ResponseHeader::UnsupportedVersion.encode())
-                .await?;
-            stream.send.finish()?;
-            debug!(
-                version,
-                "link-blossom refused an unsupported request version"
-            );
-            return Ok(());
-        }
-        Err(error) => return Err(error.into()),
-    };
-    let sha256 = hex::encode(request.sha256);
-
-    match source.get(&sha256).await {
-        Some(blob) => send_blob(&mut stream, blob).await,
-        None => {
-            stream
-                .send
-                .write_all(&ResponseHeader::NotFound.encode())
-                .await?;
-            stream.send.finish()?;
-            Ok(())
-        }
-    }
-}
-
-/// Write the ok header then stream the body in bounded pieces, enforcing the
-/// exact declared length.  If the body errors or does not deliver exactly `size`
-/// bytes the send stream is dropped without a clean finish, which resets it so
-/// the client sees a truncated transfer rather than a silent short blob.
-async fn send_blob(stream: &mut Stream, blob: BlobBytes) -> anyhow::Result<()> {
-    let size = blob.size;
-    let header = ResponseHeader::Ok {
-        size,
-        content_type: blob.content_type,
-    };
-    stream.send.write_all(&header.encode()).await?;
-
-    let mut body = blob.body;
-    let mut sent: u64 = 0;
-    while let Some(chunk) = body.next().await {
-        let chunk = chunk?;
-        for part in chunk.chunks(CHUNK) {
-            sent += part.len() as u64;
-            if sent > size {
-                anyhow::bail!("blob source produced more than the declared {size} bytes");
-            }
-            stream.send.write_all(part).await?;
-        }
-    }
-    anyhow::ensure!(
-        sent == size,
-        "blob source produced {sent} of the declared {size} bytes"
-    );
+    crate::exchange::serve(&mut stream, source, preread, None, false).await?;
     stream.send.finish()?;
     Ok(())
 }

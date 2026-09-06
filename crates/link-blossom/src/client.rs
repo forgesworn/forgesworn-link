@@ -29,7 +29,7 @@ use link_endpoint::{Endpoint, PathStatus, Session, Stream};
 use shelter_kit::{BlobFetcher, FetchError, FetchPath, FetchRequest, FetchedBlob};
 use url::Url;
 
-use crate::wire::{CHUNK, MAX_CONTENT_TYPE, Request, ResponseHeader, STATUS_OK};
+use crate::wire::{CHUNK, Request, ResponseHeader};
 
 /// Resolve a node id to a current address card.
 ///
@@ -208,7 +208,7 @@ async fn open_blob_stream(
 /// A non-`fsl` scheme is [`FetchError::UnsupportedSource`], so a dispatcher can
 /// try the next fetcher.  A structurally broken `fsl` source is
 /// [`FetchError::Unreachable`]: the scheme is ours, but nothing can be reached.
-fn parse_fsl_source(source: &Url) -> Result<(NodeId, [u8; 32]), FetchError> {
+pub(crate) fn parse_fsl_source(source: &Url) -> Result<(NodeId, [u8; 32]), FetchError> {
     if source.scheme() != "fsl" {
         return Err(FetchError::UnsupportedSource);
     }
@@ -250,46 +250,8 @@ fn parse_fsl_source(source: &Url) -> Result<(NodeId, [u8; 32]), FetchError> {
 /// before its bytes so exactly the right amount is taken, then the whole header
 /// is handed to the codec to decode, keeping one parser for both directions.
 async fn read_response(stream: &mut Stream) -> Result<ResponseHeader, FetchError> {
-    let mut status = [0u8; 1];
-    stream
-        .recv
-        .read_exact(&mut status)
+    crate::exchange::read_response(stream)
         .await
-        .map_err(|error| FetchError::Unreachable(format!("no link response header: {error}")))?;
-
-    if status[0] != STATUS_OK {
-        return ResponseHeader::decode(&status)
-            .map(|(header, _)| header)
-            .map_err(|error| {
-                FetchError::Unreachable(format!("bad link response header: {error}"))
-            });
-    }
-
-    let mut fixed = [0u8; 10];
-    stream.recv.read_exact(&mut fixed).await.map_err(|error| {
-        FetchError::Unreachable(format!("truncated link response header: {error}"))
-    })?;
-    let content_len = u16::from_be_bytes([fixed[8], fixed[9]]) as usize;
-    if content_len > MAX_CONTENT_TYPE {
-        return Err(FetchError::Unreachable(format!(
-            "content-type length {content_len} exceeds {MAX_CONTENT_TYPE}"
-        )));
-    }
-    let mut content_type = vec![0u8; content_len];
-    if content_len > 0 {
-        stream
-            .recv
-            .read_exact(&mut content_type)
-            .await
-            .map_err(|error| FetchError::Unreachable(format!("truncated content-type: {error}")))?;
-    }
-
-    let mut header = Vec::with_capacity(1 + fixed.len() + content_len);
-    header.extend_from_slice(&status);
-    header.extend_from_slice(&fixed);
-    header.extend_from_slice(&content_type);
-    ResponseHeader::decode(&header)
-        .map(|(header, _)| header)
         .map_err(|error| FetchError::Unreachable(format!("bad link response header: {error}")))
 }
 
@@ -343,8 +305,25 @@ fn link_body(
             return None;
         }
         if state.remaining == 0 {
+            // T6 requires the declared bytes AND their FIN. Ignoring trailing
+            // bytes would accept a malformed FSLB response; waiting forever
+            // for FIN would retain a storage reservation for a stalled peer.
+            let end = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                state.stream.recv.read_chunk(1, true),
+            )
+            .await;
             state.session.finish().await;
-            return None;
+            if matches!(end, Ok(Ok(None))) {
+                return None;
+            }
+            state.errored = true;
+            return Some((
+                Err(FetchError::Stream(
+                    "link body exceeded its size or ended without a clean FIN".into(),
+                )),
+                state,
+            ));
         }
         let want = state.remaining.min(CHUNK as u64) as usize;
         let mut buffer = vec![0u8; want];
