@@ -4,6 +4,9 @@
 //! WebSocket relay and a direct UDP address proved with signed probes.
 
 pub mod endpoint;
+/// Separate native LAN candidate; not part of the frozen relay contract.
+#[cfg(feature = "experimental-lan")]
+pub mod lan;
 pub mod netmon;
 pub mod path_socket;
 pub mod relay_client;

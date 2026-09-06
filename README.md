@@ -34,6 +34,13 @@ with no stall, flat memory across a four-times-larger transfer, and zero
 plaintext in two captures of a deliberately unencrypted relay hop.  What is still not proven
 is listed under [What this does NOT prove](#what-this-does-not-prove).
 
+The separate [native LAN candidate](docs/NATIVE-LAN-CANDIDATE.md), behind
+`link-endpoint`'s opt-in `experimental-lan` feature, uses locally supplied cards
+and addresses without relay bootstrap. It has local-process acceptance tests
+and its own experimental protocol identifiers. Owner review, application
+integration and the internet-disconnected physical-device journey remain open;
+the frozen relay-first contract is unchanged.
+
 ## Crates
 
 | Crate | What it holds |

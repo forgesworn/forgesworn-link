@@ -6,6 +6,10 @@ authors.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+experimental-lan = []
+
 [dependencies]
 link-core = { path = "../link-core" }
 anyhow.workspace = true
