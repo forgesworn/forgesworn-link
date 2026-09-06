@@ -266,9 +266,16 @@ checkout, supply its absolute path as a local Cargo patch:
 
 ```sh
 cargo --config 'patch."https://github.com/forgesworn/shelter-kit".shelter-kit.path="/absolute/path/to/shelter-kit"' \
+  update -p shelter-kit
+cargo --config 'patch."https://github.com/forgesworn/shelter-kit".shelter-kit.path="/absolute/path/to/shelter-kit"' \
   test -p link-blossom --all-features --test native_lan \
   native_bud04_mirror_and_repair_keep_authorisation_and_recover_after_original_loss -- --ignored
 ```
+
+Verify Cargo metadata resolves `shelter-kit` to version 0.4.2 at the supplied
+manifest path before counting the result. An existing lockfile can retain
+0.4.1 and leave the patch unused; that warning invalidates candidate evidence.
+Update the lockfile only in the disposable validation checkout.
 
 Record both exact source commits. The patch is local validation only; it is not
 a published dependency or a change to Bothy's manifests. The ordinary
