@@ -117,13 +117,20 @@ Each hint is `kind: u8`, `length: u16`, `value: length bytes`.
 | `0x01` | relay | UTF-8 `wss://` URL, 1..=255 bytes | Where the node keeps an outbound session.  Several allowed.  No ForgeSworn hostname is mandatory or default in the wire format |
 | `0x02` | udp | 16-byte IPv6 address (IPv4 as `::ffff:a.b.c.d`) followed by `u16` port, exactly 18 bytes | A local or reflected candidate.  **Present only when the owner has opted into direct paths for this card** |
 | `0x03` | onion | 56-byte v3 onion hostname without `.onion`, followed by `u16` port, exactly 58 bytes | Pointer to the independent Tor route for the same node |
+| `0x04` | ephemeral | 33-byte compressed secp256k1 point, first byte `0x02` or `0x03` | Per-card ephemeral for forward-secret rendezvous tags (`docs/RENDEZVOUS.md`).  Present only when the owner opted in |
 
 Unknown kinds are skipped by readers and remain inside the signed bytes.  A
 hint whose `length` disagrees with the fixed size for its kind, or runs past
 the card, fails the whole card.  So does a known kind whose value is not what
-the kind says: a relay hint that is not valid UTF-8 or not a `wss://` URL, an
-onion hint whose host is not 56 base32 characters (`a-z2-7`) or whose port
-is 0.  A reader never hands the application a hint value it has not checked.
+the kind says.  A relay hint must be valid UTF-8 with no byte-order mark, and
+must parse as a URL with scheme `wss`, a host that is a DNS name (`a-z0-9`,
+hyphens, dots) or an IP literal, no username or password, no fragment, no
+comma, and no control, format, separator, surrogate, unassigned or private-use
+character; a port, path and query are allowed.  An onion hint's host must be
+56 base32 characters (`a-z2-7`) and its port non-zero.  An ephemeral hint's
+first byte must be `0x02` or `0x03`.  A reader never hands the application a
+relay or onion value it has not checked; the raw bytes of a `udp` or unknown
+hint are exactly what the owner signed.
 
 ### 2.3 Verification, fail closed
 
@@ -137,12 +144,16 @@ in this order and reports the first that fails:
    wrong `length`, a relay hint is empty or longer than 255 bytes, or the
    hints do not end exactly at `len - 64`;
 4. the signature does not verify under `node_id` over the domain-prefixed
-   body.  Verification is strict RFC 8032, not ZIP-215: a non-canonical point
-   or scalar encoding fails, and a `node_id` of small order (any point in the
-   torsion subgroup, the identity included) fails this rule before the
-   signature is examined, because under such a key one fixed signature
-   verifies for every message.  Every implementation must agree on this so
-   that two verifiers never reach different verdicts on the same bytes;
+   body.  Verification is what libsodium and ed25519-dalek's `verify_strict`
+   do, not ZIP-215 and not the cofactored check: `A` (the node id) and `R`
+   (the first 32 signature bytes) must decode canonically, neither may be of
+   small order (any point in the torsion subgroup, the identity included),
+   `S` must be below the group order, and the equation checked is the
+   cofactorless `[S]B = R + [k]A` with `k = SHA-512(R || A || DOMAIN || body)
+   mod L`.  A cofactored verifier would accept a node id or nonce point
+   carrying a torsion component that a strict one refuses, and two verifiers
+   would then disagree on the same bytes.  Every implementation must agree on
+   this so that no such disagreement is possible;
 5. `issued_at > now + 300`;
 6. `expires_at <= now`;
 7. `expires_at <= issued_at` or `expires_at - issued_at > 604800`;
