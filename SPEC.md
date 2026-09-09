@@ -120,7 +120,10 @@ Each hint is `kind: u8`, `length: u16`, `value: length bytes`.
 
 Unknown kinds are skipped by readers and remain inside the signed bytes.  A
 hint whose `length` disagrees with the fixed size for its kind, or runs past
-the card, fails the whole card.
+the card, fails the whole card.  So does a known kind whose value is not what
+the kind says: a relay hint that is not valid UTF-8 or not a `wss://` URL, an
+onion hint whose host is not 56 base32 characters (`a-z2-7`) or whose port
+is 0.  A reader never hands the application a hint value it has not checked.
 
 ### 2.3 Verification, fail closed
 
@@ -133,11 +136,19 @@ in this order and reports the first that fails:
 3. `hint_count > 16`, a hint runs past `len - 64`, a fixed-size kind has the
    wrong `length`, a relay hint is empty or longer than 255 bytes, or the
    hints do not end exactly at `len - 64`;
-4. the signature does not verify under `node_id` over the domain-prefixed body;
+4. the signature does not verify under `node_id` over the domain-prefixed
+   body.  Verification is strict RFC 8032, not ZIP-215: a non-canonical point
+   or scalar encoding fails, and a `node_id` of small order (any point in the
+   torsion subgroup, the identity included) fails this rule before the
+   signature is examined, because under such a key one fixed signature
+   verifies for every message.  Every implementation must agree on this so
+   that two verifiers never reach different verdicts on the same bytes;
 5. `issued_at > now + 300`;
 6. `expires_at <= now`;
 7. `expires_at <= issued_at` or `expires_at - issued_at > 604800`;
-8. `serial <= highest_seen(node_id)` (a stale or replayed card);
+8. `serial <= highest_seen(node_id)` (a stale or replayed card).  A verifier
+   compares serials exactly as 64-bit integers; one that cannot (a JavaScript
+   `Number` above 2^53) refuses the card under rule 3 rather than rounding;
 9. the node ID is not the one the verifier was told to expect, when it was
    told to expect one.
 
