@@ -1,0 +1,26 @@
+[package]
+name = "link-ffi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "link_ffi"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+required-features = ["uniffi/cli"]
+
+[dependencies]
+link-core = { path = "../link-core" }
+link-endpoint = { path = "../link-endpoint" }
+link-websocket = { path = "../link-websocket" }
+thiserror.workspace = true
+tokio.workspace = true
+uniffi.workspace = true
+url.workspace = true
+zeroize.workspace = true

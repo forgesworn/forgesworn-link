@@ -4,6 +4,8 @@ members = [
     "crates/link-core",
     "crates/link-relay",
     "crates/link-endpoint",
+    "crates/link-websocket",
+    "crates/link-ffi",
     "crates/link-spike",
     "crates/link-blossom",
 ]
@@ -43,4 +45,5 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 tokio-tungstenite = "0.24"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uniffi = "0.29"
 zeroize = "1"

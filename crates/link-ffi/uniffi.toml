@@ -1,0 +1,4 @@
+[bindings.kotlin]
+package_name = "dev.forgesworn.link.ffi"
+cdylib_name = "link_ffi"
+android = true
