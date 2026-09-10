@@ -31,7 +31,10 @@ The records passed to `LinkEngine.start` are:
 - `LinkConfig`: 32-byte transport seed, relay URLs, direct-path consent and a
   list of routes;
 - `LinkRoute`: opaque product `route_id`, verified card bytes, 32-byte paired
-  route secret and the retained card serial;
+  route secret, retained card serial and the time that card was accepted;
+- `LinkPairingBundle`: route id, server card, the QR's 16 raw pairing-secret
+  bytes and its absolute expiry. The pairing secret is zeroised after Link
+  registers the bounded provisional route and is never retained;
 - `LinkPath`: status, route name and any public socket address already present
   in Link's `PathReport`; it contains no rendezvous material.
 
@@ -39,6 +42,7 @@ The object surface is:
 
 ```text
 LinkEngine.start(config)
+LinkEngine.pair_route(bundle) -> LinkRoute
 LinkEngine.open_socket(virtual_url, route_id, listener) -> LinkSocket
 LinkEngine.upsert_route(route)
 LinkEngine.remove_route(route_id)
@@ -54,15 +58,25 @@ LinkSocketListener.on_text(text)
 LinkSocketListener.on_closed(reason)
 ```
 
-`start` re-verifies every persisted card's signature, expected node, lifetime
-and exact recorded serial without treating that same persisted card as a new
-arrival. A live `upsert_route` requires a strictly greater serial than the
-route already holds. Start always supplies `Some(paired_routes)`, including an
-empty map, so later route additions remain in tag mode. It zeroises decoded
-route material after ownership passes to Link. `upsert_route` validates before
-replacing the route and updates the endpoint's `TagBook`; `remove_route`
-removes the tag first, closes that route's cached session and then drops the
-record. Kotlin persists encrypted route state; Link never writes it.
+`start` re-verifies every persisted card's signature, expected node and exact
+recorded serial at the retained acceptance time, without treating that same
+persisted identity pin as a new arrival. The card's advertisement expiry does
+not revoke an enrolled route. A live `upsert_route` requires a strictly greater
+serial than the route already holds. Start always supplies
+`Some(paired_routes)`, including an empty map, so later route additions remain
+in tag mode. It zeroises decoded route material after ownership passes to Link.
+
+`pair_route` verifies and pins the QR's server card, opens Link's one-stream
+provisional session, sends the caller's signed card to `PUT /events/route`,
+checks the returned server card against the same node, derives the shared TLS
+exporter route and closes the provisional session only after reading the whole
+bounded response. It installs the route in the live `TagBook` and returns the
+exact `LinkRoute` Kotlin must commit to its encrypted vault. Retrying the same
+route may replace its exporter while retaining the same server card serial.
+`upsert_route` validates before replacing the route and updates the endpoint's
+`TagBook`; `remove_route` removes the tag first, closes that route's cached
+session and then drops the record. Kotlin persists encrypted route state; Link
+never writes it.
 
 ## Session manager
 
@@ -93,3 +107,5 @@ The implementation is finished when tests prove:
 8. UniFFI bindings generate, JVM callback tests pass, and
    `aarch64-linux-android` builds;
 9. the existing macOS, Ubuntu and Windows workspace checks remain green.
+10. provisional route enrolment and same-capability retry produce exporter
+    secrets that agree at both ends, and the retry replaces the live route.

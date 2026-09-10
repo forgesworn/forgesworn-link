@@ -19,8 +19,17 @@ required-features = ["uniffi/cli"]
 link-core = { path = "../link-core" }
 link-endpoint = { path = "../link-endpoint" }
 link-websocket = { path = "../link-websocket" }
+bytes.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+hex.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 uniffi.workspace = true
 url.workspace = true
 zeroize.workspace = true
+
+[dev-dependencies]
+link-relay = { path = "../link-relay" }
+rustls.workspace = true
