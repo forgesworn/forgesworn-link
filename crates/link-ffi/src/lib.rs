@@ -5,13 +5,18 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use bytes::{Bytes, BytesMut};
+use http_body_util::{BodyExt as _, Full};
+use hyper::{Method, Request, StatusCode};
+use hyper_util::rt::TokioIo;
+use link_core::card::{MAX_CARD_BYTES, MAX_LIFETIME_SECONDS};
 use link_core::{Card, NodeId, TransportKey, VerifyContext};
 use link_endpoint::{Endpoint, EndpointConfig, RelaySpec, Session};
 use link_websocket::{IncomingMessage, Socket};
 use thiserror::Error;
 use tokio::runtime::Runtime;
 use url::Url;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize as _, Zeroizing};
 
 uniffi::setup_scaffolding!();
 
@@ -22,12 +27,49 @@ pub struct LinkConfig {
     pub allow_direct: bool,
     pub routes: Vec<LinkRoute>,
 }
-#[derive(uniffi::Record, Clone, Debug)]
+#[derive(uniffi::Record, Clone)]
 pub struct LinkRoute {
     pub route_id: String,
     pub card: Vec<u8>,
     pub paired_route_secret: Vec<u8>,
     pub card_serial: u64,
+    /// Unix second at which the signed card was accepted. Persisted cards are
+    /// re-verified at this time because they pin the enrolled identity; their
+    /// advertisement expiry does not revoke an established route.
+    pub card_verified_at: u64,
+}
+impl std::fmt::Debug for LinkRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LinkRoute")
+            .field("route_id", &self.route_id)
+            .field("card", &format_args!("{} bytes", self.card.len()))
+            .field("paired_route_secret", &"[redacted]")
+            .field("card_serial", &self.card_serial)
+            .field("card_verified_at", &self.card_verified_at)
+            .finish()
+    }
+}
+#[derive(uniffi::Record, Clone)]
+pub struct LinkPairingBundle {
+    pub route_id: String,
+    pub server_card: Vec<u8>,
+    /// The QR's 16 raw capability bytes. It is never retained by this engine.
+    pub pairing_secret: Vec<u8>,
+    /// The QR's absolute Unix-second deadline.
+    pub expires_at: u64,
+}
+impl std::fmt::Debug for LinkPairingBundle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LinkPairingBundle")
+            .field("route_id", &self.route_id)
+            .field(
+                "server_card",
+                &format_args!("{} bytes", self.server_card.len()),
+            )
+            .field("pairing_secret", &"[redacted]")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 #[derive(uniffi::Record, Clone, Debug)]
 pub struct LinkPath {
@@ -91,23 +133,30 @@ fn secret(bytes: &[u8]) -> Result<[u8; 32], LinkError> {
         .try_into()
         .map_err(|_| LinkError::Route("paired route secret must be 32 bytes".into()))
 }
+fn pairing_secret(bytes: &[u8]) -> Result<[u8; 16], LinkError> {
+    bytes
+        .try_into()
+        .map_err(|_| LinkError::Route("pairing secret must be 16 bytes".into()))
+}
+fn node_from_card_bytes(bytes: &[u8]) -> Result<NodeId, LinkError> {
+    bytes
+        .get(5..37)
+        .and_then(NodeId::from_slice)
+        .ok_or_else(|| LinkError::Route("card has no node id".into()))
+}
 /// Persisted cards are re-verified at their retained serial, not treated as new arrivals.
 fn verify_route(route: &LinkRoute) -> Result<(NodeId, Card), LinkError> {
     if route.route_id.is_empty() {
         return Err(LinkError::Route("route id must not be empty".into()));
     }
-    let node = route
-        .card
-        .get(6..38)
-        .and_then(NodeId::from_slice)
-        .ok_or_else(|| LinkError::Route("card has no node id".into()))?;
+    let node = node_from_card_bytes(&route.card)?;
     let previous = route
         .card_serial
         .checked_sub(1)
         .ok_or_else(|| LinkError::Route("card serial must be positive".into()))?;
     let card = Card::verify(
         &route.card,
-        &VerifyContext::new(now_unix())
+        &VerifyContext::new(route.card_verified_at)
             .expecting(node)
             .after_serial(previous),
     )
@@ -118,6 +167,50 @@ fn verify_route(route: &LinkRoute) -> Result<(NodeId, Card), LinkError> {
         ));
     }
     Ok((node, card))
+}
+
+const ROUTE_MAGIC: &[u8; 4] = b"EVR1";
+const ROUTE_PREFIX_BYTES: usize = ROUTE_MAGIC.len() + 2;
+const MAX_ROUTE_FRAME_BYTES: usize = ROUTE_PREFIX_BYTES + MAX_CARD_BYTES;
+
+fn route_frame(card: &[u8]) -> Vec<u8> {
+    let length = u16::try_from(card.len()).expect("Link cards fit in u16");
+    let mut frame = Vec::with_capacity(ROUTE_PREFIX_BYTES + card.len());
+    frame.extend_from_slice(ROUTE_MAGIC);
+    frame.extend_from_slice(&length.to_be_bytes());
+    frame.extend_from_slice(card);
+    frame
+}
+
+fn route_card(frame: &[u8]) -> Result<&[u8], LinkError> {
+    if frame.len() < ROUTE_PREFIX_BYTES || &frame[..4] != ROUTE_MAGIC {
+        return Err(LinkError::Route(
+            "server returned a malformed route frame".into(),
+        ));
+    }
+    let length = usize::from(u16::from_be_bytes([frame[4], frame[5]]));
+    if length > MAX_CARD_BYTES || frame.len() != ROUTE_PREFIX_BYTES + length {
+        return Err(LinkError::Route(
+            "server returned a malformed route frame".into(),
+        ));
+    }
+    Ok(&frame[ROUTE_PREFIX_BYTES..])
+}
+
+async fn collect_bounded(mut body: hyper::body::Incoming) -> Result<Bytes, LinkError> {
+    let mut bytes = BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|error| LinkError::Transport(error.to_string()))?;
+        if let Ok(data) = frame.into_data() {
+            if bytes.len().saturating_add(data.len()) > MAX_ROUTE_FRAME_BYTES {
+                return Err(LinkError::Route(
+                    "server route response is too large".into(),
+                ));
+            }
+            bytes.extend_from_slice(&data);
+        }
+    }
+    Ok(bytes.freeze())
 }
 fn path(session: &Session) -> LinkPath {
     let report = session.path();
@@ -234,6 +327,161 @@ impl LinkEngine {
             }
         });
         Ok(Arc::new(LinkSocket { socket, session }))
+    }
+
+    /// Enrol one durable event route over Link's quarantined provisional
+    /// session, install it in the running engine, and return the exact record
+    /// the Kotlin vault must commit atomically.
+    pub fn pair_route(&self, mut bundle: LinkPairingBundle) -> Result<LinkRoute, LinkError> {
+        if bundle.route_id.is_empty() {
+            return Err(LinkError::Route("route id must not be empty".into()));
+        }
+        let now = now_unix();
+        let lifetime = bundle
+            .expires_at
+            .checked_sub(now)
+            .filter(|seconds| *seconds > 0)
+            .map(Duration::from_secs)
+            .ok_or_else(|| LinkError::Route("pairing bundle is expired".into()))?;
+        let raw_pairing = Zeroizing::new(pairing_secret(&bundle.pairing_secret)?);
+        bundle.pairing_secret.zeroize();
+        let server_node = node_from_card_bytes(&bundle.server_card)?;
+        let offered_card = Card::verify(
+            &bundle.server_card,
+            &VerifyContext::new(now).expecting(server_node),
+        )
+        .map_err(|error| LinkError::Route(error.to_string()))?;
+        let endpoint = {
+            let inner = self.inner.lock().expect("engine lock");
+            if inner.stopped {
+                return Err(LinkError::Stopped);
+            }
+            if inner
+                .routes
+                .get(&bundle.route_id)
+                .is_some_and(|existing| existing.node != server_node)
+            {
+                return Err(LinkError::Route(
+                    "route id is already bound to another node".into(),
+                ));
+            }
+            inner.endpoint.clone()
+        };
+
+        let registration = endpoint
+            .register_pairing_secret(*raw_pairing, lifetime)
+            .map_err(|error| LinkError::Route(error.to_string()))?;
+        let caller_card = endpoint.card(Duration::from_secs(MAX_LIFETIME_SECONDS), Vec::new());
+        let request_body = route_frame(caller_card.as_bytes());
+        let secret_header = hex::encode(raw_pairing.as_ref());
+
+        let paired = self.runtime.block_on(async {
+            let session = endpoint
+                .connect_pairing(&offered_card, &registration)
+                .await
+                .map_err(|error| LinkError::Transport(error.to_string()))?;
+            let result = async {
+                let route_secret = session
+                    .paired_route_secret()
+                    .map_err(|error| LinkError::Route(error.to_string()))?;
+                let stream = session
+                    .open_stream()
+                    .await
+                    .map_err(|error| LinkError::Transport(error.to_string()))?;
+                let (mut sender, connection) =
+                    hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                        .await
+                        .map_err(|error| LinkError::Transport(error.to_string()))?;
+                tokio::spawn(async move {
+                    let _ = connection.await;
+                });
+                let request = Request::builder()
+                    .method(Method::PUT)
+                    .uri("/events/route")
+                    .header(hyper::header::HOST, server_node.to_base32())
+                    .header(hyper::header::CONTENT_TYPE, "application/octet-stream")
+                    .header("x-bothy-pairing-secret", secret_header)
+                    .body(Full::new(Bytes::from(request_body)))
+                    .map_err(|error| LinkError::Route(error.to_string()))?;
+                let response = sender
+                    .send_request(request)
+                    .await
+                    .map_err(|error| LinkError::Transport(error.to_string()))?;
+                if response.status() != StatusCode::OK {
+                    return Err(LinkError::Route(format!(
+                        "server refused route enrolment with {}",
+                        response.status()
+                    )));
+                }
+                let answer = collect_bounded(response.into_body()).await?;
+                let response_card_bytes = route_card(&answer)?.to_vec();
+                let response_verified_at = now_unix();
+                let response_card = Card::verify(
+                    &response_card_bytes,
+                    &VerifyContext::new(response_verified_at).expecting(server_node),
+                )
+                .map_err(|error| LinkError::Route(error.to_string()))?;
+                if response_card.serial < offered_card.serial {
+                    return Err(LinkError::Route(
+                        "server returned an older card than the pairing bundle".into(),
+                    ));
+                }
+                Ok((response_card, route_secret, response_verified_at))
+            }
+            .await;
+            session.close().await;
+            result
+        })?;
+
+        let route = LinkRoute {
+            route_id: bundle.route_id,
+            card: paired.0.as_bytes().to_vec(),
+            paired_route_secret: paired.1.to_vec(),
+            card_serial: paired.0.serial,
+            card_verified_at: paired.2,
+        };
+        let previous_session = {
+            let mut inner = self.inner.lock().expect("engine lock");
+            if inner.stopped {
+                return Err(LinkError::Stopped);
+            }
+            let prior = inner
+                .routes
+                .get(&route.route_id)
+                .map(|existing| {
+                    if existing.node != paired.0.node_id {
+                        return Err(LinkError::Route(
+                            "route id is already bound to another node".into(),
+                        ));
+                    }
+                    if route.card_serial < existing.serial {
+                        return Err(LinkError::Route(
+                            "server card serial moved backwards".into(),
+                        ));
+                    }
+                    Ok(existing.session.clone())
+                })
+                .transpose()?;
+            inner
+                .endpoint
+                .rendezvous_book()
+                .expect("tag mode")
+                .upsert_paired(paired.0.node_id, secret(&route.paired_route_secret)?);
+            inner.routes.insert(
+                route.route_id.clone(),
+                RouteState {
+                    node: paired.0.node_id,
+                    serial: route.card_serial,
+                    card: paired.0,
+                    session: None,
+                },
+            );
+            prior.flatten()
+        };
+        if let Some(session) = previous_session {
+            self.runtime.block_on(session.close(1));
+        }
+        Ok(route)
     }
 
     pub fn upsert_route(&self, route: LinkRoute) -> Result<(), LinkError> {
@@ -361,6 +609,8 @@ impl LinkSocket {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use link_endpoint::AcceptedSession;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     #[test]
     fn starts_in_tag_mode_with_no_routes() {
@@ -378,5 +628,217 @@ mod tests {
     fn route_secret_is_exactly_32_bytes() {
         assert!(secret(&[0; 31]).is_err());
         assert!(secret(&[0; 32]).is_ok());
+    }
+
+    #[test]
+    fn persisted_route_reverifies_at_its_acceptance_time() {
+        let key = TransportKey::generate();
+        let card = Card::sign(&key, 100, 200, 7, Vec::new());
+        let route = LinkRoute {
+            route_id: "durable".into(),
+            card: card.as_bytes().to_vec(),
+            paired_route_secret: vec![0x25; 32],
+            card_serial: 7,
+            card_verified_at: 150,
+        };
+        let (node, verified) = verify_route(&route).expect("persisted identity pin");
+        assert_eq!(node, key.node_id());
+        assert_eq!(verified, card);
+    }
+
+    #[test]
+    fn route_and_pairing_debug_never_print_secrets() {
+        let route = LinkRoute {
+            route_id: "room".into(),
+            card: vec![1, 2],
+            paired_route_secret: vec![0x7b; 32],
+            card_serial: 1,
+            card_verified_at: 2,
+        };
+        let bundle = LinkPairingBundle {
+            route_id: "room".into(),
+            server_card: vec![3, 4],
+            pairing_secret: vec![0x6a; 16],
+            expires_at: 3,
+        };
+        assert!(!format!("{route:?}").contains(&"7b".repeat(32)));
+        assert!(!format!("{bundle:?}").contains(&"6a".repeat(16)));
+    }
+
+    #[test]
+    fn pair_route_refuses_a_conflicting_node_before_dialling() {
+        let now = now_unix();
+        let existing_key = TransportKey::generate();
+        let existing_card = Card::sign(&existing_key, now, now + 600, 1, Vec::new());
+        let engine = LinkEngine::start(LinkConfig {
+            transport_seed: vec![0x19; 32],
+            relay_urls: Vec::new(),
+            allow_direct: false,
+            routes: vec![LinkRoute {
+                route_id: "circle-main".into(),
+                card: existing_card.as_bytes().to_vec(),
+                paired_route_secret: vec![0x28; 32],
+                card_serial: 1,
+                card_verified_at: now,
+            }],
+        })
+        .expect("engine");
+        let other_key = TransportKey::generate();
+        let other_card = Card::sign(&other_key, now, now + 600, 1, Vec::new());
+
+        let error = engine
+            .pair_route(LinkPairingBundle {
+                route_id: "circle-main".into(),
+                server_card: other_card.as_bytes().to_vec(),
+                pairing_secret: vec![0x39; 16],
+                expires_at: now + 600,
+            })
+            .expect_err("a route id cannot move to another node");
+        assert_eq!(
+            error.to_string(),
+            "route: route id is already bound to another node"
+        );
+        engine.stop();
+    }
+
+    async fn serve_route_once(
+        endpoint: Arc<Endpoint>,
+        server_card: Card,
+        expected_secret: String,
+    ) -> [u8; 32] {
+        let session = match endpoint.accept_any().await.expect("pairing arrives") {
+            AcceptedSession::Pairing(session) => session,
+            AcceptedSession::Pinned(_) => panic!("route enrolment must be provisional"),
+        };
+        let exporter = session
+            .paired_route_secret()
+            .expect("server exporter secret");
+        let mut stream = session.accept_stream().await.expect("one route request");
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let byte = stream.read_u8().await.expect("request head");
+            head.push(byte);
+            assert!(head.len() < 8 * 1024, "request head is bounded");
+        }
+        let head_text = std::str::from_utf8(&head).expect("ASCII request head");
+        assert!(head_text.starts_with("PUT /events/route HTTP/1.1\r\n"));
+        assert!(
+            head_text
+                .to_ascii_lowercase()
+                .contains(&format!("x-bothy-pairing-secret: {}\r\n", expected_secret))
+        );
+        let content_length = head_text
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length: ")
+                    .and_then(|value| value.parse::<usize>().ok())
+            })
+            .expect("content length");
+        let mut body = vec![0; content_length];
+        stream.read_exact(&mut body).await.expect("request body");
+        let caller_card = Card::verify(
+            route_card(&body).expect("caller card frame"),
+            &VerifyContext::new(now_unix()).expecting(session.peer()),
+        )
+        .expect("caller card matches provisional key");
+        assert_eq!(caller_card.node_id, session.peer());
+
+        let response = route_frame(server_card.as_bytes());
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            response.len()
+        );
+        stream
+            .write_all(head.as_bytes())
+            .await
+            .expect("response head");
+        stream.write_all(&response).await.expect("response body");
+        stream.shutdown().await.expect("finish response");
+        let secret = *exporter;
+        let _ = session.closed().await;
+        secret
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pair_route_exchanges_and_replaces_the_tls_exporter() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let relay = link_relay::start(link_relay::RelayConfig {
+            ws_bind: "127.0.0.1:0".parse().expect("ws bind"),
+            udp_bind: "127.0.0.1:0".parse().expect("udp bind"),
+            hosts: vec!["127.0.0.1".into()],
+            tls: None,
+            bytes_per_second: 0,
+            max_sessions: 16,
+            max_sessions_per_source: 0,
+            reflector_per_second: 100.0,
+        })
+        .await
+        .expect("relay");
+        let relay_url = relay.url("127.0.0.1");
+        let mut server_config = EndpointConfig::new(TransportKey::generate());
+        server_config.relays = vec![RelaySpec::plain(&relay_url)];
+        server_config.allow_direct = false;
+        server_config.bind = "127.0.0.1:0".parse().expect("server bind");
+        server_config.rendezvous = Some(HashMap::new());
+        let server = Arc::new(Endpoint::open(server_config).await.expect("server"));
+        let server_card = server.card(Duration::from_secs(600), Vec::new());
+        let raw_pairing = [0x4d; 16];
+        let _server_registration = server
+            .register_pairing_secret(raw_pairing, Duration::from_secs(600))
+            .expect("server registration");
+        let engine = tokio::task::spawn_blocking({
+            let relay_url = relay_url.clone();
+            move || {
+                LinkEngine::start(LinkConfig {
+                    transport_seed: vec![0x35; 32],
+                    relay_urls: vec![relay_url],
+                    allow_direct: false,
+                    routes: Vec::new(),
+                })
+                .expect("engine")
+            }
+        })
+        .await
+        .expect("engine task");
+
+        let pair_once = |server: Arc<Endpoint>, card: Card, engine: Arc<LinkEngine>| async move {
+            let expected = hex::encode(raw_pairing);
+            let serving = tokio::spawn(serve_route_once(server, card.clone(), expected));
+            let route = tokio::task::spawn_blocking(move || {
+                engine.pair_route(LinkPairingBundle {
+                    route_id: "circle-main".into(),
+                    server_card: card.as_bytes().to_vec(),
+                    pairing_secret: raw_pairing.to_vec(),
+                    expires_at: now_unix() + 600,
+                })
+            })
+            .await
+            .expect("pair task")
+            .expect("pair route");
+            let server_secret = serving.await.expect("server task");
+            (route, server_secret)
+        };
+
+        let (first, server_first) =
+            pair_once(server.clone(), server_card.clone(), engine.clone()).await;
+        assert_eq!(first.paired_route_secret, server_first);
+        assert_eq!(first.card, server_card.as_bytes());
+        let (second, server_second) = pair_once(server.clone(), server_card, engine.clone()).await;
+        assert_eq!(second.paired_route_secret, server_second);
+        assert_ne!(first.paired_route_secret, second.paired_route_secret);
+        assert!(
+            engine
+                .inner
+                .lock()
+                .expect("engine")
+                .routes
+                .contains_key("circle-main"),
+            "the returned route is also installed in the live engine",
+        );
+        engine.stop();
+        tokio::task::spawn_blocking(move || drop(engine))
+            .await
+            .expect("engine drop");
     }
 }

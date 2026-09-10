@@ -21,6 +21,9 @@ publish = false
 anyhow = "1"
 base64 = "0.22"
 bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }

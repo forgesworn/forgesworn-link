@@ -1419,9 +1419,16 @@ dependencies = [
 name = "link-ffi"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "link-core",
  "link-endpoint",
+ "link-relay",
  "link-websocket",
+ "rustls",
  "thiserror 2.0.20",
  "tokio",
  "uniffi",
