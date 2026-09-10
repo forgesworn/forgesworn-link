@@ -14,7 +14,8 @@ use std::sync::{Arc, Mutex, Weak};
 
 use link_core::id::NodeId;
 use link_core::rendezvous::{
-    PAIRING_SECRET_BYTES, Tag, TagCase, derive_pairing_tag, derive_tag, epoch_index,
+    PAIRED_ROUTE_SECRET_BYTES, PAIRING_SECRET_BYTES, Tag, TagCase, derive_paired_route_tag,
+    derive_pairing_tag, derive_tag, epoch_index,
 };
 use rand::RngCore;
 use tokio::sync::watch;
@@ -37,6 +38,10 @@ pub struct TagBook {
     /// Short-lived first-contact routes.  Their random local route IDs are
     /// never sent on the relay wire and are not authenticated identities.
     pairing: Mutex<HashMap<NodeId, PairingRoute>>,
+    /// Durable, product-authorised paired routes.  Unlike `pairing`, these do
+    /// not admit first contact and remain usable only while the product keeps
+    /// their secret in its own encrypted state.
+    paired: Mutex<HashMap<NodeId, Zeroizing<[u8; PAIRED_ROUTE_SECRET_BYTES]>>>,
     /// Bumped on every change, so the relay pump re-registers within its next
     /// refresh tick instead of waiting for the epoch to turn.
     version: AtomicU64,
@@ -136,10 +141,18 @@ const SEND_CACHE_CAP: usize = 4096;
 
 impl TagBook {
     pub fn new(peers: HashMap<NodeId, RendezvousPeer>) -> Self {
+        Self::with_paired(peers, HashMap::new())
+    }
+
+    pub fn with_paired(
+        peers: HashMap<NodeId, RendezvousPeer>,
+        paired: HashMap<NodeId, Zeroizing<[u8; PAIRED_ROUTE_SECRET_BYTES]>>,
+    ) -> Self {
         let (changes, _) = watch::channel(0);
         TagBook {
             peers: Mutex::new(peers),
             pairing: Mutex::new(HashMap::new()),
+            paired: Mutex::new(paired),
             version: AtomicU64::new(0),
             changes,
             send_cache: Mutex::new(SendCache::default()),
@@ -165,6 +178,30 @@ impl TagBook {
         self.bump();
     }
 
+    /// Install a durable route only after the product has authenticated and
+    /// accepted the peer's pairing request.  This material supplies relay
+    /// reachability alone; it is never a Nostr or product credential.
+    pub fn upsert_paired(&self, peer: NodeId, secret: [u8; PAIRED_ROUTE_SECRET_BYTES]) {
+        self.paired
+            .lock()
+            .expect("paired book")
+            .insert(peer, Zeroizing::new(secret));
+        self.bump();
+    }
+
+    /// Remove and zeroise one durable paired route.
+    pub fn remove_paired(&self, peer: NodeId) {
+        if self
+            .paired
+            .lock()
+            .expect("paired book")
+            .remove(&peer)
+            .is_some()
+        {
+            self.bump();
+        }
+    }
+
     /// Add one short-lived first-contact route.  The returned random node-shaped
     /// value is only a local synthetic routing key; it is never a claimed peer
     /// identity.  The secret is zeroised on removal or expiry.
@@ -179,7 +216,11 @@ impl TagBook {
             let candidate = NodeId(bytes);
             let peers = self.peers.lock().expect("book");
             let pairing = self.pairing.lock().expect("pairing book");
-            if !peers.contains_key(&candidate) && !pairing.contains_key(&candidate) {
+            let paired = self.paired.lock().expect("paired book");
+            if !peers.contains_key(&candidate)
+                && !pairing.contains_key(&candidate)
+                && !paired.contains_key(&candidate)
+            {
                 break candidate;
             }
         };
@@ -334,6 +375,7 @@ impl TagBook {
     pub fn is_empty(&self) -> bool {
         self.peers.lock().expect("book").is_empty()
             && self.pairing.lock().expect("pairing book").is_empty()
+            && self.paired.lock().expect("paired book").is_empty()
     }
 
     /// Whether this book can derive an outbound rendezvous tag for `peer`.
@@ -341,6 +383,12 @@ impl TagBook {
     /// pairing cannot become a silent wait for a relay welcome.
     pub fn contains(&self, peer: NodeId) -> bool {
         self.peers.lock().expect("book").contains_key(&peer)
+            || self
+                .pairing
+                .lock()
+                .expect("pairing book")
+                .contains_key(&peer)
+            || self.paired.lock().expect("paired book").contains_key(&peer)
     }
 
     fn window(&self, now_unix: u64) -> Vec<u64> {
@@ -358,7 +406,9 @@ impl TagBook {
         let peers = self.peers.lock().expect("book");
         let epochs = self.window(now_unix);
         let pairing = self.pairing.lock().expect("pairing book");
-        let mut tags = Vec::with_capacity((peers.len() + pairing.len()) * epochs.len());
+        let paired = self.paired.lock().expect("paired book");
+        let mut tags =
+            Vec::with_capacity((peers.len() + pairing.len() + paired.len()) * epochs.len());
         for material in peers.values() {
             for epoch in &epochs {
                 tags.push(derive_tag(
@@ -380,6 +430,11 @@ impl TagBook {
                 for epoch in &epochs {
                     tags.push(derive_pairing_tag(&live.secret, relay_host, *epoch));
                 }
+            }
+        }
+        for secret in paired.values() {
+            for epoch in &epochs {
+                tags.push(derive_paired_route_tag(secret, relay_host, *epoch));
             }
         }
         tags
@@ -422,6 +477,13 @@ impl TagBook {
                             .map(|live| derive_pairing_tag(&live.secret, relay_host, epoch))
                     })
             })
+        } {
+            tag
+        } else if let Some(tag) = {
+            let paired = self.paired.lock().expect("paired book");
+            paired
+                .get(&peer)
+                .map(|secret| derive_paired_route_tag(secret, relay_host, epoch))
         } {
             tag
         } else {
@@ -475,6 +537,15 @@ impl TagBook {
                 });
                 if admission_matches || live_matches {
                     return Some(*route_id);
+                }
+            }
+        }
+        drop(pairing);
+        let paired = self.paired.lock().expect("paired book");
+        for (peer, secret) in paired.iter() {
+            for epoch in &epochs {
+                if derive_paired_route_tag(secret, relay_host, *epoch) == *tag {
+                    return Some(*peer);
                 }
             }
         }
@@ -563,6 +634,32 @@ mod tests {
         assert!(book.contains(peer));
         book.remove(peer);
         assert!(!book.contains(peer));
+    }
+
+    #[test]
+    fn durable_paired_route_registers_reconnects_and_is_removed_explicitly() {
+        let peer = node(6);
+        let now = 1_793_588_888;
+        let host = "relay.example.org";
+        let book = TagBook::new(HashMap::new());
+        let secret = [0x6a; PAIRED_ROUTE_SECRET_BYTES];
+
+        book.upsert_paired(peer, secret);
+        assert!(book.contains(peer));
+        assert_eq!(book.registration(host, now).len(), 3);
+        let tag = book
+            .tag_for_send(peer, host, now)
+            .expect("paired route sends");
+        assert_eq!(book.resolve(&tag, host, now), Some(peer));
+        assert_ne!(
+            tag,
+            book.tag_for_send(peer, "other.example.org", now).unwrap()
+        );
+
+        book.remove_paired(peer);
+        assert!(!book.contains(peer));
+        assert!(book.registration(host, now).is_empty());
+        assert_eq!(book.resolve(&tag, host, now), None);
     }
 
     #[test]

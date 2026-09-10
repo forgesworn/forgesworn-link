@@ -4,8 +4,8 @@
 use std::path::PathBuf;
 
 use link_core::rendezvous::{
-    EPOCH_SECONDS, TAG_BYTES, TagCase, derive_pairing_tag, derive_tag, ecdh_x, epoch_index,
-    valid_compressed_point,
+    EPOCH_SECONDS, PAIRED_ROUTE_SECRET_BYTES, TAG_BYTES, TagCase, derive_paired_route_tag,
+    derive_pairing_tag, derive_tag, ecdh_x, epoch_index, valid_compressed_point,
 };
 use serde_json::Value;
 
@@ -128,6 +128,30 @@ fn pairing_secret_case_reproduces_the_independent_node_vector() {
         tag,
         derive_pairing_tag(&secret, "relay.example.org", 498_217)
     );
+}
+
+#[test]
+fn paired_route_case_reproduces_the_independent_node_vector() {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vectors/paired-rendezvous.json");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let v: Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("cannot parse {}: {e}", path.display()));
+    let secret: [u8; PAIRED_ROUTE_SECRET_BYTES] =
+        hex::decode(v["pairedRouteSecretHex"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+    let host = v["relayHost"].as_str().unwrap();
+    let epoch = v["epochIndex"].as_u64().unwrap();
+    let tag = derive_paired_route_tag(&secret, host, epoch);
+    assert_eq!(hex::encode(tag.0), v["tagHex"].as_str().unwrap());
+    assert_ne!(
+        tag,
+        derive_paired_route_tag(&secret, "relay2.example.net", epoch)
+    );
+    assert_ne!(tag, derive_paired_route_tag(&secret, host, epoch + 1));
 }
 
 #[test]
