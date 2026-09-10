@@ -23,6 +23,12 @@ pub const TAG_BYTES: usize = 16;
 pub const PAIRING_SECRET_BYTES: usize = 16;
 /// Domain separator for a pairing-secret rendezvous tag.
 pub const PAIRING_CASE: u8 = 0x03;
+/// A durable paired-route secret is exported from a completed provisional TLS
+/// session. It is transport reachability material, never a Nostr key or the
+/// one-time pairing admission secret.
+pub const PAIRED_ROUTE_SECRET_BYTES: usize = 32;
+/// Domain separator for a durable paired-route rendezvous tag.
+pub const PAIRED_ROUTE_CASE: u8 = 0x04;
 
 /// Which ephemeral mix the pair used.  Leads the ikm as a domain separator so
 /// the three modes can never be cross-interpreted.
@@ -114,6 +120,24 @@ pub fn derive_pairing_tag(
     let mut ikm = Zeroizing::new([0u8; 1 + PAIRING_SECRET_BYTES]);
     ikm[0] = PAIRING_CASE;
     ikm[1..].copy_from_slice(pairing_secret);
+    derive_from_ikm(&ikm[..], relay_host, epoch)
+}
+
+/// A durable tag for a pair that completed the explicit provisional pairing
+/// ceremony. The secret comes from the pinned TLS exporter, is retained by the
+/// product only after its own request succeeds, and names no Nostr identity.
+///
+/// ```text
+/// ikm = 0x04 || paired_route_secret // 33 bytes
+/// ```
+pub fn derive_paired_route_tag(
+    secret: &[u8; PAIRED_ROUTE_SECRET_BYTES],
+    relay_host: &str,
+    epoch: u64,
+) -> Tag {
+    let mut ikm = Zeroizing::new([0u8; 1 + PAIRED_ROUTE_SECRET_BYTES]);
+    ikm[0] = PAIRED_ROUTE_CASE;
+    ikm[1..].copy_from_slice(secret);
     derive_from_ikm(&ikm[..], relay_host, epoch)
 }
 

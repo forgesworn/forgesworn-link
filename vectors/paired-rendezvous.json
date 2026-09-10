@@ -1,0 +1,11 @@
+{
+  "format": "forgesworn-link-paired-route-known-answer-v1",
+  "status": "ratified for implementation: docs/PAIRED-RENDEZVOUS.md",
+  "saltUtf8": "forgesworn-link/rendezvous/v1",
+  "caseByte": 4,
+  "ikm": "0x04 || paired_route_secret (33 bytes)",
+  "pairedRouteSecretHex": "d1db8192f894a9187c20af2a75d660aa98c3f066b8b1b402230c1660e1f265c6",
+  "relayHost": "relay.example.org",
+  "epochIndex": 498216,
+  "tagHex": "7be1113706b578a7f65f608e018877e3"
+}

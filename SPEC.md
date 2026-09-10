@@ -530,3 +530,9 @@ The pairing-secret case `0x03` is deliberately specified separately at
 owners ratified the exact normative text at commit `e69c3cd` on 2026-08-31;
 implementation is therefore authorised, while final acceptance and freeze
 remain gated by that document's §5 evidence.
+
+The paired-route case `0x04` is separately ratified for implementation in
+[`docs/PAIRED-RENDEZVOUS.md`](docs/PAIRED-RENDEZVOUS.md). It derives durable
+tag-mode reachability from a completed, pinned provisional TLS session without
+requiring a product to export a Nostr ECDH secret. It cannot admit a new
+provisional session and does not grant product authority.

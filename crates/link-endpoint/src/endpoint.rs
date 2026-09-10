@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use link_core::card::{Card, Hint};
 use link_core::id::{NodeId, TransportKey, node_id_from_spki};
 use link_core::path::FailReason;
-use link_core::rendezvous::PAIRING_SECRET_BYTES;
+use link_core::rendezvous::{PAIRED_ROUTE_SECRET_BYTES, PAIRING_SECRET_BYTES};
 use link_core::tls::{
     PinnedClientVerifier, PinnedServerVerifier, ProvisionalClientVerifier, RefusingClientVerifier,
     node_identity,
@@ -36,6 +36,9 @@ const PAIRING_ALPN: &[u8] = b"fsl-pair/0";
 /// case-0x03 tag, while dropping the QR registration can no longer strand the
 /// connection's final packets.
 const PAIRING_ROUTE_EXPORT_LABEL: &[u8] = b"EXPORTER-FSL-pair-route-v1";
+/// Exported only after a provisional handshake.  The product stores this in
+/// its encrypted paired state after its own request authentication succeeds.
+const PAIRED_ROUTE_EXPORT_LABEL: &[u8] = b"EXPORTER-FSL-paired-route-v1";
 static NEXT_PAIRING_ROUTE_GENERATION: AtomicU64 = AtomicU64::new(1);
 /// Pairing secrets are product-level ten-minute capabilities, never a general
 /// anonymous-listener mode.
@@ -53,6 +56,8 @@ pub enum PairingError {
     TagModeRequired,
     #[error("pairing registration lifetime must be between 1s and 600s")]
     Lifetime,
+    #[error("the provisional session could not export paired-route material")]
+    RouteExport,
 }
 
 /// What one unified accept loop received.  A provisional session has a
@@ -117,6 +122,21 @@ impl PairingSession {
         self.session.peer()
     }
 
+    /// Derive the stable paired-route secret from this completed provisional
+    /// TLS connection.  Calling this does not install or retain it in Link:
+    /// the product must first authenticate its pairing request, persist the
+    /// secret under its own authority, then explicitly install it at startup.
+    pub fn paired_route_secret(
+        &self,
+    ) -> Result<zeroize::Zeroizing<[u8; PAIRED_ROUTE_SECRET_BYTES]>, PairingError> {
+        let mut secret = [0u8; PAIRED_ROUTE_SECRET_BYTES];
+        self.session
+            .connection()
+            .export_keying_material(&mut secret, PAIRED_ROUTE_EXPORT_LABEL, b"")
+            .map_err(|_| PairingError::RouteExport)?;
+        Ok(zeroize::Zeroizing::new(secret))
+    }
+
     fn take_application_stream(&self) -> anyhow::Result<()> {
         if self.application_stream_used.swap(true, Ordering::SeqCst) {
             anyhow::bail!("a pairing session exposes exactly one application stream");
@@ -156,7 +176,7 @@ impl PairingSession {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct EndpointConfig {
     pub key: TransportKey,
     /// Highest card serial this transport key has already signed.  The shell
@@ -190,6 +210,11 @@ pub struct EndpointConfig {
     /// mode.  The shell computes the material from the pair's cards and Nostr
     /// keys; the transport never touches Nostr.
     pub rendezvous: Option<HashMap<NodeId, RendezvousPeer>>,
+    /// Product-authorised durable reachability routes derived from an accepted
+    /// provisional pairing, keyed by the peer's current Link node ID.  Either
+    /// tag material field enables tag mode. Link takes these zeroising values
+    /// while opening and never writes product state itself.
+    pub paired_routes: Option<HashMap<NodeId, zeroize::Zeroizing<[u8; PAIRED_ROUTE_SECRET_BYTES]>>>,
 }
 
 impl EndpointConfig {
@@ -205,6 +230,7 @@ impl EndpointConfig {
             probe_delay: Duration::ZERO,
             rendezvous_timeout: Duration::from_secs(30),
             rendezvous: None,
+            paired_routes: None,
         }
     }
 }
@@ -222,15 +248,17 @@ pub struct Endpoint {
 
 impl Endpoint {
     /// Bind the sockets and start the relay driver.  Does not wait for a relay.
-    pub async fn open(config: EndpointConfig) -> anyhow::Result<Endpoint> {
+    pub async fn open(mut config: EndpointConfig) -> anyhow::Result<Endpoint> {
         anyhow::ensure!(
             config.serial_seed != Some(u64::MAX),
             "card serial seed is exhausted"
         );
-        let book = config
-            .rendezvous
-            .clone()
-            .map(|peers| Arc::new(TagBook::new(peers)));
+        let book = (config.rendezvous.is_some() || config.paired_routes.is_some()).then(|| {
+            Arc::new(TagBook::with_paired(
+                config.rendezvous.take().unwrap_or_default(),
+                config.paired_routes.take().unwrap_or_default(),
+            ))
+        });
         let net = NetMonitor::spawn(config.net_poll, interface_snapshot);
         let (socket, paths) = build(
             config.key.clone(),

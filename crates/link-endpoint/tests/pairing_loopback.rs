@@ -92,6 +92,22 @@ async fn two_nodes_meet_from_the_pairing_secret_alone() {
     assert_eq!(&response, b"ok");
     serving.await.expect("server task");
 
+    // The application has now authenticated and accepted its own pairing
+    // request. It may derive the durable reachability secret, bind it to the
+    // card node IDs it accepted, and install it explicitly. Link itself has
+    // neither product authority nor persistent product state.
+    let keeper_route = keeper.paired_route_secret().expect("keeper route secret");
+    let box_route = box_session.paired_route_secret().expect("box route secret");
+    assert_eq!(&*keeper_route, &*box_route, "TLS exporter agrees");
+    keeper_endpoint
+        .rendezvous_book()
+        .expect("tag book")
+        .upsert_paired(box_card.node_id, *keeper_route);
+    box_endpoint
+        .rendezvous_book()
+        .expect("tag book")
+        .upsert_paired(keeper_endpoint.node_id(), *box_route);
+
     assert!(
         keeper.open_stream().await.is_err(),
         "a provisional connection exposes no second application stream"
@@ -111,6 +127,51 @@ async fn two_nodes_meet_from_the_pairing_secret_alone() {
         .await
         .expect("the listener observes the close after admission is removed");
     drop(box_registration);
+
+    // No QR registration remains. A normal card-pinned reconnect now uses
+    // only the separately installed case-0x04 paired route.
+    let accepting = {
+        let endpoint = box_endpoint.clone();
+        tokio::spawn(async move { endpoint.accept().await.expect("ordinary accept") })
+    };
+    let ordinary = keeper_endpoint
+        .connect(&box_card)
+        .await
+        .expect("ordinary paired-route reconnect");
+    let accepted = accepting.await.expect("ordinary accept task");
+    let serving = tokio::spawn(async move {
+        let mut stream = accepted.accept_stream().await.expect("ordinary stream");
+        let mut request = [0u8; 7];
+        stream
+            .read_exact(&mut request)
+            .await
+            .expect("ordinary bytes");
+        assert_eq!(&request, b"rebound");
+        stream.write_all(b"ok").await.expect("ordinary response");
+        stream.shutdown().await.expect("ordinary finish");
+    });
+    let mut stream = ordinary.open_stream().await.expect("ordinary stream");
+    stream
+        .write_all(b"rebound")
+        .await
+        .expect("ordinary request");
+    stream.shutdown().await.expect("ordinary finish");
+    let mut response = [0u8; 2];
+    stream
+        .read_exact(&mut response)
+        .await
+        .expect("ordinary response");
+    assert_eq!(&response, b"ok");
+    serving.await.expect("ordinary server task");
+    ordinary.close(0).await;
+    keeper_endpoint
+        .rendezvous_book()
+        .expect("tag book")
+        .remove_paired(box_card.node_id);
+    box_endpoint
+        .rendezvous_book()
+        .expect("tag book")
+        .remove_paired(keeper_endpoint.node_id());
     relay.shutdown();
 }
 
