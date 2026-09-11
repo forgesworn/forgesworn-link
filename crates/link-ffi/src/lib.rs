@@ -267,6 +267,10 @@ impl LinkEngine {
         let mut endpoint_config = EndpointConfig::new(TransportKey::from_seed(seed));
         endpoint_config.relays = config.relay_urls.iter().map(RelaySpec::plain).collect();
         endpoint_config.allow_direct = config.allow_direct;
+        // Mobile DNS, TLS and WebSocket setup can be delayed by Android's
+        // process and network scheduling. Give it the relay driver's existing
+        // reconnect window before declaring first contact unavailable.
+        endpoint_config.rendezvous_timeout = Duration::from_secs(60);
         // Always tag mode, including the empty case: no identity registration on later upsert.
         endpoint_config.paired_routes = Some(paired_routes);
         endpoint_config.net_poll = Duration::ZERO;
