@@ -11,7 +11,7 @@ use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use link_core::card::{MAX_CARD_BYTES, MAX_LIFETIME_SECONDS};
 use link_core::{Card, NodeId, TransportKey, VerifyContext};
-use link_endpoint::{Endpoint, EndpointConfig, RelaySpec, Session};
+use link_endpoint::{Endpoint, EndpointConfig, MAX_PAIRING_LIFETIME, RelaySpec, Session};
 use link_websocket::{IncomingMessage, Socket};
 use thiserror::Error;
 use tokio::runtime::Runtime;
@@ -137,6 +137,21 @@ fn pairing_secret(bytes: &[u8]) -> Result<[u8; 16], LinkError> {
     bytes
         .try_into()
         .map_err(|_| LinkError::Route("pairing secret must be 16 bytes".into()))
+}
+const PAIRING_CLOCK_SKEW: Duration = Duration::from_secs(60);
+
+fn pairing_lifetime(expires_at: u64, now: u64) -> Result<Duration, LinkError> {
+    let remaining = expires_at
+        .checked_sub(now)
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .ok_or_else(|| LinkError::Route("pairing bundle is expired".into()))?;
+    if remaining > MAX_PAIRING_LIFETIME + PAIRING_CLOCK_SKEW {
+        return Err(LinkError::Route(
+            "pairing bundle lifetime is too long".into(),
+        ));
+    }
+    Ok(remaining.min(MAX_PAIRING_LIFETIME))
 }
 fn node_from_card_bytes(bytes: &[u8]) -> Result<NodeId, LinkError> {
     bytes
@@ -337,12 +352,7 @@ impl LinkEngine {
             return Err(LinkError::Route("route id must not be empty".into()));
         }
         let now = now_unix();
-        let lifetime = bundle
-            .expires_at
-            .checked_sub(now)
-            .filter(|seconds| *seconds > 0)
-            .map(Duration::from_secs)
-            .ok_or_else(|| LinkError::Route("pairing bundle is expired".into()))?;
+        let lifetime = pairing_lifetime(bundle.expires_at, now)?;
         let raw_pairing = Zeroizing::new(pairing_secret(&bundle.pairing_secret)?);
         bundle.pairing_secret.zeroize();
         let server_node = node_from_card_bytes(&bundle.server_card)?;
@@ -636,6 +646,16 @@ mod tests {
     fn route_secret_is_exactly_32_bytes() {
         assert!(secret(&[0; 31]).is_err());
         assert!(secret(&[0; 32]).is_ok());
+    }
+
+    #[test]
+    fn pairing_lifetime_tolerates_bounded_clock_skew_without_extending_admission() {
+        assert_eq!(
+            pairing_lifetime(1_601, 1_000).expect("one second of skew is accepted"),
+            MAX_PAIRING_LIFETIME,
+        );
+        assert!(pairing_lifetime(1_000, 1_000).is_err());
+        assert!(pairing_lifetime(1_661, 1_000).is_err());
     }
 
     #[test]
