@@ -40,6 +40,19 @@ async fn two_nodes_meet_from_the_pairing_secret_alone() {
     let box_card = exchange_card(&box_endpoint);
     let secret = [0x5a; 16];
 
+    // Match a live Bothy: its endpoint is already registered and connected
+    // before a person asks it to show a fresh pairing code.
+    let warm_registration = box_endpoint
+        .register_pairing_secret([0x44; 16], Duration::from_secs(600))
+        .expect("warm registration");
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        box_endpoint.paths().relay().home().wait_up(),
+    )
+    .await
+    .expect("box relay connects before the QR tag is added")
+    .expect("box relay is up");
+
     // Neither ordinary book knows the other node.  Normal connect therefore
     // fails visibly; only the bounded pairing API may use case 0x03.
     let box_registration = box_endpoint
@@ -127,6 +140,7 @@ async fn two_nodes_meet_from_the_pairing_secret_alone() {
         .await
         .expect("the listener observes the close after admission is removed");
     drop(box_registration);
+    drop(warm_registration);
 
     // No QR registration remains. A normal card-pinned reconnect now uses
     // only the separately installed case-0x04 paired route.

@@ -498,6 +498,12 @@ async fn driver(
             continue;
         }
         let spec = relays[index % relays.len()].clone();
+        // Subscribe before taking the registration snapshot in `connect`.
+        // Otherwise a tag added after the initial Register but before `pump`
+        // subscribes becomes the receiver's already-seen value and is never
+        // sent to this live relay session.
+        let (_idle_changes, idle_rx) = watch::channel(0u64);
+        let book_changes = book.as_deref().map(TagBook::subscribe).unwrap_or(idle_rx);
         let attempt = tokio::time::timeout(CONNECT_TIMEOUT, connect(&key, &spec, book.as_deref()))
             .await
             .map_err(anyhow::Error::from)
@@ -521,6 +527,7 @@ async fn driver(
                     &readiness,
                     book.as_deref(),
                     &host,
+                    book_changes,
                 )
                 .await;
                 match end {
@@ -668,6 +675,7 @@ async fn pump(
     readiness: &WriteReadiness,
     book: Option<&TagBook>,
     host: &str,
+    mut book_changes: watch::Receiver<u64>,
 ) -> PumpEnd {
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -678,11 +686,6 @@ async fn pump(
     refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_epoch = link_core::rendezvous::epoch_index(now_unix());
     let mut last_version = book.map(TagBook::version).unwrap_or(0);
-    // A dummy sender keeps identity mode's receiver pending forever.  Tag
-    // mode replaces it with the book's broadcast state, so removals reach
-    // every relay driver immediately, including an empty replacement set.
-    let (_idle_changes, idle_rx) = watch::channel(0u64);
-    let mut book_changes = book.map(TagBook::subscribe).unwrap_or(idle_rx);
     let mut nonce = [0u8; 8];
     loop {
         tokio::select! {
