@@ -393,7 +393,10 @@ impl LinkEngine {
             let session = endpoint
                 .connect_pairing(&offered_card, &registration)
                 .await
-                .map_err(|error| LinkError::Transport(error.to_string()))?;
+                .map_err(|error| {
+                    let activity = endpoint.pairing_relay_activity(&registration);
+                    LinkError::Transport(format!("{error}; {activity}"))
+                })?;
             let result = async {
                 let route_secret = session
                     .paired_route_secret()

@@ -170,7 +170,50 @@ pub struct RelayDriver {
     /// The lowercase host of the relay the session is on, memoised against
     /// its URL, so a tag-mode datagram costs no URL parse.
     host_memo: Arc<Mutex<Option<(String, String)>>>,
+    activity: Arc<RelayActivity>,
     stop: watch::Sender<bool>,
+}
+
+#[derive(Default)]
+struct RelayActivity {
+    registrations_sent: AtomicU64,
+    tag_datagrams_sent: AtomicU64,
+    tag_datagrams_received: AtomicU64,
+    tag_datagrams_resolved: AtomicU64,
+}
+
+/// Aggregate transport activity for one relay driver. It deliberately carries
+/// no node IDs, rendezvous tags, relay tokens, or application payloads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RelayActivitySnapshot {
+    pub registrations_sent: u64,
+    pub tag_datagrams_sent: u64,
+    pub tag_datagrams_received: u64,
+    pub tag_datagrams_resolved: u64,
+}
+
+impl std::fmt::Display for RelayActivitySnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "relay activity: registrations={}, tag_sent={}, tag_received={}, tag_resolved={}",
+            self.registrations_sent,
+            self.tag_datagrams_sent,
+            self.tag_datagrams_received,
+            self.tag_datagrams_resolved
+        )
+    }
+}
+
+impl RelayActivity {
+    fn snapshot(&self) -> RelayActivitySnapshot {
+        RelayActivitySnapshot {
+            registrations_sent: self.registrations_sent.load(Ordering::Relaxed),
+            tag_datagrams_sent: self.tag_datagrams_sent.load(Ordering::Relaxed),
+            tag_datagrams_received: self.tag_datagrams_received.load(Ordering::Relaxed),
+            tag_datagrams_resolved: self.tag_datagrams_resolved.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// At most this many drivers beyond the home driver; past it a peer's hints
@@ -342,6 +385,10 @@ impl RelayDriver {
         self.status.borrow().clone()
     }
 
+    pub fn activity(&self) -> RelayActivitySnapshot {
+        self.activity.snapshot()
+    }
+
     pub fn watch(&self) -> watch::Receiver<RelayStatus> {
         self.status.clone()
     }
@@ -412,6 +459,7 @@ fn spawn_driver(
     let (status_tx, status_rx) = watch::channel(RelayStatus::Connecting);
     let (events_tx, _) = broadcast::channel(EVENT_CAPACITY);
     let (stop_tx, mut stop_rx) = watch::channel(false);
+    let activity = Arc::new(RelayActivity::default());
     let urls: Vec<String> = relays.iter().map(|spec| spec.url.clone()).collect();
     let work = driver(
         id,
@@ -423,6 +471,7 @@ fn spawn_driver(
         events_tx.clone(),
         readiness.clone(),
         book.clone(),
+        activity.clone(),
     );
     let stopped_events = events_tx.clone();
     let stopped_readiness = readiness.clone();
@@ -445,6 +494,7 @@ fn spawn_driver(
         readiness,
         book,
         host_memo: Arc::new(Mutex::new(None)),
+        activity,
         stop: stop_tx,
     }
 }
@@ -474,6 +524,7 @@ async fn driver(
     events: broadcast::Sender<RelayStatus>,
     readiness: Arc<WriteReadiness>,
     book: Option<Arc<TagBook>>,
+    activity: Arc<RelayActivity>,
 ) {
     if relays.is_empty() {
         set_status(&status, &events, RelayStatus::Failed);
@@ -504,10 +555,13 @@ async fn driver(
         // sent to this live relay session.
         let (_idle_changes, idle_rx) = watch::channel(0u64);
         let book_changes = book.as_deref().map(TagBook::subscribe).unwrap_or(idle_rx);
-        let attempt = tokio::time::timeout(CONNECT_TIMEOUT, connect(&key, &spec, book.as_deref()))
-            .await
-            .map_err(anyhow::Error::from)
-            .and_then(|result| result);
+        let attempt = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            connect(&key, &spec, book.as_deref(), &activity),
+        )
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result);
         match attempt {
             Ok(ws) => {
                 backoff = BACKOFF_MIN;
@@ -528,6 +582,7 @@ async fn driver(
                     book.as_deref(),
                     &host,
                     book_changes,
+                    &activity,
                 )
                 .await;
                 match end {
@@ -602,6 +657,7 @@ async fn connect(
     key: &TransportKey,
     spec: &RelaySpec,
     book: Option<&TagBook>,
+    activity: &RelayActivity,
 ) -> anyhow::Result<Socket> {
     let (tls, host, port, path) = spec.parts()?;
     let stream = tokio::time::timeout(
@@ -648,6 +704,7 @@ async fn connect(
             }
             ws.send(Message::Binary(Frame::Register { tags }.encode()))
                 .await?;
+            activity.registrations_sent.fetch_add(1, Ordering::Relaxed);
         }
     }
     match next_frame(&mut ws).await? {
@@ -677,6 +734,7 @@ async fn pump(
     book: Option<&TagBook>,
     host: &str,
     mut book_changes: watch::Receiver<u64>,
+    activity: &RelayActivity,
 ) -> PumpEnd {
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -707,6 +765,7 @@ async fn pump(
                     if ws.send(Message::Binary(Frame::Register { tags }.encode())).await.is_err() {
                         return PumpEnd::Lost;
                     }
+                    activity.registrations_sent.fetch_add(1, Ordering::Relaxed);
                 }
             }
             changed = book_changes.changed(), if book.is_some() => {
@@ -720,11 +779,16 @@ async fn pump(
                 if ws.send(Message::Binary(Frame::Register { tags }.encode())).await.is_err() {
                     return PumpEnd::Lost;
                 }
+                activity.registrations_sent.fetch_add(1, Ordering::Relaxed);
             }
             frame = outbound.recv() => {
                 let Some(frame) = frame else { return PumpEnd::Lost };
+                let is_tag_datagram = matches!(frame, Frame::SendTag { .. });
                 if ws.send(Message::Binary(frame.encode())).await.is_err() {
                     return PumpEnd::Lost;
+                }
+                if is_tag_datagram {
+                    activity.tag_datagrams_sent.fetch_add(1, Ordering::Relaxed);
                 }
                 // Hysteresis: wake a stalled sender once the queue is half empty.
                 if outbound.capacity() >= MAX_QUEUED_FRAMES / 2 {
@@ -749,10 +813,12 @@ async fn pump(
                         }
                         Some(Frame::RecvTag { tag, datagram }) => {
                             let Some(book) = book else { return PumpEnd::Lost };
+                            activity.tag_datagrams_received.fetch_add(1, Ordering::Relaxed);
                             // Attribute by this endpoint's own book; a tag it
                             // cannot resolve (a stale epoch, a removed pair) is
                             // dropped, which QUIC treats as loss.
                             if let Some(peer) = book.resolve(&tag, host, now_unix()) {
+                                activity.tag_datagrams_resolved.fetch_add(1, Ordering::Relaxed);
                                 let _ = inbound.try_send(RelayInbound {
                                     source: peer,
                                     datagram,
