@@ -791,16 +791,25 @@ mod tests {
         server_config.rendezvous = Some(HashMap::new());
         let server = Arc::new(Endpoint::open(server_config).await.expect("server"));
         let server_card = server.card(Duration::from_secs(600), Vec::new());
+        let _warm_registration = server
+            .register_pairing_secret([0x44; 16], Duration::from_secs(600))
+            .expect("warm server registration");
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            server.paths().relay().home().wait_up(),
+        )
+        .await
+        .expect("server relay connects before the QR tag is added")
+        .expect("server relay is up");
         let raw_pairing = [0x4d; 16];
         let _server_registration = server
             .register_pairing_secret(raw_pairing, Duration::from_secs(600))
             .expect("server registration");
         let engine = tokio::task::spawn_blocking({
-            let relay_url = relay_url.clone();
             move || {
                 LinkEngine::start(LinkConfig {
                     transport_seed: vec![0x35; 32],
-                    relay_urls: vec![relay_url],
+                    relay_urls: Vec::new(),
                     allow_direct: false,
                     routes: Vec::new(),
                 })

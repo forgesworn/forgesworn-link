@@ -14,9 +14,9 @@ use link_endpoint::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-async fn pairing_endpoint(relay: &str) -> Endpoint {
+async fn pairing_endpoint(relay: Option<&str>) -> Endpoint {
     let mut config = EndpointConfig::new(TransportKey::generate());
-    config.relays = vec![RelaySpec::plain(relay)];
+    config.relays = relay.into_iter().map(RelaySpec::plain).collect();
     config.allow_direct = false;
     config.bind = "127.0.0.1:0".parse().unwrap();
     config.rendezvous = Some(HashMap::new());
@@ -35,8 +35,10 @@ async fn two_nodes_meet_from_the_pairing_secret_alone() {
     init_tracing();
     let relay = start_relay().await;
     let url = relay.url("127.0.0.1");
-    let box_endpoint = Arc::new(pairing_endpoint(&url).await);
-    let keeper_endpoint = pairing_endpoint(&url).await;
+    let box_endpoint = Arc::new(pairing_endpoint(Some(&url)).await);
+    // Match the Android bridge: it has no configured home relay and starts a
+    // driver from the Bothy card's relay hint only when pairing begins.
+    let keeper_endpoint = pairing_endpoint(None).await;
     let box_card = exchange_card(&box_endpoint);
     let secret = [0x5a; 16];
 
