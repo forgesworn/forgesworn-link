@@ -56,7 +56,7 @@ LinkEngine.reannounce()
 LinkEngine.stop()
 
 LinkSocket.send_text(text)
-LinkSocket.close()
+LinkSocket.disconnect()
 LinkSocket.path() -> LinkPath
 
 LinkSocketListener.on_open()
@@ -97,6 +97,11 @@ bridge never reconnects a product socket itself.
 The listener receives `on_open` only after the WebSocket 101 response. NIP-42
 application readiness remains KithMoot's next slice, so physical open cannot be
 treated as an authenticated relay there.
+
+`disconnect` closes the application stream. The exported method deliberately
+does not use the name `close`: generated Kotlin reserves `close()` for
+`AutoCloseable` disposal of the native object, and the two methods would have
+identical JVM signatures.
 
 ## Proof
 

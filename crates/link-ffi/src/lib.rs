@@ -596,7 +596,11 @@ impl LinkSocket {
             .send_text(text)
             .map_err(|error| LinkError::Socket(error.to_string()))
     }
-    pub fn close(&self) -> Result<(), LinkError> {
+    /// Close the application stream. This is deliberately not named `close`:
+    /// UniFFI's Kotlin object already implements `AutoCloseable.close()` for
+    /// native-object disposal, and exporting the same name makes the generated
+    /// Android binding uncompilable.
+    pub fn disconnect(&self) -> Result<(), LinkError> {
         self.socket
             .close()
             .map_err(|error| LinkError::Socket(error.to_string()))
