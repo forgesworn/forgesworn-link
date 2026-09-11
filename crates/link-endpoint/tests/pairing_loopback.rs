@@ -14,9 +14,9 @@ use link_endpoint::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-async fn pairing_endpoint(relay: &str) -> Endpoint {
+async fn pairing_endpoint(relay: Option<&str>) -> Endpoint {
     let mut config = EndpointConfig::new(TransportKey::generate());
-    config.relays = vec![RelaySpec::plain(relay)];
+    config.relays = relay.into_iter().map(RelaySpec::plain).collect();
     config.allow_direct = false;
     config.bind = "127.0.0.1:0".parse().unwrap();
     config.rendezvous = Some(HashMap::new());
@@ -35,10 +35,25 @@ async fn two_nodes_meet_from_the_pairing_secret_alone() {
     init_tracing();
     let relay = start_relay().await;
     let url = relay.url("127.0.0.1");
-    let box_endpoint = Arc::new(pairing_endpoint(&url).await);
-    let keeper_endpoint = pairing_endpoint(&url).await;
+    let box_endpoint = Arc::new(pairing_endpoint(Some(&url)).await);
+    // Match the Android bridge: it has no configured home relay and starts a
+    // driver from the Bothy card's relay hint only when pairing begins.
+    let keeper_endpoint = pairing_endpoint(None).await;
     let box_card = exchange_card(&box_endpoint);
     let secret = [0x5a; 16];
+
+    // Match a live Bothy: its endpoint is already registered and connected
+    // before a person asks it to show a fresh pairing code.
+    let warm_registration = box_endpoint
+        .register_pairing_secret([0x44; 16], Duration::from_secs(600))
+        .expect("warm registration");
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        box_endpoint.paths().relay().home().wait_up(),
+    )
+    .await
+    .expect("box relay connects before the QR tag is added")
+    .expect("box relay is up");
 
     // Neither ordinary book knows the other node.  Normal connect therefore
     // fails visibly; only the bounded pairing API may use case 0x03.
@@ -127,6 +142,7 @@ async fn two_nodes_meet_from_the_pairing_secret_alone() {
         .await
         .expect("the listener observes the close after admission is removed");
     drop(box_registration);
+    drop(warm_registration);
 
     // No QR registration remains. A normal card-pinned reconnect now uses
     // only the separately installed case-0x04 paired route.

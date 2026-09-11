@@ -11,7 +11,7 @@ use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use link_core::card::{MAX_CARD_BYTES, MAX_LIFETIME_SECONDS};
 use link_core::{Card, NodeId, TransportKey, VerifyContext};
-use link_endpoint::{Endpoint, EndpointConfig, RelaySpec, Session};
+use link_endpoint::{Endpoint, EndpointConfig, MAX_PAIRING_LIFETIME, RelaySpec, Session};
 use link_websocket::{IncomingMessage, Socket};
 use thiserror::Error;
 use tokio::runtime::Runtime;
@@ -138,6 +138,21 @@ fn pairing_secret(bytes: &[u8]) -> Result<[u8; 16], LinkError> {
         .try_into()
         .map_err(|_| LinkError::Route("pairing secret must be 16 bytes".into()))
 }
+const PAIRING_CLOCK_SKEW: Duration = Duration::from_secs(60);
+
+fn pairing_lifetime(expires_at: u64, now: u64) -> Result<Duration, LinkError> {
+    let remaining = expires_at
+        .checked_sub(now)
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .ok_or_else(|| LinkError::Route("pairing bundle is expired".into()))?;
+    if remaining > MAX_PAIRING_LIFETIME + PAIRING_CLOCK_SKEW {
+        return Err(LinkError::Route(
+            "pairing bundle lifetime is too long".into(),
+        ));
+    }
+    Ok(remaining.min(MAX_PAIRING_LIFETIME))
+}
 fn node_from_card_bytes(bytes: &[u8]) -> Result<NodeId, LinkError> {
     bytes
         .get(5..37)
@@ -252,6 +267,10 @@ impl LinkEngine {
         let mut endpoint_config = EndpointConfig::new(TransportKey::from_seed(seed));
         endpoint_config.relays = config.relay_urls.iter().map(RelaySpec::plain).collect();
         endpoint_config.allow_direct = config.allow_direct;
+        // Mobile DNS, TLS and WebSocket setup can be delayed by Android's
+        // process and network scheduling. Give it the relay driver's existing
+        // reconnect window before declaring first contact unavailable.
+        endpoint_config.rendezvous_timeout = Duration::from_secs(60);
         // Always tag mode, including the empty case: no identity registration on later upsert.
         endpoint_config.paired_routes = Some(paired_routes);
         endpoint_config.net_poll = Duration::ZERO;
@@ -337,12 +356,7 @@ impl LinkEngine {
             return Err(LinkError::Route("route id must not be empty".into()));
         }
         let now = now_unix();
-        let lifetime = bundle
-            .expires_at
-            .checked_sub(now)
-            .filter(|seconds| *seconds > 0)
-            .map(Duration::from_secs)
-            .ok_or_else(|| LinkError::Route("pairing bundle is expired".into()))?;
+        let lifetime = pairing_lifetime(bundle.expires_at, now)?;
         let raw_pairing = Zeroizing::new(pairing_secret(&bundle.pairing_secret)?);
         bundle.pairing_secret.zeroize();
         let server_node = node_from_card_bytes(&bundle.server_card)?;
@@ -383,7 +397,10 @@ impl LinkEngine {
             let session = endpoint
                 .connect_pairing(&offered_card, &registration)
                 .await
-                .map_err(|error| LinkError::Transport(error.to_string()))?;
+                .map_err(|error| {
+                    let activity = endpoint.pairing_relay_activity(&registration);
+                    LinkError::Transport(format!("{error}; {activity}"))
+                })?;
             let result = async {
                 let route_secret = session
                     .paired_route_secret()
@@ -639,6 +656,16 @@ mod tests {
     }
 
     #[test]
+    fn pairing_lifetime_tolerates_bounded_clock_skew_without_extending_admission() {
+        assert_eq!(
+            pairing_lifetime(1_601, 1_000).expect("one second of skew is accepted"),
+            MAX_PAIRING_LIFETIME,
+        );
+        assert!(pairing_lifetime(1_000, 1_000).is_err());
+        assert!(pairing_lifetime(1_661, 1_000).is_err());
+    }
+
+    #[test]
     fn persisted_route_reverifies_at_its_acceptance_time() {
         let key = TransportKey::generate();
         let card = Card::sign(&key, 100, 200, 7, Vec::new());
@@ -791,16 +818,25 @@ mod tests {
         server_config.rendezvous = Some(HashMap::new());
         let server = Arc::new(Endpoint::open(server_config).await.expect("server"));
         let server_card = server.card(Duration::from_secs(600), Vec::new());
+        let _warm_registration = server
+            .register_pairing_secret([0x44; 16], Duration::from_secs(600))
+            .expect("warm server registration");
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            server.paths().relay().home().wait_up(),
+        )
+        .await
+        .expect("server relay connects before the QR tag is added")
+        .expect("server relay is up");
         let raw_pairing = [0x4d; 16];
         let _server_registration = server
             .register_pairing_secret(raw_pairing, Duration::from_secs(600))
             .expect("server registration");
         let engine = tokio::task::spawn_blocking({
-            let relay_url = relay_url.clone();
             move || {
                 LinkEngine::start(LinkConfig {
                     transport_seed: vec![0x35; 32],
-                    relay_urls: vec![relay_url],
+                    relay_urls: Vec::new(),
                     allow_direct: false,
                     routes: Vec::new(),
                 })

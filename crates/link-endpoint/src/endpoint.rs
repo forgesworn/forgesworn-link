@@ -22,7 +22,7 @@ use tracing::{info, warn};
 
 use crate::netmon::{NetMonitor, interface_snapshot};
 use crate::path_socket::{Paths, build};
-use crate::relay_client::{RelayDriver, RelaySpec, RelayStatus};
+use crate::relay_client::{RelayActivitySnapshot, RelayDriver, RelaySpec, RelayStatus};
 use crate::rendezvous_book::{PairingRegistration, RendezvousPeer, TagBook};
 use crate::session::{Session, Stream};
 
@@ -644,6 +644,15 @@ impl Endpoint {
             route,
             generation,
         ))
+    }
+
+    /// Safe aggregate counters for diagnosing a first-contact relay path.
+    /// The snapshot contains no peer identity, rendezvous material, or data.
+    pub fn pairing_relay_activity(
+        &self,
+        registration: &PairingRegistration,
+    ) -> RelayActivitySnapshot {
+        self.paths.relay_for(registration.route()).activity()
     }
 
     /// Accept an ordinary pinned session.  A pairing arrival is closed rather
