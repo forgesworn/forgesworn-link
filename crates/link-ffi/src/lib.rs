@@ -368,8 +368,12 @@ impl LinkEngine {
             inner.endpoint.clone()
         };
 
-        let registration = endpoint
-            .register_pairing_secret(*raw_pairing, lifetime)
+        // UniFFI calls this synchronous method from an ordinary Kotlin worker.
+        // Pairing registration arms an expiry task, so it must enter the
+        // engine-owned runtime just like the network exchange below.
+        let registration = self
+            .runtime
+            .block_on(async { endpoint.register_pairing_secret(*raw_pairing, lifetime) })
             .map_err(|error| LinkError::Route(error.to_string()))?;
         let caller_card = endpoint.card(Duration::from_secs(MAX_LIFETIME_SECONDS), Vec::new());
         let request_body = route_frame(caller_card.as_bytes());
