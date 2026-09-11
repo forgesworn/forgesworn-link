@@ -67,6 +67,13 @@ if [[ ! -s "${KOTLIN_FILE}" ]]; then
     echo "error: UniFFI produced no Kotlin binding" >&2
     exit 1
 fi
+# Every UniFFI object already implements AutoCloseable.close() for native
+# disposal. An exported method with that Kotlin signature produces duplicate
+# overloads and makes the consumer uncompilable.
+if grep -Eq '^[[:space:]]+fun `close`\(\)' "${KOTLIN_FILE}"; then
+    echo "error: an exported FFI object method collides with Kotlin AutoCloseable.close()" >&2
+    exit 1
+fi
 
 LLVM_STRIP="$(find "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt" -path '*/bin/llvm-strip' -print | head -n1)"
 if [[ -z "${LLVM_STRIP}" || ! -x "${LLVM_STRIP}" ]]; then
