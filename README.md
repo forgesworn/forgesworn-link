@@ -176,18 +176,17 @@ acceptance record of spec section 7, a person has to do the following by hand.
 7. **Capture on the relay host** while a transfer runs, and confirm the payload
    frames are opaque.  That capture is a Phase 0 go condition and this
    repository has none.
-8. **Android.**  There is no Android build here at all.  The endpoint crate is
-   plain tokio and quinn, so an `aarch64-linux-android` build of a small JNI or
-   `cargo-ndk` wrapper around `Endpoint`, `Session` and `Stream` is the smallest
-   thing that would work.  Then the questions that matter are whether a
-   background service keeps the WebSocket session alive across doze, what the
-   carrier does to a long-lived outbound WSS connection, and whether the direct
-   path survives a Wi-Fi to mobile handover.  Nothing in this spike answers any
-   of them.  The endpoint polls the interface set every five seconds and, on a
-   change, re-queries the reflector, re-announces its candidates and starts a
-   probing round (`EndpointConfig.net_poll`); a service with a
-   `ConnectivityManager` callback should call `Session::reannounce` from it
-   and set the poll to zero.
+8. **Android.** `scripts/build-android-bundle.sh` creates an API-26 JNI hand-off
+   for arm64-v8a and x86_64, generated Kotlin and a SHA-256 manifest. CI uploads
+   the directory as an immutable artifact named for the exact Link commit. This
+   proves native compilation and binding generation only. Whether a background
+   service keeps the WebSocket session alive across doze, what the carrier does
+   to a long-lived outbound WSS connection, and whether the direct path survives
+   a Wi-Fi to mobile handover still require recorded device runs. The endpoint
+   polls the interface set every five seconds and, on a change, re-queries the
+   reflector, re-announces its candidates and starts a probing round
+   (`EndpointConfig.net_poll`); a service with a `ConnectivityManager` callback
+   should call `Session::reannounce` from it and set the poll to zero.
 
 Record every row against the table in spec section 7 and treat any missing row
 as a no-go, not as a pass.
@@ -216,9 +215,9 @@ do not cover:
 - **Carrier-grade NAT from a phone.**  The runs used a laptop and a Linux box
   on home broadband, not a handset on a mobile network.
 - **Windows.**  Recorded runs are macOS and Linux.
-- **Android**, background operation, battery or radio behaviour.  There is no
-  Android build here yet; the endpoint is plain tokio and quinn, so an
-  `aarch64-linux-android` wrapper is the smallest next step.
+- **Android background operation, battery or radio behaviour.** The native
+  bundle is built in CI, but no physical handset has proved doze, carrier or
+  handover behaviour.
 - **The relay under sustained multi-tenant load** or deliberate abuse.  The
   capture that showed zero plaintext was a single transfer, not a loaded relay.
 - **A full security review.**  The identity rule is implemented and tested for

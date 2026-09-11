@@ -21,8 +21,14 @@ terminal close notification. Dropping every handle closes the Link stream.
 
 `link-ffi` is a `cdylib`, `staticlib` and Rust library using UniFFI library
 mode. It owns one multi-thread Tokio runtime and one app-wide `Endpoint`.
-Generated Kotlin uses package `dev.forgesworn.link.ffi`; the Android build and
-binding scripts follow Bothy's existing cargo-ndk and UniFFI pattern.
+Generated Kotlin uses package `dev.forgesworn.link.ffi`. Run
+`scripts/build-android-bundle.sh` from a clean Link checkout to create the
+KithMoot hand-off: stripped API-26 arm64-v8a and x86_64 libraries, generated
+Kotlin, and a SHA-256 manifest naming the exact source commit. The Android
+bundle workflow uploads this directory as `link-ffi-android-<commit>` and
+records the immutable artifact digest in its job summary. KithMoot must pin
+both that commit and digest before extracting it into its generated build
+directory.
 
 ## FFI surface
 

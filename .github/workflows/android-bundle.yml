@@ -1,0 +1,71 @@
+name: Android bundle
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/link-core/**"
+      - "crates/link-endpoint/**"
+      - "crates/link-websocket/**"
+      - "crates/link-ffi/**"
+      - "scripts/build-android-bundle.sh"
+      - ".github/workflows/android-bundle.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  pull_request:
+    paths:
+      - "crates/link-core/**"
+      - "crates/link-endpoint/**"
+      - "crates/link-websocket/**"
+      - "crates/link-ffi/**"
+      - "scripts/build-android-bundle.sh"
+      - ".github/workflows/android-bundle.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+jobs:
+  bundle:
+    name: Build immutable Android bridge bundle
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      LINK_ANDROID_OUT_DIR: ${{ github.workspace }}/dist/link-ffi-android
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.1"
+          targets: aarch64-linux-android,x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+      - name: Locate preinstalled NDK
+        id: ndk
+        run: |
+          ndk_dir=$(ls -d "${ANDROID_SDK_ROOT}"/ndk/*/ 2>/dev/null | sort -V | tail -n1)
+          if [[ -z "${ndk_dir}" ]]; then
+            echo "error: no NDK found under ANDROID_SDK_ROOT/ndk" >&2
+            exit 1
+          fi
+          echo "path=${ndk_dir%/}" >> "${GITHUB_OUTPUT}"
+      - name: Build Android bundle
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.path }}
+        run: ./scripts/build-android-bundle.sh
+      - id: artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: link-ffi-android-${{ github.sha }}
+          path: dist/link-ffi-android
+          if-no-files-found: error
+          retention-days: 90
+      - name: Record immutable hand-off
+        run: |
+          echo "## Link Android bundle" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- Source commit: \`${GITHUB_SHA}\`" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- Artifact: \`link-ffi-android-${GITHUB_SHA}\`" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- Artifact SHA-256: \`${{ steps.artifact.outputs.artifact-digest }}\`" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- Bundle manifest:" >> "${GITHUB_STEP_SUMMARY}"
+          echo '```json' >> "${GITHUB_STEP_SUMMARY}"
+          cat dist/link-ffi-android/manifest.json >> "${GITHUB_STEP_SUMMARY}"
+          echo '```' >> "${GITHUB_STEP_SUMMARY}"
