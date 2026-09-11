@@ -667,6 +667,7 @@ async fn next_frame(ws: &mut Socket) -> anyhow::Result<Option<Frame>> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn pump(
     driver_id: u64,
     mut ws: Socket,
