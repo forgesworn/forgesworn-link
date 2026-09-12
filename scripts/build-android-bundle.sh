@@ -74,6 +74,14 @@ if grep -Eq '^[[:space:]]+fun `close`\(\)' "${KOTLIN_FILE}"; then
     echo "error: an exported FFI object method collides with Kotlin AutoCloseable.close()" >&2
     exit 1
 fi
+# Helpers that choose a route-retirement path or override the cadence deadline
+# are Rust implementation details. UniFFI exports every method in an annotated
+# impl block, regardless of Rust visibility, so fail the hand-off if either
+# ever leaks into Kotlin again.
+if grep -Eq '^[[:space:]]+fun `(deleteRoute|requestJsonWithTimeout)`\(' "${KOTLIN_FILE}"; then
+    echo "error: a private LinkEngine helper leaked into the Kotlin API" >&2
+    exit 1
+fi
 
 LLVM_STRIP="$(find "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt" -path '*/bin/llvm-strip' -print | head -n1)"
 if [[ -z "${LLVM_STRIP}" || ! -x "${LLVM_STRIP}" ]]; then
