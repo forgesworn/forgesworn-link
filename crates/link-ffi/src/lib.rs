@@ -351,6 +351,27 @@ impl LinkEngine {
     /// Ask the paired server to retire this route. Local credentials remain
     /// installed until the product durably records the acknowledged outcome.
     pub fn retire_route(&self, route_id: String) -> Result<(), LinkError> {
+        self.delete_route(route_id, "/events/route".into(), "route retirement".into())
+    }
+
+    /// Remove the paired transport after the product has durably recorded
+    /// logical retirement. The caller may safely treat transport failure as a
+    /// lost final acknowledgement: application authority was revoked by
+    /// `retire_route`, and this method never removes local credentials.
+    pub fn finalize_route(&self, route_id: String) -> Result<(), LinkError> {
+        self.delete_route(
+            route_id,
+            "/events/route/finalize".into(),
+            "route finalisation".into(),
+        )
+    }
+
+    fn delete_route(
+        &self,
+        route_id: String,
+        path: String,
+        operation: String,
+    ) -> Result<(), LinkError> {
         let (session, node) = {
             let mut inner = self.inner.lock().expect("engine lock");
             if inner.stopped {
@@ -393,7 +414,7 @@ impl LinkEngine {
             });
             let request = Request::builder()
                 .method(Method::DELETE)
-                .uri("/events/route")
+                .uri(path)
                 .header(hyper::header::HOST, node.to_base32())
                 .body(Full::new(Bytes::new()))
                 .map_err(|error| LinkError::Route(error.to_string()))?;
@@ -403,7 +424,7 @@ impl LinkEngine {
                 .map_err(|error| LinkError::Transport(error.to_string()))?;
             if response.status() != StatusCode::NO_CONTENT {
                 return Err(LinkError::Route(format!(
-                    "server refused route retirement with {}",
+                    "server refused {operation} with {}",
                     response.status()
                 )));
             }
@@ -820,6 +841,7 @@ mod tests {
         .expect("engine");
 
         assert!(engine.retire_route("route-to-retire".into()).is_err());
+        assert!(engine.finalize_route("route-to-retire".into()).is_err());
         assert!(
             engine
                 .inner
