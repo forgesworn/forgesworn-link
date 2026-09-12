@@ -787,7 +787,9 @@ impl LinkEngine {
                 let endpoint = inner.endpoint.clone();
                 let session = Arc::new(
                     self.runtime
-                        .block_on(tokio::time::timeout(timeout, endpoint.connect(&card)))
+                        .block_on(async {
+                            tokio::time::timeout(timeout, endpoint.connect(&card)).await
+                        })
                         .map_err(|_| LinkError::Transport("cadence request timed out".into()))?
                         .map_err(|error| LinkError::Transport(error.to_string()))?,
                 );
@@ -806,33 +808,36 @@ impl LinkEngine {
             .ok_or_else(|| LinkError::Transport("cadence request timed out".into()))?;
         let status_and_body = self
             .runtime
-            .block_on(tokio::time::timeout(remaining, async {
-                let stream = session
-                    .open_stream()
-                    .await
-                    .map_err(|error| LinkError::Transport(error.to_string()))?;
-                let (mut sender, connection) =
-                    hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .block_on(async {
+                tokio::time::timeout(remaining, async {
+                    let stream = session
+                        .open_stream()
                         .await
                         .map_err(|error| LinkError::Transport(error.to_string()))?;
-                tokio::spawn(async move {
-                    let _ = connection.await;
-                });
-                let outgoing = Request::builder()
-                    .method(method)
-                    .uri(request.path)
-                    .header(hyper::header::HOST, node.to_base32())
-                    .header(hyper::header::CONTENT_TYPE, "application/json")
-                    .header(hyper::header::AUTHORIZATION, request.authorization)
-                    .header(hyper::header::CONNECTION, "close")
-                    .body(Full::new(Bytes::from(request.body)))
-                    .map_err(|error| LinkError::Route(error.to_string()))?;
-                let response = sender
-                    .send_request(outgoing)
-                    .await
-                    .map_err(|error| LinkError::Transport(error.to_string()))?;
-                decode_http_response(response).await
-            }))
+                    let (mut sender, connection) =
+                        hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                            .await
+                            .map_err(|error| LinkError::Transport(error.to_string()))?;
+                    tokio::spawn(async move {
+                        let _ = connection.await;
+                    });
+                    let outgoing = Request::builder()
+                        .method(method)
+                        .uri(request.path)
+                        .header(hyper::header::HOST, node.to_base32())
+                        .header(hyper::header::CONTENT_TYPE, "application/json")
+                        .header(hyper::header::AUTHORIZATION, request.authorization)
+                        .header(hyper::header::CONNECTION, "close")
+                        .body(Full::new(Bytes::from(request.body)))
+                        .map_err(|error| LinkError::Route(error.to_string()))?;
+                    let response = sender
+                        .send_request(outgoing)
+                        .await
+                        .map_err(|error| LinkError::Transport(error.to_string()))?;
+                    decode_http_response(response).await
+                })
+                .await
+            })
             .map_err(|_| LinkError::Transport("cadence request timed out".into()))??;
         Ok(LinkHttpResponse {
             status: status_and_body.0,
@@ -1238,9 +1243,15 @@ mod tests {
             }
         });
 
-        let first = tokio::task::spawn_blocking({
+        // UniFFI invokes this from an ordinary JVM worker with no ambient
+        // Tokio context. A Tokio blocking task would hide reactor-entry bugs.
+        let first = std::thread::spawn({
             let engine = engine.clone();
             move || {
+                assert!(
+                    tokio::runtime::Handle::try_current().is_err(),
+                    "regression caller must have no ambient Tokio runtime"
+                );
                 engine.request_json(LinkHttpRequest {
                     route_id: "circle-main".into(),
                     method: "POST".into(),
@@ -1250,7 +1261,7 @@ mod tests {
                 })
             }
         })
-        .await
+        .join()
         .unwrap()
         .expect("first response");
         assert_eq!(first.status, 200);
@@ -1269,7 +1280,7 @@ mod tests {
                 .unwrap(),
         ) as usize;
 
-        let second = tokio::task::spawn_blocking({
+        let second = std::thread::spawn({
             let engine = engine.clone();
             move || {
                 engine.request_json(LinkHttpRequest {
@@ -1281,7 +1292,7 @@ mod tests {
                 })
             }
         })
-        .await
+        .join()
         .unwrap()
         .expect("second response");
         assert_eq!(second.status, 403);
@@ -1300,7 +1311,7 @@ mod tests {
         ) as usize;
         assert_eq!(first_session, second_session, "requests reuse one session");
 
-        let timeout = tokio::task::spawn_blocking({
+        let timeout = std::thread::spawn({
             let engine = engine.clone();
             move || {
                 engine.request_json_with_timeout(
@@ -1315,7 +1326,7 @@ mod tests {
                 )
             }
         })
-        .await
+        .join()
         .unwrap()
         .expect_err("stalled response is bounded");
         assert_eq!(timeout.to_string(), "transport: cadence request timed out");
