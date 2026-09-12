@@ -348,6 +348,70 @@ impl LinkEngine {
         Ok(Arc::new(LinkSocket { socket, session }))
     }
 
+    /// Ask the paired server to retire this route. Local credentials remain
+    /// installed until the product durably records the acknowledged outcome.
+    pub fn retire_route(&self, route_id: String) -> Result<(), LinkError> {
+        let (session, node) = {
+            let mut inner = self.inner.lock().expect("engine lock");
+            if inner.stopped {
+                return Err(LinkError::Stopped);
+            }
+            let route = inner
+                .routes
+                .get(&route_id)
+                .ok_or_else(|| LinkError::Route("route is not installed".into()))?;
+            let node = route.node;
+            let session = if let Some(session) = &route.session {
+                session.clone()
+            } else {
+                let card = route.card.clone();
+                let session = Arc::new(
+                    self.runtime
+                        .block_on(inner.endpoint.connect(&card))
+                        .map_err(|error| LinkError::Transport(error.to_string()))?,
+                );
+                inner
+                    .routes
+                    .get_mut(&route_id)
+                    .expect("route retained by engine lock")
+                    .session = Some(session.clone());
+                session
+            };
+            (session, node)
+        };
+        self.runtime.block_on(async {
+            let stream = session
+                .open_stream()
+                .await
+                .map_err(|error| LinkError::Transport(error.to_string()))?;
+            let (mut sender, connection) =
+                hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                    .await
+                    .map_err(|error| LinkError::Transport(error.to_string()))?;
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let request = Request::builder()
+                .method(Method::DELETE)
+                .uri("/events/route")
+                .header(hyper::header::HOST, node.to_base32())
+                .body(Full::new(Bytes::new()))
+                .map_err(|error| LinkError::Route(error.to_string()))?;
+            let response = sender
+                .send_request(request)
+                .await
+                .map_err(|error| LinkError::Transport(error.to_string()))?;
+            if response.status() != StatusCode::NO_CONTENT {
+                return Err(LinkError::Route(format!(
+                    "server refused route retirement with {}",
+                    response.status()
+                )));
+            }
+            collect_bounded(response.into_body()).await?;
+            Ok(())
+        })
+    }
+
     /// Enrol one durable event route over Link's quarantined provisional
     /// session, install it in the running engine, and return the exact record
     /// the Kotlin vault must commit atomically.
@@ -732,6 +796,37 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "route: route id is already bound to another node"
+        );
+        engine.stop();
+    }
+
+    #[test]
+    fn failed_retirement_keeps_the_local_route_for_retry() {
+        let now = now_unix();
+        let server_key = TransportKey::generate();
+        let server_card = Card::sign(&server_key, now, now + 600, 1, Vec::new());
+        let engine = LinkEngine::start(LinkConfig {
+            transport_seed: vec![0x41; 32],
+            relay_urls: Vec::new(),
+            allow_direct: false,
+            routes: vec![LinkRoute {
+                route_id: "route-to-retire".into(),
+                card: server_card.as_bytes().to_vec(),
+                paired_route_secret: vec![0x51; 32],
+                card_serial: 1,
+                card_verified_at: now,
+            }],
+        })
+        .expect("engine");
+
+        assert!(engine.retire_route("route-to-retire".into()).is_err());
+        assert!(
+            engine
+                .inner
+                .lock()
+                .expect("engine")
+                .routes
+                .contains_key("route-to-retire")
         );
         engine.stop();
     }
