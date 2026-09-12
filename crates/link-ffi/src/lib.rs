@@ -1,16 +1,19 @@
 //! Kotlin's owned boundary to Link: it supplies encrypted persisted route state;
-//! Rust owns endpoint, sessions, and WebSocket handles. No Nostr data enters here.
+//! Rust owns endpoint, sessions, WebSocket handles and bounded HTTP streams.
+//! Cadence authorization and JSON cross as opaque bytes; Link interprets no Nostr
+//! event or application authority.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::{Bytes, BytesMut};
 use http_body_util::{BodyExt as _, Full};
-use hyper::{Method, Request, StatusCode};
+use hyper::body::Body;
+use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use link_core::card::{MAX_CARD_BYTES, MAX_LIFETIME_SECONDS};
-use link_core::{Card, NodeId, TransportKey, VerifyContext};
+use link_core::{Card, NodeId, PathStatus, TransportKey, VerifyContext};
 use link_endpoint::{Endpoint, EndpointConfig, MAX_PAIRING_LIFETIME, RelaySpec, Session};
 use link_websocket::{IncomingMessage, Socket};
 use thiserror::Error;
@@ -77,6 +80,48 @@ pub struct LinkPath {
     pub relay: Option<String>,
     pub direct: Option<String>,
     pub cause: String,
+}
+
+/// One JSON request sent over an already paired Link route.
+///
+/// The route selects a pinned peer. The native boundary supplies `Host` and
+/// `Content-Type`, so Kotlin cannot redirect this call or change its transport
+/// identity.
+#[derive(uniffi::Record, Clone)]
+pub struct LinkHttpRequest {
+    pub route_id: String,
+    pub method: String,
+    pub path: String,
+    pub authorization: String,
+    pub body: Vec<u8>,
+}
+impl std::fmt::Debug for LinkHttpRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LinkHttpRequest")
+            .field("route_id", &"[redacted]")
+            .field("method", &self.method)
+            .field("path", &"[redacted]")
+            .field("authorization", &"[redacted]")
+            .field("body", &format_args!("{} bytes", self.body.len()))
+            .finish()
+    }
+}
+
+/// A bounded JSON response and the Link path that carried it.
+#[derive(uniffi::Record, Clone)]
+pub struct LinkHttpResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
+    pub path: LinkPath,
+}
+impl std::fmt::Debug for LinkHttpResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LinkHttpResponse")
+            .field("status", &self.status)
+            .field("body", &format_args!("{} bytes", self.body.len()))
+            .field("path", &self.path)
+            .finish()
+    }
 }
 
 #[derive(uniffi::Error, Error, Debug)]
@@ -187,6 +232,10 @@ fn verify_route(route: &LinkRoute) -> Result<(NodeId, Card), LinkError> {
 const ROUTE_MAGIC: &[u8; 4] = b"EVR1";
 const ROUTE_PREFIX_BYTES: usize = ROUTE_MAGIC.len() + 2;
 const MAX_ROUTE_FRAME_BYTES: usize = ROUTE_PREFIX_BYTES + MAX_CARD_BYTES;
+const MAX_HTTP_PATH_BYTES: usize = 2_048;
+const MAX_HTTP_AUTHORIZATION_BYTES: usize = 48 * 1_024;
+const MAX_HTTP_BODY_BYTES: usize = 256 * 1_024;
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn route_frame(card: &[u8]) -> Vec<u8> {
     let length = u16::try_from(card.len()).expect("Link cards fit in u16");
@@ -212,20 +261,91 @@ fn route_card(frame: &[u8]) -> Result<&[u8], LinkError> {
     Ok(&frame[ROUTE_PREFIX_BYTES..])
 }
 
-async fn collect_bounded(mut body: hyper::body::Incoming) -> Result<Bytes, LinkError> {
+async fn collect_bounded<B>(mut body: B, limit: usize, label: &str) -> Result<Bytes, LinkError>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
     let mut bytes = BytesMut::new();
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(|error| LinkError::Transport(error.to_string()))?;
         if let Ok(data) = frame.into_data() {
-            if bytes.len().saturating_add(data.len()) > MAX_ROUTE_FRAME_BYTES {
-                return Err(LinkError::Route(
-                    "server route response is too large".into(),
-                ));
+            if bytes.len().saturating_add(data.len()) > limit {
+                return Err(LinkError::Route(format!(
+                    "server {label} response is too large"
+                )));
             }
             bytes.extend_from_slice(&data);
         }
     }
     Ok(bytes.freeze())
+}
+
+fn validate_http_request(request: &LinkHttpRequest) -> Result<Method, LinkError> {
+    let method = match request.method.as_str() {
+        "POST" => Method::POST,
+        "PUT" => Method::PUT,
+        _ => {
+            return Err(LinkError::Route(
+                "cadence request method must be POST or PUT".into(),
+            ));
+        }
+    };
+    let path = request.path.as_bytes();
+    if path.is_empty()
+        || path.len() > MAX_HTTP_PATH_BYTES
+        || !request.path.starts_with("/cadence/v1/")
+        || path.contains(&b'?')
+        || path.contains(&b'#')
+        || !path.iter().all(u8::is_ascii_graphic)
+    {
+        return Err(LinkError::Route(
+            "cadence request path is not canonical".into(),
+        ));
+    }
+    let authorization = request.authorization.as_bytes();
+    let encoded = authorization.strip_prefix(b"Nostr ").unwrap_or_default();
+    if authorization.len() > MAX_HTTP_AUTHORIZATION_BYTES
+        || encoded.is_empty()
+        || !encoded
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+    {
+        return Err(LinkError::Route(
+            "cadence authorization is not one bounded Nostr value".into(),
+        ));
+    }
+    if request.body.len() > MAX_HTTP_BODY_BYTES {
+        return Err(LinkError::Route("cadence request body is too large".into()));
+    }
+    Ok(method)
+}
+
+async fn decode_http_response<B>(response: Response<B>) -> Result<(u16, Vec<u8>), LinkError>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
+    if response.status().is_redirection() {
+        return Err(LinkError::Route(
+            "cadence response must not redirect".into(),
+        ));
+    }
+    let content_type = response
+        .headers()
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .filter(|value| value.eq_ignore_ascii_case("application/json"));
+    if content_type.is_none() {
+        return Err(LinkError::Route(
+            "cadence response is not application/json".into(),
+        ));
+    }
+    let status = response.status().as_u16();
+    let body = collect_bounded(response.into_body(), MAX_HTTP_BODY_BYTES, "cadence").await?;
+    Ok((status, body.to_vec()))
 }
 fn path(session: &Session) -> LinkPath {
     let report = session.path();
@@ -348,6 +468,12 @@ impl LinkEngine {
         Ok(Arc::new(LinkSocket { socket, session }))
     }
 
+    /// Send one bounded cadence JSON request over the route's pinned Link
+    /// session. The application supplies neither a network URL nor a `Host`.
+    pub fn request_json(&self, request: LinkHttpRequest) -> Result<LinkHttpResponse, LinkError> {
+        self.request_json_with_timeout(request, HTTP_REQUEST_TIMEOUT)
+    }
+
     /// Ask the paired server to retire this route. Local credentials remain
     /// installed until the product durably records the acknowledged outcome.
     pub fn retire_route(&self, route_id: String) -> Result<(), LinkError> {
@@ -364,73 +490,6 @@ impl LinkEngine {
             "/events/route/finalize".into(),
             "route finalisation".into(),
         )
-    }
-
-    fn delete_route(
-        &self,
-        route_id: String,
-        path: String,
-        operation: String,
-    ) -> Result<(), LinkError> {
-        let (session, node) = {
-            let mut inner = self.inner.lock().expect("engine lock");
-            if inner.stopped {
-                return Err(LinkError::Stopped);
-            }
-            let route = inner
-                .routes
-                .get(&route_id)
-                .ok_or_else(|| LinkError::Route("route is not installed".into()))?;
-            let node = route.node;
-            let session = if let Some(session) = &route.session {
-                session.clone()
-            } else {
-                let card = route.card.clone();
-                let session = Arc::new(
-                    self.runtime
-                        .block_on(inner.endpoint.connect(&card))
-                        .map_err(|error| LinkError::Transport(error.to_string()))?,
-                );
-                inner
-                    .routes
-                    .get_mut(&route_id)
-                    .expect("route retained by engine lock")
-                    .session = Some(session.clone());
-                session
-            };
-            (session, node)
-        };
-        self.runtime.block_on(async {
-            let stream = session
-                .open_stream()
-                .await
-                .map_err(|error| LinkError::Transport(error.to_string()))?;
-            let (mut sender, connection) =
-                hyper::client::conn::http1::handshake(TokioIo::new(stream))
-                    .await
-                    .map_err(|error| LinkError::Transport(error.to_string()))?;
-            tokio::spawn(async move {
-                let _ = connection.await;
-            });
-            let request = Request::builder()
-                .method(Method::DELETE)
-                .uri(path)
-                .header(hyper::header::HOST, node.to_base32())
-                .body(Full::new(Bytes::new()))
-                .map_err(|error| LinkError::Route(error.to_string()))?;
-            let response = sender
-                .send_request(request)
-                .await
-                .map_err(|error| LinkError::Transport(error.to_string()))?;
-            if response.status() != StatusCode::NO_CONTENT {
-                return Err(LinkError::Route(format!(
-                    "server refused {operation} with {}",
-                    response.status()
-                )));
-            }
-            collect_bounded(response.into_body()).await?;
-            Ok(())
-        })
     }
 
     /// Enrol one durable event route over Link's quarantined provisional
@@ -519,7 +578,8 @@ impl LinkEngine {
                         response.status()
                     )));
                 }
-                let answer = collect_bounded(response.into_body()).await?;
+                let answer =
+                    collect_bounded(response.into_body(), MAX_ROUTE_FRAME_BYTES, "route").await?;
                 let response_card_bytes = route_card(&answer)?.to_vec();
                 let response_verified_at = now_unix();
                 let response_card = Card::verify(
@@ -695,6 +755,160 @@ impl LinkEngine {
         }
     }
 }
+
+impl LinkEngine {
+    fn request_json_with_timeout(
+        &self,
+        request: LinkHttpRequest,
+        timeout: Duration,
+    ) -> Result<LinkHttpResponse, LinkError> {
+        let method = validate_http_request(&request)?;
+        let started = Instant::now();
+        let (session, node) = {
+            // Match `open_socket`: holding the engine lock through a first dial
+            // coalesces callers onto Link's one session for this peer.
+            let mut inner = self.inner.lock().expect("engine lock");
+            if inner.stopped {
+                return Err(LinkError::Stopped);
+            }
+            let route = inner
+                .routes
+                .get(&request.route_id)
+                .ok_or_else(|| LinkError::Route("route is not installed".into()))?;
+            let node = route.node;
+            let current = route
+                .session
+                .as_ref()
+                .filter(|session| !matches!(session.path().status, PathStatus::Failed(_)));
+            let session = if let Some(session) = current {
+                session.clone()
+            } else {
+                let card = route.card.clone();
+                let endpoint = inner.endpoint.clone();
+                let session = Arc::new(
+                    self.runtime
+                        .block_on(tokio::time::timeout(timeout, endpoint.connect(&card)))
+                        .map_err(|_| LinkError::Transport("cadence request timed out".into()))?
+                        .map_err(|error| LinkError::Transport(error.to_string()))?,
+                );
+                inner
+                    .routes
+                    .get_mut(&request.route_id)
+                    .expect("route retained by engine lock")
+                    .session = Some(session.clone());
+                session
+            };
+            (session, node)
+        };
+        let remaining = timeout
+            .checked_sub(started.elapsed())
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(|| LinkError::Transport("cadence request timed out".into()))?;
+        let status_and_body = self
+            .runtime
+            .block_on(tokio::time::timeout(remaining, async {
+                let stream = session
+                    .open_stream()
+                    .await
+                    .map_err(|error| LinkError::Transport(error.to_string()))?;
+                let (mut sender, connection) =
+                    hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                        .await
+                        .map_err(|error| LinkError::Transport(error.to_string()))?;
+                tokio::spawn(async move {
+                    let _ = connection.await;
+                });
+                let outgoing = Request::builder()
+                    .method(method)
+                    .uri(request.path)
+                    .header(hyper::header::HOST, node.to_base32())
+                    .header(hyper::header::CONTENT_TYPE, "application/json")
+                    .header(hyper::header::AUTHORIZATION, request.authorization)
+                    .header(hyper::header::CONNECTION, "close")
+                    .body(Full::new(Bytes::from(request.body)))
+                    .map_err(|error| LinkError::Route(error.to_string()))?;
+                let response = sender
+                    .send_request(outgoing)
+                    .await
+                    .map_err(|error| LinkError::Transport(error.to_string()))?;
+                decode_http_response(response).await
+            }))
+            .map_err(|_| LinkError::Transport("cadence request timed out".into()))??;
+        Ok(LinkHttpResponse {
+            status: status_and_body.0,
+            body: status_and_body.1,
+            path: path(&session),
+        })
+    }
+
+    fn delete_route(
+        &self,
+        route_id: String,
+        path: String,
+        operation: String,
+    ) -> Result<(), LinkError> {
+        let (session, node) = {
+            let mut inner = self.inner.lock().expect("engine lock");
+            if inner.stopped {
+                return Err(LinkError::Stopped);
+            }
+            let route = inner
+                .routes
+                .get(&route_id)
+                .ok_or_else(|| LinkError::Route("route is not installed".into()))?;
+            let node = route.node;
+            let session = if let Some(session) = &route.session {
+                session.clone()
+            } else {
+                let card = route.card.clone();
+                let session = Arc::new(
+                    self.runtime
+                        .block_on(inner.endpoint.connect(&card))
+                        .map_err(|error| LinkError::Transport(error.to_string()))?,
+                );
+                inner
+                    .routes
+                    .get_mut(&route_id)
+                    .expect("route retained by engine lock")
+                    .session = Some(session.clone());
+                session
+            };
+            (session, node)
+        };
+        self.runtime.block_on(async {
+            let stream = session
+                .open_stream()
+                .await
+                .map_err(|error| LinkError::Transport(error.to_string()))?;
+            let (mut sender, connection) =
+                hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                    .await
+                    .map_err(|error| LinkError::Transport(error.to_string()))?;
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let request = Request::builder()
+                .method(Method::DELETE)
+                .uri(path)
+                .header(hyper::header::HOST, node.to_base32())
+                .body(Full::new(Bytes::new()))
+                .map_err(|error| LinkError::Route(error.to_string()))?;
+            let response = sender
+                .send_request(request)
+                .await
+                .map_err(|error| LinkError::Transport(error.to_string()))?;
+            if response.status() != StatusCode::NO_CONTENT {
+                return Err(LinkError::Route(format!(
+                    "server refused {operation} with {}",
+                    response.status()
+                )));
+            }
+            collect_bounded(response.into_body(), MAX_ROUTE_FRAME_BYTES, "route").await?;
+            Ok(())
+        })
+    }
+}
+
 #[uniffi::export]
 impl LinkSocket {
     pub fn send_text(&self, text: String) -> Result<(), LinkError> {
@@ -783,6 +997,336 @@ mod tests {
         };
         assert!(!format!("{route:?}").contains(&"7b".repeat(32)));
         assert!(!format!("{bundle:?}").contains(&"6a".repeat(16)));
+    }
+
+    fn valid_http_request() -> LinkHttpRequest {
+        LinkHttpRequest {
+            route_id: "circle-main".into(),
+            method: "POST".into(),
+            path: "/cadence/v1/status".into(),
+            authorization: "Nostr YQ==".into(),
+            body: br#"{"v":1}"#.to_vec(),
+        }
+    }
+
+    #[test]
+    fn cadence_request_boundary_is_narrow_and_redacted() {
+        let request = valid_http_request();
+        assert_eq!(validate_http_request(&request).unwrap(), Method::POST);
+        let rendered = format!("{request:?}");
+        assert!(!rendered.contains("YQ=="));
+        assert!(!rendered.contains(r#"{"v":1}"#));
+        assert!(!rendered.contains("circle-main"));
+        assert!(!rendered.contains("/cadence/v1/status"));
+
+        let mut put = request.clone();
+        put.method = "PUT".into();
+        assert_eq!(validate_http_request(&put).unwrap(), Method::PUT);
+
+        for method in ["GET", "post", "DELETE"] {
+            let mut changed = request.clone();
+            changed.method = method.into();
+            assert!(validate_http_request(&changed).is_err(), "method {method}");
+        }
+        for path in [
+            "cadence/v1/status",
+            "/events",
+            "/cadence/v1/status?room=secret",
+            "/cadence/v1/status#fragment",
+            "/cadence/v1/status\nX-Injected: yes",
+            "/cadence/v1/é",
+        ] {
+            let mut changed = request.clone();
+            changed.path = path.into();
+            assert!(validate_http_request(&changed).is_err(), "path {path:?}");
+        }
+        let mut long_path = request.clone();
+        long_path.path = format!("/cadence/v1/{}", "a".repeat(MAX_HTTP_PATH_BYTES));
+        assert!(validate_http_request(&long_path).is_err());
+
+        for authorization in [
+            "",
+            "Bearer YQ==",
+            "Nostr ",
+            "Nostr YQ==\r\nX-Injected: yes",
+            "Nostr YQ==,Nostr Yg==",
+        ] {
+            let mut changed = request.clone();
+            changed.authorization = authorization.into();
+            assert!(
+                validate_http_request(&changed).is_err(),
+                "authorization {authorization:?}"
+            );
+        }
+        let mut long_authorization = request.clone();
+        long_authorization.authorization =
+            format!("Nostr {}", "A".repeat(MAX_HTTP_AUTHORIZATION_BYTES));
+        assert!(validate_http_request(&long_authorization).is_err());
+
+        let mut largest_body = request.clone();
+        largest_body.body = vec![0; MAX_HTTP_BODY_BYTES];
+        assert!(validate_http_request(&largest_body).is_ok());
+        largest_body.body.push(0);
+        assert!(validate_http_request(&largest_body).is_err());
+    }
+
+    #[tokio::test]
+    async fn cadence_response_requires_bounded_json_and_never_redirects() {
+        let response = Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .header(
+                hyper::header::CONTENT_TYPE,
+                "application/json; charset=utf-8",
+            )
+            .body(Full::new(Bytes::from_static(br#"{"v":1,"code":"scope"}"#)))
+            .unwrap();
+        let (status, body) = decode_http_response(response).await.unwrap();
+        assert_eq!(status, 403);
+        assert_eq!(body, br#"{"v":1,"code":"scope"}"#);
+
+        let redirect = Response::builder()
+            .status(StatusCode::TEMPORARY_REDIRECT)
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        assert!(decode_http_response(redirect).await.is_err());
+
+        let wrong_type = Response::builder()
+            .status(StatusCode::OK)
+            .header(hyper::header::CONTENT_TYPE, "text/plain")
+            .body(Full::new(Bytes::from_static(b"{}")))
+            .unwrap();
+        assert!(decode_http_response(wrong_type).await.is_err());
+
+        let oversized = Response::builder()
+            .status(StatusCode::OK)
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from(vec![0; MAX_HTTP_BODY_BYTES + 1])))
+            .unwrap();
+        assert!(decode_http_response(oversized).await.is_err());
+
+        let response = LinkHttpResponse {
+            status: 200,
+            body: b"response-secret".to_vec(),
+            path: LinkPath {
+                status: "relayed".into(),
+                relay: None,
+                direct: None,
+                cause: "fixture".into(),
+            },
+        };
+        assert!(!format!("{response:?}").contains("response-secret"));
+    }
+
+    async fn read_http_request(stream: &mut link_endpoint::Stream) -> (String, Vec<u8>) {
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(stream.read_u8().await.expect("request head"));
+            assert!(head.len() <= MAX_HTTP_AUTHORIZATION_BYTES + 8 * 1_024);
+        }
+        let head = String::from_utf8(head).expect("HTTP head is ASCII");
+        let content_length = head
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length: ")
+                    .and_then(|value| value.parse::<usize>().ok())
+            })
+            .expect("content length");
+        let mut body = vec![0; content_length];
+        stream.read_exact(&mut body).await.expect("request body");
+        (head, body)
+    }
+
+    async fn write_json_response(stream: &mut link_endpoint::Stream, status: &str, body: &[u8]) {
+        let head = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+        stream.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cadence_json_crosses_one_pinned_link_session_with_exact_bytes() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let relay = link_relay::start(link_relay::RelayConfig {
+            ws_bind: "127.0.0.1:0".parse().unwrap(),
+            udp_bind: "127.0.0.1:0".parse().unwrap(),
+            hosts: vec!["127.0.0.1".into()],
+            tls: None,
+            bytes_per_second: 0,
+            max_sessions: 16,
+            max_sessions_per_source: 0,
+            reflector_per_second: 100.0,
+        })
+        .await
+        .expect("relay");
+        let relay_url = relay.url("127.0.0.1");
+        let client_seed = [0x35; 32];
+        let client_node = TransportKey::from_seed(client_seed).node_id();
+        let paired_secret = [0x73; 32];
+        let mut server_config = EndpointConfig::new(TransportKey::generate());
+        server_config.relays = vec![RelaySpec::plain(&relay_url)];
+        server_config.allow_direct = false;
+        server_config.bind = "127.0.0.1:0".parse().unwrap();
+        server_config.paired_routes = Some(HashMap::from([(
+            client_node,
+            Zeroizing::new(paired_secret),
+        )]));
+        let server = Arc::new(Endpoint::open(server_config).await.expect("server"));
+        let server_card = server.card(Duration::from_secs(600), Vec::new());
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            server.paths().relay().home().wait_up(),
+        )
+        .await
+        .expect("server relay wait")
+        .expect("server relay is up");
+
+        let engine = tokio::task::spawn_blocking(move || {
+            LinkEngine::start(LinkConfig {
+                transport_seed: client_seed.to_vec(),
+                relay_urls: Vec::new(),
+                allow_direct: false,
+                routes: vec![LinkRoute {
+                    route_id: "circle-main".into(),
+                    card: server_card.as_bytes().to_vec(),
+                    paired_route_secret: paired_secret.to_vec(),
+                    card_serial: server_card.serial,
+                    card_verified_at: now_unix(),
+                }],
+            })
+            .expect("engine")
+        })
+        .await
+        .expect("engine task");
+        let server_node = server.node_id().to_base32();
+        let serving = tokio::spawn({
+            let server = server.clone();
+            let server_node = server_node.clone();
+            async move {
+                let session = match server.accept_any().await.expect("client session") {
+                    AcceptedSession::Pinned(session) => session,
+                    AcceptedSession::Pairing(_) => panic!("ordinary request must be pinned"),
+                };
+                assert_eq!(session.peer(), client_node);
+
+                let mut first = session.accept_stream().await.expect("first request");
+                let (head, body) = read_http_request(&mut first).await;
+                assert!(head.starts_with("POST /cadence/v1/status HTTP/1.1\r\n"));
+                let lower = head.to_ascii_lowercase();
+                assert!(lower.contains(&format!("host: {server_node}\r\n")));
+                assert!(lower.contains("content-type: application/json\r\n"));
+                assert!(head.contains("authorization: Nostr YQ==\r\n"));
+                assert_eq!(body, br#"{"v":1,"request":"first"}"#);
+                write_json_response(&mut first, "200 OK", br#"{"v":1,"code":"not-ready"}"#).await;
+
+                let mut second = session.accept_stream().await.expect("second request");
+                let (head, body) = read_http_request(&mut second).await;
+                assert!(head.starts_with(
+                    "PUT /cadence/v1/leases/00112233445566778899aabbccddeeff HTTP/1.1\r\n"
+                ));
+                assert_eq!(body, br#"{"v":1,"request":"second"}"#);
+                write_json_response(&mut second, "403 Forbidden", br#"{"v":1,"code":"scope"}"#)
+                    .await;
+
+                let mut stalled = session.accept_stream().await.expect("stalled request");
+                let _ = read_http_request(&mut stalled).await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        });
+
+        let first = tokio::task::spawn_blocking({
+            let engine = engine.clone();
+            move || {
+                engine.request_json(LinkHttpRequest {
+                    route_id: "circle-main".into(),
+                    method: "POST".into(),
+                    path: "/cadence/v1/status".into(),
+                    authorization: "Nostr YQ==".into(),
+                    body: br#"{"v":1,"request":"first"}"#.to_vec(),
+                })
+            }
+        })
+        .await
+        .unwrap()
+        .expect("first response");
+        assert_eq!(first.status, 200);
+        assert_eq!(first.body, br#"{"v":1,"code":"not-ready"}"#);
+        assert_eq!(first.path.status, "relayed");
+        let first_session = Arc::as_ptr(
+            engine
+                .inner
+                .lock()
+                .unwrap()
+                .routes
+                .get("circle-main")
+                .unwrap()
+                .session
+                .as_ref()
+                .unwrap(),
+        ) as usize;
+
+        let second = tokio::task::spawn_blocking({
+            let engine = engine.clone();
+            move || {
+                engine.request_json(LinkHttpRequest {
+                    route_id: "circle-main".into(),
+                    method: "PUT".into(),
+                    path: "/cadence/v1/leases/00112233445566778899aabbccddeeff".into(),
+                    authorization: "Nostr YQ==".into(),
+                    body: br#"{"v":1,"request":"second"}"#.to_vec(),
+                })
+            }
+        })
+        .await
+        .unwrap()
+        .expect("second response");
+        assert_eq!(second.status, 403);
+        assert_eq!(second.body, br#"{"v":1,"code":"scope"}"#);
+        let second_session = Arc::as_ptr(
+            engine
+                .inner
+                .lock()
+                .unwrap()
+                .routes
+                .get("circle-main")
+                .unwrap()
+                .session
+                .as_ref()
+                .unwrap(),
+        ) as usize;
+        assert_eq!(first_session, second_session, "requests reuse one session");
+
+        let timeout = tokio::task::spawn_blocking({
+            let engine = engine.clone();
+            move || {
+                engine.request_json_with_timeout(
+                    LinkHttpRequest {
+                        route_id: "circle-main".into(),
+                        method: "POST".into(),
+                        path: "/cadence/v1/status".into(),
+                        authorization: "Nostr YQ==".into(),
+                        body: br#"{"v":1,"request":"stalled"}"#.to_vec(),
+                    },
+                    Duration::from_millis(50),
+                )
+            }
+        })
+        .await
+        .unwrap()
+        .expect_err("stalled response is bounded");
+        assert_eq!(timeout.to_string(), "transport: cadence request timed out");
+
+        serving.await.unwrap();
+        tokio::task::spawn_blocking(move || {
+            engine.stop();
+            drop(engine);
+        })
+        .await
+        .unwrap();
     }
 
     #[test]

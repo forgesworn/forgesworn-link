@@ -41,6 +41,10 @@ The records passed to `LinkEngine.start` are:
 - `LinkPairingBundle`: route id, server card, the QR's 16 raw pairing-secret
   bytes and its absolute expiry. The pairing secret is zeroised after Link
   registers the bounded provisional route and is never retained;
+- `LinkHttpRequest`: installed route id, `POST` or `PUT`, a canonical
+  `/cadence/v1/` path, one Nostr authorization value and exact JSON body bytes;
+- `LinkHttpResponse`: numeric status, exact bounded JSON body and the Link path
+  that carried it; and
 - `LinkPath`: status, route name and any public socket address already present
   in Link's `PathReport`; it contains no rendezvous material.
 
@@ -50,6 +54,7 @@ The object surface is:
 LinkEngine.start(config)
 LinkEngine.pair_route(bundle) -> LinkRoute
 LinkEngine.open_socket(virtual_url, route_id, listener) -> LinkSocket
+LinkEngine.request_json(request) -> LinkHttpResponse
 LinkEngine.upsert_route(route)
 LinkEngine.remove_route(route_id)
 LinkEngine.reannounce()
@@ -83,6 +88,16 @@ route may replace its exporter while retaining the same server card serial.
 `TagBook`; `remove_route` removes the tag first, closes that route's cached
 session and then drops the record. Kotlin persists encrypted route state; Link
 never writes it.
+
+`request_json` opens HTTP/1.1 on a stream of the installed route's cached Link
+session. Kotlin cannot supply a host or network URL: Link writes the pinned
+peer node id as `Host`, supplies `Content-Type: application/json`, never
+follows redirects and returns ordinary JSON refusal statuses to the caller.
+Only `POST` and `PUT` to a canonical `/cadence/v1/` path are accepted. The
+path is capped at 2,048 bytes, authorization at 48 KiB and each request and
+response body at 256 KiB. One 30-second deadline covers a first dial, request,
+response head and response body. Debug output reports body sizes and redacts
+both authorization and body bytes.
 
 ## Session manager
 
@@ -120,3 +135,7 @@ The implementation is finished when tests prove:
 9. the existing macOS, Ubuntu and Windows workspace checks remain green.
 10. provisional route enrolment and same-capability retry produce exporter
     secrets that agree at both ends, and the retry replaces the live route.
+11. bounded cadence JSON crosses a real paired Link session with exact method,
+    path, pinned host, authorization and body bytes; a second request reuses
+    that session, JSON refusal bodies return intact and a stalled response
+    reaches the fixed deadline.
