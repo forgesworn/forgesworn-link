@@ -1,0 +1,55 @@
+# ForgeSworn Link
+
+> Two nodes that want to mirror or repair storage over the open internet need
+> a transport that finds a direct path when one exists and falls back to a
+> relay that learns no identity when it does not. ForgeSworn Link is that
+> wide-area transport lane: QUIC direct paths with a WebSocket relay
+> fallback, built on `quinn` and `rustls`.
+
+It is for a Bothy box or a Tor-less Wildbloom node that needs to talk to a
+peer across NATs without running its own discovery service or trusting a
+relay operator with its identity. The contract is narrow: how a node
+identifies itself, how two nodes discover a route, how they attempt a direct
+connection, how they fall back to a relay, and how a transport plugs into a
+Blossom store. Every cryptographic primitive, the TLS stack and the QUIC
+stack come from independently maintained crates; this project owns only the
+protocol on top of them.
+
+## Getting Started
+
+This is a Rust workspace of unpublished crates (`publish = false`); consume
+it as a path or git dependency, or run the demo binaries directly.
+
+```sh
+cargo build
+```
+
+That builds the `link-relay` and `link-spike` binaries. See
+[Running the loopback demo](README.md#running-the-loopback-demo) for the
+full two-key walkthrough: start a relay, mint two keys, serve on one and
+send from the other.
+
+## Key Concepts
+
+- **Card**: the `FSL-CARD-1` address card a node presents to a peer, encoding its node ID, relay hints and verification context.
+- **Endpoint / Session / Stream**: the narrow API surface an application uses; a `Session` moves transparently between relayed and direct without the application noticing.
+- **PathStatus / PathReport**: the state machine and its JSON-serialisable report, tracking `Idle`, `Relayed`, `Probing` and `Direct` with the cause of each transition.
+- **Session-keyed probes**: signed UDP probes that prove a direct address belongs to the claimed peer before traffic is trusted to it.
+- **One TLS identity rule**: a single rustls verifier rule governs both the relay WebSocket and the direct QUIC path, so there is one place identity can go wrong.
+
+## API Surface
+
+- `link-core`: `Card`, `Hint`, `VerifyContext`, `NodeId`, `TransportKey`, `PathReport`, `PathStatus`, `FailReason`, `Tag`, `TagCase`.
+- `link-endpoint`: `Endpoint`, `EndpointConfig`, `Session`, `Stream`, `PairingSession`, `RelaySpec`, `RelayStatus`, `TagBook`, `RendezvousPeer`.
+- `link-blossom`: a hash-addressed blob-fetch protocol over a `Session` stream, plus an optional `shelter-kit` `BlobFetcher` adapter for mirror and repair.
+- `link-relay`: the `link-relay` binary, a bounded WebSocket datagram relay plus a stateless UDP reflector.
+- `link-spike`: the `link-spike` binary (`keygen`, `card`, `serve`, `send`) used for the loopback and real-network demos.
+
+## Optional
+
+- [README](README.md): crate table, recorded loopback runs, the real-machine acceptance procedure, spec deviations and open problems.
+- [docs/RENDEZVOUS.md](docs/RENDEZVOUS.md), [docs/PAIRED-RENDEZVOUS.md](docs/PAIRED-RENDEZVOUS.md): rendezvous and pairing design.
+- [docs/ANDROID-BRIDGE.md](docs/ANDROID-BRIDGE.md): the JNI hand-off for Android.
+- [docs/relay-identity-privacy.md](docs/relay-identity-privacy.md): what the relay does and does not learn.
+- [SPEC.md](SPEC.md): the Phase 0 protocol specification.
+- [acceptance/](acceptance/): real-network acceptance records.
