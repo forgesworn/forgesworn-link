@@ -29,13 +29,12 @@ impl NetMonitor {
         if poll.is_zero() {
             // Keep the channel open so a subscriber sees "never changes"
             // rather than "sender gone"; the task ends with the last receiver.
-            tokio::spawn(async move { tx.closed().await });
+            crate::rt::spawn(async move { tx.closed().await });
             return rx;
         }
-        tokio::spawn(async move {
+        crate::rt::spawn(async move {
             let mut last = normalised(snapshot());
-            let mut tick = tokio::time::interval(poll);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut tick = crate::rt::interval(poll);
             // The first tick of an interval completes at once.
             tick.tick().await;
             loop {

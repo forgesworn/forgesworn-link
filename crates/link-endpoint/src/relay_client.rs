@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use link_core::id::{NodeId, TransportKey};
@@ -17,6 +17,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
 use crate::rendezvous_book::TagBook;
+use crate::rt;
 
 /// Backoff bounds of spec 4.3.
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
@@ -338,8 +339,8 @@ impl RelayDriver {
                 // Tag mode: the peer's identity never goes to the relay.  The
                 // tag depends on which relay this session is on, so nothing is
                 // sendable before the welcome names it.
-                let Some(tag) =
-                    self.with_current_host(|host| book.tag_for_send(destination, host, now_unix()))
+                let Some(tag) = self
+                    .with_current_host(|host| book.tag_for_send(destination, host, rt::unix_now()))
                 else {
                     return QueueOutcome::Dropped;
                 };
@@ -475,7 +476,7 @@ fn spawn_driver(
     );
     let stopped_events = events_tx.clone();
     let stopped_readiness = readiness.clone();
-    tokio::spawn(async move {
+    rt::spawn(async move {
         tokio::select! {
             biased;
             _ = stop_rx.changed() => {
@@ -532,7 +533,7 @@ async fn driver(
     }
     let mut index = 0usize;
     let mut backoff = BACKOFF_MIN;
-    let mut down_since: Option<std::time::Instant> = None;
+    let mut down_since: Option<rt::Instant> = None;
 
     loop {
         if let Some(book) = &book
@@ -545,7 +546,7 @@ async fn driver(
             // the next pass connect and register within a second.
             set_status(&status, &events, RelayStatus::Connecting);
             down_since = None;
-            tokio::time::sleep(BACKOFF_MIN).await;
+            rt::sleep(BACKOFF_MIN).await;
             continue;
         }
         let spec = relays[index % relays.len()].clone();
@@ -555,7 +556,7 @@ async fn driver(
         // sent to this live relay session.
         let (_idle_changes, idle_rx) = watch::channel(0u64);
         let book_changes = book.as_deref().map(TagBook::subscribe).unwrap_or(idle_rx);
-        let attempt = tokio::time::timeout(
+        let attempt = rt::timeout(
             CONNECT_TIMEOUT,
             connect(&key, &spec, book.as_deref(), &activity),
         )
@@ -604,7 +605,7 @@ async fn driver(
                     return;
                 }
                 set_status(&status, &events, RelayStatus::Reconnecting);
-                down_since = Some(std::time::Instant::now());
+                down_since = Some(rt::Instant::now());
                 readiness.wake_all();
                 // Spec 4.3: next configured relay, then the same one.
                 index += 1;
@@ -612,13 +613,13 @@ async fn driver(
                     // Tag mode cannot tell which endpoint a third holder of
                     // one pair tag replaced.  Back off before retrying so the
                     // legitimate two ends can converge without a hot loop.
-                    tokio::time::sleep(BACKOFF_MAX).await;
+                    rt::sleep(BACKOFF_MAX).await;
                 }
                 continue;
             }
             Err(e) => {
                 debug!(relay = %spec.url, error = %e, "relay connect failed");
-                let since = *down_since.get_or_insert_with(std::time::Instant::now);
+                let since = *down_since.get_or_insert_with(rt::Instant::now);
                 if since.elapsed() > RECONNECT_DEADLINE {
                     if *status.borrow() != RelayStatus::Failed {
                         warn!("no relay within 60 s; sessions fail, endpoint keeps reconnecting");
@@ -629,7 +630,7 @@ async fn driver(
                     set_status(&status, &events, RelayStatus::Reconnecting);
                 }
                 index += 1;
-                tokio::time::sleep(backoff).await;
+                rt::sleep(backoff).await;
                 backoff = (backoff * 2).min(BACKOFF_MAX);
             }
         }
@@ -660,7 +661,7 @@ async fn connect(
     activity: &RelayActivity,
 ) -> anyhow::Result<Socket> {
     let (tls, host, port, path) = spec.parts()?;
-    let stream = tokio::time::timeout(
+    let stream = rt::timeout(
         Duration::from_secs(10),
         TcpStream::connect((host.as_str(), port)),
     )
@@ -698,7 +699,7 @@ async fn connect(
         Some(book) => {
             // No identity and no signature ever go to the relay on this path;
             // the challenge is acknowledged by ignoring it.
-            let tags = book.registration(&host, now_unix());
+            let tags = book.registration(&host, rt::unix_now());
             if tags.is_empty() {
                 anyhow::bail!("tag mode with no rendezvous pairs to register");
             }
@@ -714,7 +715,7 @@ async fn connect(
 }
 
 async fn next_frame(ws: &mut Socket) -> anyhow::Result<Option<Frame>> {
-    let message = tokio::time::timeout(Duration::from_secs(10), ws.next())
+    let message = rt::timeout(Duration::from_secs(10), ws.next())
         .await?
         .transpose()?;
     Ok(match message {
@@ -736,14 +737,12 @@ async fn pump(
     mut book_changes: watch::Receiver<u64>,
     activity: &RelayActivity,
 ) -> PumpEnd {
-    let mut ping = tokio::time::interval(PING_INTERVAL);
-    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut ping = rt::interval(PING_INTERVAL);
     // Tag mode re-registers when the epoch turns or the book changes (a card
     // rotation upsert), so the relay always holds the previous, current and
     // next epoch's tags for the current pair set.
-    let mut refresh = tokio::time::interval(Duration::from_secs(60));
-    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut last_epoch = link_core::rendezvous::epoch_index(now_unix());
+    let mut refresh = rt::interval(Duration::from_secs(60));
+    let mut last_epoch = link_core::rendezvous::epoch_index(rt::unix_now());
     let mut last_version = book.map(TagBook::version).unwrap_or(0);
     let mut nonce = [0u8; 8];
     loop {
@@ -756,12 +755,12 @@ async fn pump(
             }
             _ = refresh.tick(), if book.is_some() => {
                 let Some(book) = book else { continue };
-                let current = link_core::rendezvous::epoch_index(now_unix());
+                let current = link_core::rendezvous::epoch_index(rt::unix_now());
                 let version = book.version();
                 if current != last_epoch || version != last_version {
                     last_epoch = current;
                     last_version = version;
-                    let tags = book.registration(host, now_unix());
+                    let tags = book.registration(host, rt::unix_now());
                     if ws.send(Message::Binary(Frame::Register { tags }.encode())).await.is_err() {
                         return PumpEnd::Lost;
                     }
@@ -773,9 +772,9 @@ async fn pump(
                     return PumpEnd::Lost;
                 }
                 let Some(book) = book else { continue };
-                last_epoch = link_core::rendezvous::epoch_index(now_unix());
+                last_epoch = link_core::rendezvous::epoch_index(rt::unix_now());
                 last_version = book.version();
-                let tags = book.registration(host, now_unix());
+                let tags = book.registration(host, rt::unix_now());
                 if ws.send(Message::Binary(Frame::Register { tags }.encode())).await.is_err() {
                     return PumpEnd::Lost;
                 }
@@ -817,7 +816,7 @@ async fn pump(
                             // Attribute by this endpoint's own book; a tag it
                             // cannot resolve (a stale epoch, a removed pair) is
                             // dropped, which QUIC treats as loss.
-                            if let Some(peer) = book.resolve(&tag, host, now_unix()) {
+                            if let Some(peer) = book.resolve(&tag, host, rt::unix_now()) {
                                 activity.tag_datagrams_resolved.fetch_add(1, Ordering::Relaxed);
                                 let _ = inbound.try_send(RelayInbound {
                                     source: peer,
@@ -848,11 +847,4 @@ async fn pump(
             }
         }
     }
-}
-
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }

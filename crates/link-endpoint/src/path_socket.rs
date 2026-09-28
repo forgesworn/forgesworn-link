@@ -9,7 +9,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use link_core::card::unmap_ipv6;
 use link_core::id::{NodeId, TransportKey};
@@ -25,6 +25,7 @@ use tokio::sync::{Notify, mpsc, watch};
 use tracing::{debug, trace};
 
 use crate::relay_client::{QueueOutcome, RelayDriver, RelayInbound, RelaySpec};
+use crate::rt::{self, Instant};
 
 /// A direct path counts as usable only while its proof is this fresh, spec 4.1.
 pub const DIRECT_FRESH: Duration = Duration::from_secs(15);
@@ -672,7 +673,7 @@ pub async fn build(
     // Relay inbound: attribute by the relay's source node ID, spec 4.1.
     {
         let paths = paths.clone();
-        tokio::spawn(async move {
+        rt::spawn(async move {
             while let Some(RelayInbound {
                 source,
                 datagram,
@@ -689,7 +690,7 @@ pub async fn build(
     // Direct inbound: probes, reflector replies, and datagrams from proven addresses.
     {
         let paths = paths.clone();
-        tokio::spawn(async move {
+        rt::spawn(async move {
             let mut buf = vec![0u8; 2048];
             loop {
                 let (len, from) = match udp.recv_from(&mut buf).await {

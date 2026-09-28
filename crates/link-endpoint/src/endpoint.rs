@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use link_core::card::{Card, Hint};
 use link_core::id::{NodeId, TransportKey, node_id_from_spki};
@@ -24,6 +24,7 @@ use crate::netmon::{NetMonitor, interface_snapshot};
 use crate::path_socket::{Paths, build};
 use crate::relay_client::{RelayActivitySnapshot, RelayDriver, RelaySpec, RelayStatus};
 use crate::rendezvous_book::{PairingRegistration, RendezvousPeer, TagBook};
+use crate::rt;
 use crate::session::{Session, Stream};
 
 /// Cap the MTU so a QUIC packet always fits the relay's 1..=1350 frame bound.
@@ -81,18 +82,18 @@ impl PairingSession {
     fn new(session: Session, book: Arc<TagBook>, route: NodeId, generation: u64) -> Self {
         let connection = session.connection();
         let lifetime_connection = connection.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(MAX_PAIRING_SESSION_LIFETIME).await;
+        rt::spawn(async move {
+            rt::sleep(MAX_PAIRING_SESSION_LIFETIME).await;
             lifetime_connection.close(VarInt::from_u32(3), b"pairing lifetime");
         });
-        tokio::spawn(async move {
+        rt::spawn(async move {
             let reason = connection.closed().await;
             if matches!(reason, quinn::ConnectionError::LocallyClosed) {
                 // Quinn reports a local close before its CONNECTION_CLOSE has
                 // drained. Keep only the TLS-exported route (never the QR
                 // admission secret) for one full provisional-session bound so
                 // retransmission cannot be cut off by product handle teardown.
-                tokio::time::sleep(MAX_PAIRING_SESSION_LIFETIME).await;
+                rt::sleep(MAX_PAIRING_SESSION_LIFETIME).await;
             }
             book.remove_live_pairing(route, generation);
         });
@@ -294,13 +295,10 @@ impl Endpoint {
             endpoint_config,
             Some(server_config),
             socket,
-            Arc::new(quinn::TokioRuntime),
+            rt::quinn_runtime(),
         )?;
 
-        let wall_clock = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let wall_clock = rt::unix_now();
         let serial_seed = config.serial_seed.unwrap_or(0).max(wall_clock);
 
         let endpoint = Endpoint {
@@ -316,7 +314,7 @@ impl Endpoint {
         if let Some(reflector) = endpoint.config.reflector {
             endpoint.paths.query_reflector(reflector);
             // Give the reflector a moment before the first card or candidate list.
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            rt::sleep(Duration::from_millis(200)).await;
         }
 
         info!(
@@ -365,12 +363,12 @@ impl Endpoint {
             return Err(PairingError::Lifetime);
         }
         let book = self.book.as_ref().ok_or(PairingError::TagModeRequired)?;
-        let expires_at = now_unix().saturating_add(lifetime.as_secs());
+        let expires_at = rt::unix_now().saturating_add(lifetime.as_secs());
         let registration = book.register_pairing(secret, expires_at);
         let route = registration.route();
         let weak = Arc::downgrade(book);
-        tokio::spawn(async move {
-            tokio::time::sleep(lifetime).await;
+        rt::spawn(async move {
+            rt::sleep(lifetime).await;
             if let Some(book) = weak.upgrade() {
                 book.remove_pairing(route);
             }
@@ -380,10 +378,7 @@ impl Endpoint {
 
     /// Sign a fresh `FSL-CARD-1`.  UDP hints appear only with owner consent.
     pub fn card(&self, ttl: Duration, extra: Vec<Hint>) -> Card {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let now = rt::unix_now();
         let ttl = ttl
             .as_secs()
             .clamp(1, link_core::card::MAX_LIFETIME_SECONDS);
@@ -428,7 +423,7 @@ impl Endpoint {
             RelayStatus::Failed => return Err(FailReason::Relay),
             _ => {}
         }
-        let terminal = tokio::time::timeout(deadline, driver.wait_up())
+        let terminal = rt::timeout(deadline, driver.wait_up())
             .await
             .map_err(|_| FailReason::Timeout)?;
         terminal.ok_or_else(|| match driver.status() {
@@ -576,11 +571,11 @@ impl Endpoint {
         let Some(book) = self.book.as_ref() else {
             return Err(FailReason::Rendezvous);
         };
-        if !registration.belongs_to(book) || !registration.is_active(now_unix()) {
+        if !registration.belongs_to(book) || !registration.is_active(rt::unix_now()) {
             return Err(FailReason::Rendezvous);
         }
         let route = registration.route();
-        if route == self.node_id() || !book.pairing_active(route, now_unix()) {
+        if route == self.node_id() || !book.pairing_active(route, rt::unix_now()) {
             return Err(FailReason::Rendezvous);
         }
 
@@ -685,7 +680,7 @@ impl Endpoint {
             let pairing = self
                 .book
                 .as_ref()
-                .is_some_and(|book| book.pairing_active(route, now_unix()));
+                .is_some_and(|book| book.pairing_active(route, rt::unix_now()));
             let ordinary_slot = (!pairing).then(|| self.paths.begin_session(route));
             let server_config = self.server_config((!pairing).then_some(route))?;
 
@@ -803,7 +798,7 @@ fn promote_pairing_route(
         .export_keying_material(&mut secret, PAIRING_ROUTE_EXPORT_LABEL, b"")
         .map_err(|_| FailReason::Relay)?;
     let generation = NEXT_PAIRING_ROUTE_GENERATION.fetch_add(1, Ordering::Relaxed);
-    if !book.promote_pairing(route, secret, generation, now_unix()) {
+    if !book.promote_pairing(route, secret, generation, rt::unix_now()) {
         return Err(FailReason::Rendezvous);
     }
     Ok(generation)
@@ -851,11 +846,4 @@ fn transport_config_with(max_bidi_streams: u32, idle_timeout: Duration) -> quinn
             quinn::IdleTimeout::try_from(idle_timeout).expect("idle"),
         ));
     config
-}
-
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
 }
