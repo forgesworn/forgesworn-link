@@ -7,35 +7,29 @@
 //! socket is opened.
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
 use std::future::poll_fn;
 use std::rc::Rc;
 use std::task::{Poll, Waker};
-use std::time::Duration;
 
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 use web_sys::{BinaryType, CloseEvent, Event, MessageEvent, WebSocket};
 
 use super::WsMessage;
+use super::inbound::{InboundQueue, MAX_MESSAGE_BYTES};
 use crate::relay_client::RelaySpec;
 
-/// Received messages held for the relay session.  The page delivers them
-/// whether or not the session keeps up, so the bound is enforced here: a
-/// relay that outruns the session loses the session rather than growing
-/// the queue.
-const INBOUND_BOUND: usize = 1024;
-/// `bufferedAmount` above which a send waits.  A browser WebSocket never
-/// pushes back on `send`, so without this the relay queue's backpressure
-/// would end in the page's buffer instead of at quinn.
+/// `bufferedAmount` above which the session stops taking datagrams off its
+/// queue.  A browser WebSocket never pushes back on `send`, so without this
+/// the relay queue's backpressure would end in the page's buffer instead of
+/// at quinn.
 const SEND_HIGH_WATER: u32 = 1 << 20;
-const SEND_POLL: Duration = Duration::from_millis(10);
 
 #[derive(Default)]
 struct Shared {
     open: bool,
     ended: Option<String>,
-    queue: VecDeque<WsMessage>,
+    queue: InboundQueue,
     waker: Option<Waker>,
 }
 
@@ -52,6 +46,11 @@ impl Shared {
         }
         self.wake();
     }
+}
+
+/// How soon a session whose socket was not `send_ready` looks again.
+pub fn send_retry() -> impl std::future::Future<Output = ()> {
+    crate::rt::sleep(std::time::Duration::from_millis(10))
 }
 
 pub struct RelaySocket {
@@ -87,16 +86,20 @@ impl RelaySocket {
                 if shared.ended.is_some() {
                     return;
                 }
-                if shared.queue.len() >= INBOUND_BOUND {
-                    let _ = ws.close();
-                    shared.end("relay messages arrived faster than they were read".into());
-                    return;
-                }
                 let message = match event.data().dyn_into::<js_sys::ArrayBuffer>() {
+                    Ok(buffer) if buffer.byte_length() > MAX_MESSAGE_BYTES => {
+                        let _ = ws.close();
+                        shared.end("relay message above the frame bound".into());
+                        return;
+                    }
                     Ok(buffer) => WsMessage::Binary(js_sys::Uint8Array::new(&buffer).to_vec()),
                     Err(_) => WsMessage::Other,
                 };
-                shared.queue.push_back(message);
+                if !shared.queue.push(message) {
+                    let _ = ws.close();
+                    shared.end("relay control frames arrived faster than they were read".into());
+                    return;
+                }
                 shared.wake();
             })
         };
@@ -148,15 +151,18 @@ impl RelaySocket {
         Ok(socket)
     }
 
+    /// Whether the session should take another datagram off its queue.
+    /// Checked before a datagram is sent, never waited on inside `send`, so
+    /// the session keeps reading while the page's send buffer drains.
+    pub fn send_ready(&self) -> bool {
+        self.ws.buffered_amount() <= SEND_HIGH_WATER
+    }
+
+    /// Sends at once.  Backpressure is `send_ready`'s, applied only to
+    /// datagrams; a ping or registration is small and always goes.
     pub async fn send(&mut self, bytes: Vec<u8>) -> anyhow::Result<()> {
-        loop {
-            if let Some(reason) = &self.shared.borrow().ended {
-                anyhow::bail!("relay WebSocket ended: {reason}");
-            }
-            if self.ws.buffered_amount() <= SEND_HIGH_WATER {
-                break;
-            }
-            crate::rt::sleep(SEND_POLL).await;
+        if let Some(reason) = &self.shared.borrow().ended {
+            anyhow::bail!("relay WebSocket ended: {reason}");
         }
         self.ws
             .send_with_u8_array(&bytes)
@@ -166,7 +172,7 @@ impl RelaySocket {
     pub async fn next(&mut self) -> Option<anyhow::Result<WsMessage>> {
         poll_fn(|cx| {
             let mut shared = self.shared.borrow_mut();
-            if let Some(message) = shared.queue.pop_front() {
+            if let Some(message) = shared.queue.pop() {
                 Poll::Ready(Some(Ok(message)))
             } else if shared.ended.is_some() {
                 Poll::Ready(None)

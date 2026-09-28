@@ -13,6 +13,11 @@ use crate::relay_client::RelaySpec;
 pub trait Duplex: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Duplex for T {}
 
+/// A native socket is always `send_ready`, so this never completes.
+pub fn send_retry() -> std::future::Pending<()> {
+    std::future::pending()
+}
+
 pub struct RelaySocket(tokio_tungstenite::WebSocketStream<Box<dyn Duplex>>);
 
 impl RelaySocket {
@@ -36,6 +41,11 @@ impl RelaySocket {
         let request = format!("{}://{host}:{port}{path}", if tls { "wss" } else { "ws" });
         let (ws, _) = tokio_tungstenite::client_async(request, transport).await?;
         Ok(RelaySocket(ws))
+    }
+
+    /// Always: tungstenite's `send` waits for the socket itself.
+    pub fn send_ready(&self) -> bool {
+        true
     }
 
     pub async fn send(&mut self, bytes: Vec<u8>) -> anyhow::Result<()> {

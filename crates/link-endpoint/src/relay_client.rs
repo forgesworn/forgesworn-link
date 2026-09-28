@@ -12,7 +12,7 @@ use rand::RngCore;
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, info, warn};
 
-use crate::relay_socket::{RelaySocket, WsMessage};
+use crate::relay_socket::{RelaySocket, WsMessage, send_retry};
 use crate::rendezvous_book::TagBook;
 use crate::rt;
 
@@ -785,7 +785,7 @@ async fn pump(
                 }
                 activity.registrations_sent.fetch_add(1, Ordering::Relaxed);
             }
-            frame = outbound.recv() => {
+            frame = outbound.recv(), if ws.send_ready() => {
                 let Some(frame) = frame else { return PumpEnd::Lost };
                 let is_tag_datagram = matches!(frame, Frame::SendTag { .. });
                 if ws.send(frame.encode()).await.is_err() {
@@ -799,6 +799,9 @@ async fn pump(
                     readiness.wake_all();
                 }
             }
+            // Only a browser is ever not ready: look again shortly, reading
+            // all the while.
+            _ = send_retry(), if !ws.send_ready() => {}
             message = ws.next() => {
                 let Some(Ok(message)) = message else { return PumpEnd::Lost };
                 match message {

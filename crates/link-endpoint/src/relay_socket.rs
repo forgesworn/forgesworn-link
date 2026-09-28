@@ -8,6 +8,11 @@
 //!
 //! * `open(spec)` -- a WebSocket to the relay, ready for the challenge.  The
 //!   caller bounds it with its connect timeout.
+//! * `send_ready()` -- whether to take another datagram off the queue.
+//!   Always true natively, where `send` itself waits for the socket; in a
+//!   browser, whether the page's send buffer is below its high-water mark.
+//!   The session keeps reading while it is false, and `send_retry()`
+//!   wakes it to look again (never, natively).
 //! * `send(bytes)` -- one binary message.
 //! * `pong(payload)` -- answer a WebSocket-level ping (native only: a
 //!   browser answers pings itself and never surfaces one).
@@ -18,15 +23,17 @@
 //! build opens the page's `WebSocket`, which does its own WebPKI
 //! verification and therefore accepts only a plain `wss://` spec.
 
+#[cfg(any(wasm_browser, test))]
+mod inbound;
 #[cfg(not(wasm_browser))]
 mod native;
 #[cfg(wasm_browser)]
 mod web;
 
 #[cfg(not(wasm_browser))]
-pub use native::{Duplex, RelaySocket};
+pub use native::{Duplex, RelaySocket, send_retry};
 #[cfg(wasm_browser)]
-pub use web::RelaySocket;
+pub use web::{RelaySocket, send_retry};
 
 /// One WebSocket message, as far as the relay protocol cares.
 pub enum WsMessage {
