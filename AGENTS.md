@@ -18,7 +18,7 @@ contract on top of them.
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | Lint |
 | `cargo test --workspace --all-features` | Run the test suite |
 | `python3 -m unittest discover -s deploy/founders -p 'test_*.py' -v` | Test the deployment scripts |
-| `scripts/build-link-web.sh [--target web\|bundler\|nodejs]` | Build the browser package (needs a wasm32 clang: `WASI_SDK` or `CC_wasm32_unknown_unknown`) |
+| `scripts/build-link-web.sh [--target web\|bundler\|nodejs]` | Build the browser package (needs wasi-sdk 34.0 via `WASI_SDK`; `--check` reports missing inputs) |
 
 Toolchain is pinned at `1.94.1` in `rust-toolchain.toml`. CI (`.github/workflows/ci.yml`) runs format, clippy and test on Linux, Windows and macOS.
 
