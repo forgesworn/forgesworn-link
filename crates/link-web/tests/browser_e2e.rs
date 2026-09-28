@@ -84,20 +84,68 @@ fn wasm_toolchain(command: &mut std::process::Command) {
     }
 }
 
-/// Build the Node package with the same script a release uses.
-fn build_package() -> PathBuf {
+/// The nested wasm build's own target directory, inside whichever one this
+/// test was built in (so `CARGO_TARGET_DIR` and `build.target-dir` apply).
+fn package_target_dir() -> PathBuf {
+    Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .parent()
+        .expect("CARGO_TARGET_TMPDIR sits inside the target directory")
+        .join("link-web")
+}
+
+fn build_script(args: &[&str]) -> std::process::Command {
     let root = workspace();
-    let target_dir = root.join("target/link-web");
-    let out = target_dir.join("e2e-pkg");
     let mut command = std::process::Command::new(root.join("scripts/build-link-web.sh"));
     command
-        .args(["--target", "nodejs", "--out"])
-        .arg(&out)
-        .env("LINK_WEB_TARGET_DIR", &target_dir)
+        .args(args)
+        .env("LINK_WEB_TARGET_DIR", package_target_dir())
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .current_dir(&root);
     wasm_toolchain(&mut command);
-    let status = command.status().expect("run scripts/build-link-web.sh");
+    command
+}
+
+/// Why the package cannot be built here, if it cannot: the script's own
+/// check of the pinned wasi-sdk clang, the wasm32 target and a
+/// wasm-bindgen CLI matching Cargo.lock.
+fn missing_build_inputs() -> Option<String> {
+    let output = build_script(&["--check"])
+        .output()
+        .expect("run scripts/build-link-web.sh --check");
+    match output.status.code() {
+        Some(0) => None,
+        Some(3) => Some(String::from_utf8_lossy(&output.stderr).trim().to_owned()),
+        _ => panic!(
+            "scripts/build-link-web.sh --check failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    }
+}
+
+/// Why Node cannot stand in for the browser, if it cannot: it must be 24
+/// or later, for its global WebSocket.
+fn missing_node() -> Option<String> {
+    let Ok(output) = std::process::Command::new("node").arg("--version").output() else {
+        return Some("node is not on PATH".into());
+    };
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let major = version
+        .strip_prefix('v')
+        .and_then(|rest| rest.split('.').next())
+        .and_then(|major| major.parse::<u32>().ok());
+    match major {
+        Some(major) if major >= 24 => None,
+        _ => Some(format!("node {version} is older than 24")),
+    }
+}
+
+/// Build the Node package with the same script a release uses.
+fn build_package() -> PathBuf {
+    let out = package_target_dir().join("e2e-pkg");
+    let status = build_script(&["--target", "nodejs", "--out"])
+        .arg(&out)
+        .status()
+        .expect("run scripts/build-link-web.sh");
     assert!(status.success(), "scripts/build-link-web.sh failed");
     out
 }
@@ -345,6 +393,10 @@ async fn a_browser_engine_pairs_requests_and_echoes_over_a_real_relay() {
         );
         return;
     }
+    if let Some(reason) = missing_node().or_else(missing_build_inputs) {
+        eprintln!("skipping link-web end-to-end: {reason}");
+        return;
+    }
     let _ = rustls::crypto::ring::default_provider().install_default();
     let package = tokio::task::spawn_blocking(build_package)
         .await
@@ -445,7 +497,11 @@ async fn a_browser_engine_pairs_requests_and_echoes_over_a_real_relay() {
         // The record carries the card the server answered with, which is
         // at least as new as the QR's.
         let returned = seen.returned_card.as_ref().expect("a card was returned");
-        assert_eq!(paired["cardSerial"], returned.serial);
+        assert_eq!(
+            paired["serialTypes"],
+            serde_json::json!(["bigint", "bigint"])
+        );
+        assert_eq!(paired["cardSerial"], returned.serial.to_string());
         assert!(returned.serial >= card.serial);
         assert_eq!(
             paired["card"],

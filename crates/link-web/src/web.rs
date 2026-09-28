@@ -23,8 +23,10 @@ export interface LinkRoute {
   routeId: string;
   card: Uint8Array;
   pairedRouteSecret: Uint8Array;
-  cardSerial: number;
-  cardVerifiedAt: number;
+  /** A u64 carried exactly; a safe-integer number is also accepted. */
+  cardSerial: bigint;
+  /** Unix seconds, a u64 carried exactly; a safe-integer number is also accepted. */
+  cardVerifiedAt: bigint;
 }
 export interface LinkConfig {
   /** 32 bytes, supplied by the host from its own encrypted storage. */
@@ -118,11 +120,13 @@ fn list(object: &JsValue, name: &str) -> Result<Array, JsError> {
     Ok(Array::from(&value))
 }
 
-fn number(value: u64) -> Result<JsValue, JsValue> {
-    if value > MAX_SAFE_INTEGER {
-        return Err(JsError::new("route: value exceeds a safe JavaScript integer").into());
+/// A u64 from a BigInt, or from a number that holds it exactly.
+fn wide(object: &JsValue, name: &str) -> Result<u64, JsError> {
+    let value = field(object, name)?;
+    if value.is_bigint() {
+        return u64::try_from(value).map_err(|_| invalid(&format!("{name} must be a u64 BigInt")));
     }
-    Ok(JsValue::from_f64(value as f64))
+    integer(object, name)
 }
 
 fn set(object: &Object, name: &str, value: &JsValue) {
@@ -130,17 +134,26 @@ fn set(object: &Object, name: &str, value: &JsValue) {
     let _ = Reflect::set(object, &JsValue::from_str(name), value);
 }
 
+/// Every other field is read before the secret is copied out of the page,
+/// so a malformed record never leaves a stray copy; once copied it is in a
+/// `Route`, which zeroises it on drop.
 fn route_in(value: &JsValue) -> Result<Route, JsError> {
+    let route_id = string(value, "routeId")?;
+    let card = bytes(value, "card")?;
+    let card_serial = wide(value, "cardSerial")?;
+    let card_verified_at = wide(value, "cardVerifiedAt")?;
     Ok(Route {
-        route_id: string(value, "routeId")?,
-        card: bytes(value, "card")?,
+        route_id,
+        card,
         paired_route_secret: bytes(value, "pairedRouteSecret")?,
-        card_serial: integer(value, "cardSerial")?,
-        card_verified_at: integer(value, "cardVerifiedAt")?,
+        card_serial,
+        card_verified_at,
     })
 }
 
-fn route_out(route: &Route) -> Result<JsValue, JsValue> {
+/// Infallible, so a route the server has enrolled always reaches the page:
+/// its u64 fields go across as BigInt, which holds every value exactly.
+fn route_out(route: &Route) -> JsValue {
     let object = Object::new();
     set(&object, "routeId", &JsValue::from_str(&route.route_id));
     set(&object, "card", &Uint8Array::from(route.card.as_slice()));
@@ -149,9 +162,13 @@ fn route_out(route: &Route) -> Result<JsValue, JsValue> {
         "pairedRouteSecret",
         &Uint8Array::from(route.paired_route_secret.as_slice()),
     );
-    set(&object, "cardSerial", &number(route.card_serial)?);
-    set(&object, "cardVerifiedAt", &number(route.card_verified_at)?);
-    Ok(object.into())
+    set(&object, "cardSerial", &JsValue::from(route.card_serial));
+    set(
+        &object,
+        "cardVerifiedAt",
+        &JsValue::from(route.card_verified_at),
+    );
+    object.into()
 }
 
 fn path_out(path: PathInfo) -> JsValue {
@@ -238,12 +255,17 @@ impl WebEngine {
         &self,
         #[wasm_bindgen(unchecked_param_type = "LinkPairingBundle")] bundle: JsValue,
     ) -> Promise {
+        // The capability is copied last, straight into a bundle that
+        // zeroises it on drop.
         let bundle = match (|| {
+            let route_id = string(&bundle, "routeId")?;
+            let server_card = bytes(&bundle, "serverCard")?;
+            let expires_at = integer(&bundle, "expiresAt")?;
             Ok::<_, JsError>(PairingBundle {
-                route_id: string(&bundle, "routeId")?,
-                server_card: bytes(&bundle, "serverCard")?,
+                route_id,
+                server_card,
                 pairing_secret: bytes(&bundle, "pairingSecret")?,
-                expires_at: integer(&bundle, "expiresAt")?,
+                expires_at,
             })
         })() {
             Ok(bundle) => bundle,
@@ -251,7 +273,7 @@ impl WebEngine {
         };
         self.run(|engine| async move {
             let route = engine.pair_route(bundle).await.map_err(engine_error)?;
-            route_out(&route)
+            Ok(route_out(&route))
         })
     }
 

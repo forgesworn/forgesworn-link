@@ -61,8 +61,10 @@ report.paired = {
   keys: Object.keys(route).sort(),
   card: Buffer.from(route.card).toString('base64'),
   secretBytes: route.pairedRouteSecret.length,
-  cardSerial: route.cardSerial,
-  cardVerifiedAt: route.cardVerifiedAt,
+  // u64 fields cross as BigInt; reported as decimal strings.
+  serialTypes: [typeof route.cardSerial, typeof route.cardVerifiedAt],
+  cardSerial: String(route.cardSerial),
+  cardVerifiedAt: String(route.cardVerifiedAt),
 }
 
 const reply = await within(engine.request(echoRequest('first')), 'request', 60_000)
