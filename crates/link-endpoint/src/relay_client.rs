@@ -65,38 +65,31 @@ impl RelaySpec {
         } else {
             anyhow::bail!("relay URL must start with ws:// or wss://");
         };
-        // Nothing a URL parser could read differently from this one: no
-        // whitespace or control characters anywhere, and an authority that
-        // is only a host and a port (no userinfo, backslash, query or
-        // fragment).  A native dial and a browser WebSocket then always
-        // agree on the host, which is also the host the node signs against.
+        // Only printable ASCII, and none of the characters a URL parser
+        // rewrites or reads as structure (percent escapes, backslashes as
+        // slashes, fragments), so the path is sent as written.
         anyhow::ensure!(
-            !self
-                .url
-                .chars()
-                .any(|c| c.is_whitespace() || c.is_control()),
-            "relay URL contains whitespace or a control character"
+            self.url
+                .bytes()
+                .all(|b| b.is_ascii_graphic() && !matches!(b, b'%' | b'\\' | b'#')),
+            "relay URL must be printable ASCII without %, \\ or #"
         );
         let (authority, path) = match rest.split_once('/') {
             Some((a, p)) => (a, format!("/{p}")),
             None => (rest, "/".to_string()),
         };
-        anyhow::ensure!(
-            !authority.contains(['@', '\\', '?', '#']),
-            "relay URL authority must be a host and optional port"
-        );
         let (host, port) = match authority.rsplit_once(':') {
             Some((h, p)) if !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
-                (h.to_string(), p.parse::<u16>()?)
+                (h, p.parse::<u16>()?)
             }
-            _ => (authority.to_string(), if tls { 443 } else { 80 }),
+            _ => (authority, if tls { 443 } else { 80 }),
         };
-        let bracketed = host.starts_with('[') && host.ends_with(']');
+        let host = host.to_ascii_lowercase();
         anyhow::ensure!(
-            !host.is_empty() && (bracketed || !host.contains([':', '[', ']'])),
-            "relay URL has no usable host"
+            canonical_host(&host),
+            "relay URL host must be a DNS name, a dotted-quad IPv4 address or a bracketed IPv6 address"
         );
-        Ok((tls, host.to_lowercase(), port, path))
+        Ok((tls, host, port, path))
     }
 
     /// The lowercase host a node signs against, spec 3.1.  The port is not part
@@ -131,6 +124,46 @@ impl RelaySpec {
         );
         Ok(format!("wss://{host}:{port}{path}"))
     }
+}
+
+/// Whether a lowercase relay host is one that a native dial and the WHATWG
+/// URL parser a browser uses read identically, so both reach, and a node
+/// signs against, the same host:
+///
+/// * a DNS name of letter-digit-hyphen labels (punycode for anything
+///   else), whose last label does not look like a number, since WHATWG
+///   would read that as an IPv4 address;
+/// * an IPv4 address in canonical dotted-decimal form (no octal, hex or
+///   short forms, which WHATWG rewrites);
+/// * an IPv6 address in brackets, in its canonical compressed form
+///   (WHATWG re-serialises any other spelling).
+fn canonical_host(host: &str) -> bool {
+    if let Some(inner) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        return inner
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok_and(|addr| !inner.contains('.') && addr.to_string() == inner);
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    let last = labels.last().copied().unwrap_or_default();
+    let numeric = !last.is_empty()
+        && (last.bytes().all(|b| b.is_ascii_digit())
+            || last
+                .strip_prefix("0x")
+                .is_some_and(|hex| hex.bytes().all(|b| b.is_ascii_hexdigit())));
+    if numeric {
+        return host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|addr| addr.to_string() == host);
+    }
+    host.len() <= 253
+        && labels.iter().all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -929,19 +962,27 @@ mod tests {
         );
     }
 
-    /// Native and browser read one host from a relay URL, because anything
-    /// two URL parsers could read differently is refused outright.
+    /// Only a canonical host (a DNS name, a dotted-quad IPv4 address or a
+    /// bracketed canonical IPv6 address) and an optional port pass, so the
+    /// host read here is the one a browser's URL parser reads.
     #[test]
     fn a_relay_url_authority_is_only_a_host_and_port() {
         for (url, host, port) in [
             ("wss://Relay.Example.com", "relay.example.com", 443),
             (
-                "wss://relay.example.com:8443/link?x=1#y",
+                "wss://relay.example.com:8443/link?x=1",
                 "relay.example.com",
                 8443,
             ),
             ("ws://127.0.0.1:7000", "127.0.0.1", 7000),
             ("wss://[::1]:9000/", "[::1]", 9000),
+            ("wss://[2001:db8::1]/", "[2001:db8::1]", 443),
+            ("wss://xn--bcher-kva.example/", "xn--bcher-kva.example", 443),
+            (
+                "wss://relay-1.example.com:0443/",
+                "relay-1.example.com",
+                443,
+            ),
         ] {
             let (_, parsed_host, parsed_port, _) = RelaySpec::plain(url).parts().unwrap();
             assert_eq!((parsed_host.as_str(), parsed_port), (host, port), "{url}");
@@ -952,6 +993,21 @@ mod tests {
             "wss://evil.example.com\\@relay.example.com/",
             "wss://relay.example.com?@evil.example.com",
             "wss://relay.example.com#@evil.example.com",
+            "wss://relay.example.com/link#fragment",
+            "wss://relay.example.com/%2e%2e/link",
+            "wss://relay%2eexample.com/",
+            "wss://bücher.example/",
+            "wss://relay_example.com/",
+            "wss://-relay.example.com/",
+            "wss://relay..example.com/",
+            "wss://relay.example.com./",
+            "wss://0x7f.0.0.1/",
+            "wss://127.1/",
+            "wss://0177.0.0.1/",
+            "wss://2130706433/",
+            "wss://relay.example.123/",
+            "wss://[0:0::1]/",
+            "wss://[::FFFF:127.0.0.1]/",
             "wss://relay.example.com /",
             "wss://relay.example.com/a b",
             "wss://relay.example.com\t/",
