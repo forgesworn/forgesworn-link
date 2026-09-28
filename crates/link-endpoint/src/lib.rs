@@ -11,7 +11,7 @@ mod relay_socket;
 #[cfg(not(wasm_browser))]
 mod relay_tls;
 pub mod rendezvous_book;
-mod rt;
+pub mod rt;
 pub mod session;
 
 pub use endpoint::{

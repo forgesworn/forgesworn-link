@@ -1,0 +1,37 @@
+[package]
+name = "link-web"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The browser engine: link-engine behind a wasm-bindgen surface.  Built for
+# wasm32-unknown-unknown by scripts/build-link-web.sh; on any other target
+# the library is empty and only its end-to-end test compiles.
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
+link-endpoint = { path = "../link-endpoint" }
+link-engine = { path = "../link-engine" }
+link-websocket = { path = "../link-websocket" }
+js-sys = "0.3"
+tokio = { version = "1", default-features = false, features = ["sync"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+
+[dev-dependencies]
+base64.workspace = true
+hex.workspace = true
+link-core = { path = "../link-core" }
+link-endpoint = { path = "../link-endpoint" }
+link-engine = { path = "../link-engine" }
+link-relay = { path = "../link-relay" }
+rustls.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
