@@ -6,6 +6,9 @@
 //! operating system) maps them onto the page's event loop, its timers and
 //! `performance.now()`, because tokio's runtime, its timer and
 //! `std::time::Instant` are not available there.
+//!
+//! Public so the crates above the endpoint (link-websocket, link-engine,
+//! link-web) spawn and keep time on the same runtime as the endpoint.
 
 use std::fmt;
 use std::sync::Arc;

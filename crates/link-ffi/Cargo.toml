@@ -16,20 +16,16 @@ path = "uniffi-bindgen.rs"
 required-features = ["uniffi/cli"]
 
 [dependencies]
-link-core = { path = "../link-core" }
 link-endpoint = { path = "../link-endpoint" }
+link-engine = { path = "../link-engine" }
 link-websocket = { path = "../link-websocket" }
-bytes.workspace = true
-http-body-util.workspace = true
-hyper.workspace = true
-hyper-util.workspace = true
-hex.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 uniffi.workspace = true
-url.workspace = true
-zeroize.workspace = true
 
 [dev-dependencies]
+link-core = { path = "../link-core" }
 link-relay = { path = "../link-relay" }
+hex.workspace = true
 rustls.workspace = true
+zeroize.workspace = true

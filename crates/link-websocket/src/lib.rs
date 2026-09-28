@@ -133,7 +133,7 @@ pub async fn open(
     let (commands, command_rx) = mpsc::channel(OUTBOUND_QUEUE);
     let (overflow, overflow_rx) = watch::channel(false);
     let (incoming_tx, incoming_rx) = mpsc::channel(INBOUND_QUEUE);
-    tokio::spawn(drive(websocket, command_rx, overflow_rx, incoming_tx));
+    link_endpoint::rt::spawn(drive(websocket, command_rx, overflow_rx, incoming_tx));
     Ok((Socket { commands, overflow }, incoming_rx))
 }
 

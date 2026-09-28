@@ -5,6 +5,7 @@ members = [
     "crates/link-relay",
     "crates/link-endpoint",
     "crates/link-websocket",
+    "crates/link-engine",
     "crates/link-ffi",
     "crates/link-spike",
     "crates/link-blossom",

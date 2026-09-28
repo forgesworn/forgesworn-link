@@ -1,24 +1,33 @@
 [package]
-name = "link-websocket"
+name = "link-engine"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 publish.workspace = true
 
+# The paired-route engine behind link-ffi and link-web: route checks, pairing
+# enrolment, the bounded JSON request and the event socket, written once and
+# runtime-neutral.
+
 [dependencies]
-futures-util.workspace = true
 link-core = { path = "../link-core" }
 link-endpoint = { path = "../link-endpoint" }
+link-websocket = { path = "../link-websocket" }
+bytes.workspace = true
+hex.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 thiserror.workspace = true
 url.workspace = true
+zeroize.workspace = true
 
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
 tokio.workspace = true
-tokio-tungstenite.workspace = true
 
-# Browser: only the WebSocket handshake and framing over a Link stream; no
-# socket of its own and no tokio runtime.
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
 tokio = { version = "1", default-features = false, features = ["sync", "macros", "io-util"] }
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+
+[dev-dependencies]
+tokio.workspace = true
