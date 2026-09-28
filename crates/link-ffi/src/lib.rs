@@ -13,7 +13,7 @@ use link_engine::{
 };
 use link_websocket::{IncomingMessage, Socket};
 use thiserror::Error;
-use tokio::runtime::Runtime;
+use tokio::runtime::{Handle, Runtime};
 
 uniffi::setup_scaffolding!();
 
@@ -141,8 +141,9 @@ pub trait LinkSocketListener: Send + Sync {
 
 #[derive(uniffi::Object)]
 pub struct LinkEngine {
-    runtime: Runtime,
-    core: Engine,
+    /// `Some` until drop, which decides how the runtime may end.
+    runtime: Option<Runtime>,
+    core: Arc<Engine>,
 }
 #[derive(uniffi::Object)]
 pub struct LinkSocket {
@@ -229,8 +230,22 @@ impl LinkEngine {
             routes: config.routes.into_iter().map(Route::from).collect(),
         };
         let runtime = Runtime::new().map_err(|error| LinkError::Transport(error.to_string()))?;
-        let core = runtime.block_on(Engine::start(config))?;
-        Ok(Arc::new(Self { runtime, core }))
+        // A fresh runtime cannot be the caller's own, so a caller inside some
+        // other runtime is served from a helper thread rather than refused.
+        let core = if Handle::try_current().is_ok() {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| runtime.block_on(Engine::start(config)))
+                    .join()
+                    .expect("engine start panicked")
+            })
+        } else {
+            runtime.block_on(Engine::start(config))
+        }?;
+        Ok(Arc::new(Self {
+            runtime: Some(runtime),
+            core: Arc::new(core),
+        }))
     }
 
     pub fn open_socket(
@@ -240,9 +255,9 @@ impl LinkEngine {
         listener: Box<dyn LinkSocketListener>,
     ) -> Result<Arc<LinkSocket>, LinkError> {
         let (socket, mut incoming, session) =
-            self.block_on(self.core.open_socket(&virtual_url, &route_id))?;
+            self.block_on(self.core.open_socket(&virtual_url, &route_id))??;
         listener.on_open();
-        self.runtime.spawn(async move {
+        self.runtime().spawn(async move {
             while let Some(message) = incoming.recv().await {
                 match message {
                     IncomingMessage::Text(text) => listener.on_text(text),
@@ -265,7 +280,7 @@ impl LinkEngine {
     /// Ask the paired server to retire this route. Local credentials remain
     /// installed until the product durably records the acknowledged outcome.
     pub fn retire_route(&self, route_id: String) -> Result<(), LinkError> {
-        Ok(self.block_on(self.core.retire_route(&route_id))?)
+        Ok(self.block_on(self.core.retire_route(&route_id))??)
     }
 
     /// Remove the paired transport after the product has durably recorded
@@ -273,7 +288,7 @@ impl LinkEngine {
     /// lost final acknowledgement: application authority was revoked by
     /// `retire_route`, and this method never removes local credentials.
     pub fn finalize_route(&self, route_id: String) -> Result<(), LinkError> {
-        Ok(self.block_on(self.core.finalize_route(&route_id))?)
+        Ok(self.block_on(self.core.finalize_route(&route_id))??)
     }
 
     /// Enrol one durable event route over Link's quarantined provisional
@@ -292,43 +307,61 @@ impl LinkEngine {
             pairing_secret,
             expires_at,
         };
-        Ok(self.block_on(self.core.pair_route(bundle))?.into())
+        Ok(self.block_on(self.core.pair_route(bundle))??.into())
     }
 
     pub fn upsert_route(&self, route: LinkRoute) -> Result<(), LinkError> {
-        Ok(self.block_on(self.core.upsert_route(route.into()))?)
+        Ok(self.block_on(self.core.upsert_route(route.into()))??)
     }
     pub fn remove_route(&self, route_id: String) -> Result<(), LinkError> {
-        Ok(self.block_on(self.core.remove_route(&route_id))?)
+        Ok(self.block_on(self.core.remove_route(&route_id))??)
     }
     pub fn reannounce(&self) -> Result<(), LinkError> {
-        Ok(self.block_on(self.core.reannounce())?)
+        Ok(self.block_on(self.core.reannounce())??)
     }
+    /// Stop the engine.  Called from the engine's own runtime (a socket
+    /// callback), it cannot wait there, so the stop runs in the background.
     pub fn stop(&self) {
-        self.block_on(self.core.stop());
+        let core = self.core.clone();
+        if self.block_on(async move { core.stop().await }).is_err() {
+            let core = self.core.clone();
+            self.runtime().spawn(async move { core.stop().await });
+        }
     }
 }
 
 impl LinkEngine {
-    /// Run one engine call for a synchronous UniFFI method.  Kotlin calls
-    /// from an ordinary thread, which blocks on the engine-owned runtime.  A
-    /// caller already inside a Tokio runtime (Rust embedding the engine, or a
-    /// test) cannot block that way, so its call runs on a scoped helper
-    /// thread instead; either way the caller waits for the result.
-    fn block_on<F>(&self, future: F) -> F::Output
+    fn runtime(&self) -> &Runtime {
+        self.runtime.as_ref().expect("the runtime lives until drop")
+    }
+
+    /// Run one engine call for a synchronous UniFFI method, waiting for it.
+    ///
+    /// Kotlin calls from its own executor, an ordinary thread, which blocks
+    /// on the engine-owned runtime.  A call from the engine's own runtime
+    /// (a socket callback that calls back in) could only deadlock, so it is
+    /// refused with an error.  A call from some other Tokio runtime (Rust
+    /// embedding the engine, or a test) cannot block its own thread on a
+    /// second runtime, so it waits on a scoped helper thread instead.
+    fn block_on<F>(&self, future: F) -> Result<F::Output, LinkError>
     where
         F: std::future::Future + Send,
         F::Output: Send,
     {
-        if tokio::runtime::Handle::try_current().is_err() {
-            return self.runtime.block_on(future);
+        match Handle::try_current() {
+            Err(_) => Ok(self.runtime().block_on(future)),
+            Ok(current) if current.id() == self.runtime().handle().id() => Err(LinkError::Config(
+                "the engine cannot be called from its own runtime (a socket callback); \
+                     call it from another thread"
+                    .into(),
+            )),
+            Ok(_) => Ok(std::thread::scope(|scope| {
+                scope
+                    .spawn(|| self.runtime().block_on(future))
+                    .join()
+                    .expect("engine call panicked")
+            })),
         }
-        std::thread::scope(|scope| {
-            scope
-                .spawn(|| self.runtime.block_on(future))
-                .join()
-                .expect("engine call panicked")
-        })
     }
 
     fn request_json_with_timeout(
@@ -337,8 +370,21 @@ impl LinkEngine {
         timeout: Duration,
     ) -> Result<LinkHttpResponse, LinkError> {
         Ok(self
-            .block_on(self.core.request_json(request.into(), timeout))?
+            .block_on(self.core.request_json(request.into(), timeout))??
             .into())
+    }
+}
+
+impl Drop for LinkEngine {
+    fn drop(&mut self) {
+        // Dropping a runtime waits for its tasks, which a thread inside a
+        // runtime (including this one's, if a task held the last reference)
+        // must not do; there it is shut down without waiting.
+        if let Some(runtime) = self.runtime.take()
+            && Handle::try_current().is_ok()
+        {
+            runtime.shutdown_background();
+        }
     }
 }
 
@@ -385,6 +431,43 @@ mod tests {
         })
         .expect("empty paired route map is a valid tag-mode start");
         engine.stop();
+    }
+
+    /// A socket callback runs on the engine's own runtime; a call back into
+    /// the engine from there is refused rather than left to deadlock, and a
+    /// stop from there still happens, in the background.
+    #[test]
+    fn a_call_from_the_engines_own_runtime_is_refused() {
+        let engine = LinkEngine::start(LinkConfig {
+            transport_seed: vec![0x61; 32],
+            relay_urls: Vec::new(),
+            allow_direct: false,
+            routes: Vec::new(),
+        })
+        .expect("engine");
+        let inside = engine.runtime().spawn({
+            let engine = engine.clone();
+            async move {
+                let refused = engine.remove_route("any".into());
+                engine.stop();
+                refused
+            }
+        });
+        let refused = engine
+            .runtime()
+            .block_on(inside)
+            .expect("callback task")
+            .expect_err("refused on the engine's own runtime");
+        assert!(refused.to_string().contains("its own runtime"), "{refused}");
+        let mut stopped = false;
+        for _ in 0..200 {
+            if matches!(engine.reannounce(), Err(LinkError::Stopped)) {
+                stopped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(stopped, "the background stop took effect");
     }
 
     #[test]

@@ -10,6 +10,7 @@
 //! wrappers only adapt calling conventions.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,7 +25,7 @@ use link_endpoint::rt;
 use link_endpoint::{Endpoint, EndpointConfig, MAX_PAIRING_LIFETIME, RelaySpec, Session};
 use link_websocket::{IncomingMessage, Socket};
 use thiserror::Error;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, watch};
 use url::Url;
 use zeroize::{Zeroize as _, Zeroizing};
 
@@ -387,15 +388,18 @@ struct RouteState {
 }
 
 struct Inner {
-    endpoint: Arc<Endpoint>,
     routes: HashMap<String, RouteState>,
     stopped: bool,
 }
 
 /// The engine.  One lock covers the route table and every first dial, so
 /// simultaneous callers coalesce onto Link's one session per peer before
-/// Link's own newest-session-wins rule could supersede the first one.
+/// Link's own newest-session-wins rule could supersede the first one.  The
+/// endpoint and the stop signal live outside the lock, so `stop` never
+/// waits behind a dial: every dial races the signal and gives way.
 pub struct Engine {
+    endpoint: Arc<Endpoint>,
+    stop: watch::Sender<bool>,
     inner: Mutex<Inner>,
 }
 
@@ -440,12 +444,26 @@ impl Engine {
             .await
             .map_err(|error| EngineError::Transport(error.to_string()))?;
         Ok(Engine {
+            endpoint: Arc::new(endpoint),
+            stop: watch::Sender::new(false),
             inner: Mutex::new(Inner {
-                endpoint: Arc::new(endpoint),
                 routes,
                 stopped: false,
             }),
         })
+    }
+
+    /// `work`, unless the engine stops first.
+    async fn unless_stopped<T>(
+        &self,
+        work: impl Future<Output = Result<T, EngineError>>,
+    ) -> Result<T, EngineError> {
+        let mut stop = self.stop.subscribe();
+        tokio::select! {
+            biased;
+            _ = stop.wait_for(|stopped| *stopped) => Err(EngineError::Stopped),
+            result = work => result,
+        }
     }
 
     /// Open the route's event WebSocket.  The virtual URL must name the
@@ -475,12 +493,14 @@ impl Engine {
                 session.clone()
             } else {
                 let card = route.card.clone();
-                let endpoint = inner.endpoint.clone();
                 let session = Arc::new(
-                    endpoint
-                        .connect(&card)
-                        .await
-                        .map_err(|error| EngineError::Transport(error.to_string()))?,
+                    self.unless_stopped(async {
+                        self.endpoint
+                            .connect(&card)
+                            .await
+                            .map_err(|error| EngineError::Transport(error.to_string()))
+                    })
+                    .await?,
                 );
                 // `route` was only borrowed above and the engine lock means
                 // it cannot have been removed or replaced during this dial.
@@ -527,12 +547,16 @@ impl Engine {
                 session.clone()
             } else {
                 let card = route.card.clone();
-                let endpoint = inner.endpoint.clone();
                 let session = Arc::new(
-                    rt::timeout(timeout, endpoint.connect(&card))
-                        .await
-                        .map_err(|_| EngineError::Transport("cadence request timed out".into()))?
-                        .map_err(|error| EngineError::Transport(error.to_string()))?,
+                    self.unless_stopped(async {
+                        rt::timeout(timeout, self.endpoint.connect(&card))
+                            .await
+                            .map_err(|_| {
+                                EngineError::Transport("cadence request timed out".into())
+                            })?
+                            .map_err(|error| EngineError::Transport(error.to_string()))
+                    })
+                    .await?,
                 );
                 inner
                     .routes
@@ -620,7 +644,7 @@ impl Engine {
                     "route id is already bound to another node".into(),
                 ));
             }
-            inner.endpoint.clone()
+            self.endpoint.clone()
         };
 
         let registration = endpoint
@@ -630,63 +654,68 @@ impl Engine {
         let request_body = route_frame(caller_card.as_bytes());
         let secret_header = Zeroizing::new(hex::encode(raw_pairing.as_ref()));
 
-        let session = endpoint
-            .connect_pairing(&offered_card, &registration)
-            .await
-            .map_err(|error| {
-                let activity = endpoint.pairing_relay_activity(&registration);
-                EngineError::Transport(format!("{error}; {activity}"))
-            })?;
-        let result = async {
-            let route_secret = session
-                .paired_route_secret()
-                .map_err(|error| EngineError::Route(error.to_string()))?;
-            let stream = session
-                .open_stream()
-                .await
-                .map_err(|error| EngineError::Transport(error.to_string()))?;
-            let (mut sender, connection) =
-                hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        let session = self
+            .unless_stopped(async {
+                endpoint
+                    .connect_pairing(&offered_card, &registration)
+                    .await
+                    .map_err(|error| {
+                        let activity = endpoint.pairing_relay_activity(&registration);
+                        EngineError::Transport(format!("{error}; {activity}"))
+                    })
+            })
+            .await?;
+        let result = self
+            .unless_stopped(async {
+                let route_secret = session
+                    .paired_route_secret()
+                    .map_err(|error| EngineError::Route(error.to_string()))?;
+                let stream = session
+                    .open_stream()
                     .await
                     .map_err(|error| EngineError::Transport(error.to_string()))?;
-            rt::spawn(async move {
-                let _ = connection.await;
-            });
-            let request = Request::builder()
-                .method(Method::PUT)
-                .uri("/events/route")
-                .header(hyper::header::HOST, server_node.to_base32())
-                .header(hyper::header::CONTENT_TYPE, "application/octet-stream")
-                .header("x-bothy-pairing-secret", secret_header.as_str())
-                .body(Full::new(Bytes::from(request_body)))
+                let (mut sender, connection) =
+                    hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                        .await
+                        .map_err(|error| EngineError::Transport(error.to_string()))?;
+                rt::spawn(async move {
+                    let _ = connection.await;
+                });
+                let request = Request::builder()
+                    .method(Method::PUT)
+                    .uri("/events/route")
+                    .header(hyper::header::HOST, server_node.to_base32())
+                    .header(hyper::header::CONTENT_TYPE, "application/octet-stream")
+                    .header("x-bothy-pairing-secret", secret_header.as_str())
+                    .body(Full::new(Bytes::from(request_body)))
+                    .map_err(|error| EngineError::Route(error.to_string()))?;
+                let response = sender
+                    .send_request(request)
+                    .await
+                    .map_err(|error| EngineError::Transport(error.to_string()))?;
+                if response.status() != StatusCode::OK {
+                    return Err(EngineError::Route(format!(
+                        "server refused route enrolment with {}",
+                        response.status()
+                    )));
+                }
+                let answer =
+                    collect_bounded(response.into_body(), MAX_ROUTE_FRAME_BYTES, "route").await?;
+                let response_card_bytes = route_card(&answer)?.to_vec();
+                let response_verified_at = rt::unix_now();
+                let response_card = Card::verify(
+                    &response_card_bytes,
+                    &VerifyContext::new(response_verified_at).expecting(server_node),
+                )
                 .map_err(|error| EngineError::Route(error.to_string()))?;
-            let response = sender
-                .send_request(request)
-                .await
-                .map_err(|error| EngineError::Transport(error.to_string()))?;
-            if response.status() != StatusCode::OK {
-                return Err(EngineError::Route(format!(
-                    "server refused route enrolment with {}",
-                    response.status()
-                )));
-            }
-            let answer =
-                collect_bounded(response.into_body(), MAX_ROUTE_FRAME_BYTES, "route").await?;
-            let response_card_bytes = route_card(&answer)?.to_vec();
-            let response_verified_at = rt::unix_now();
-            let response_card = Card::verify(
-                &response_card_bytes,
-                &VerifyContext::new(response_verified_at).expecting(server_node),
-            )
-            .map_err(|error| EngineError::Route(error.to_string()))?;
-            if response_card.serial < offered_card.serial {
-                return Err(EngineError::Route(
-                    "server returned an older card than the pairing bundle".into(),
-                ));
-            }
-            Ok((response_card, route_secret, response_verified_at))
-        }
-        .await;
+                if response_card.serial < offered_card.serial {
+                    return Err(EngineError::Route(
+                        "server returned an older card than the pairing bundle".into(),
+                    ));
+                }
+                Ok((response_card, route_secret, response_verified_at))
+            })
+            .await;
         session.close().await;
         let (paired_card, route_secret, verified_at) = result?;
 
@@ -719,8 +748,7 @@ impl Engine {
                     Ok(existing.session.clone())
                 })
                 .transpose()?;
-            inner
-                .endpoint
+            self.endpoint
                 .rendezvous_book()
                 .expect("tag mode")
                 .upsert_paired(paired_card.node_id, *route_secret);
@@ -760,14 +788,12 @@ impl Engine {
                 })
                 .transpose()?;
             if let Some((old_node, _)) = previous.as_ref() {
-                inner
-                    .endpoint
+                self.endpoint
                     .rendezvous_book()
                     .expect("tag mode")
                     .remove_paired(*old_node);
             }
-            inner
-                .endpoint
+            self.endpoint
                 .rendezvous_book()
                 .expect("tag mode")
                 .upsert_paired(node, *route_secret);
@@ -800,8 +826,7 @@ impl Engine {
                 .routes
                 .remove(route_id)
                 .ok_or_else(|| EngineError::Route("route is not installed".into()))?;
-            inner
-                .endpoint
+            self.endpoint
                 .rendezvous_book()
                 .expect("tag mode")
                 .remove_paired(route.node);
@@ -831,15 +856,18 @@ impl Engine {
         Ok(())
     }
 
-    /// Refuse every later call and close the cached sessions.  Installed
-    /// route credentials stay with the endpoint until the engine is dropped;
-    /// [`Engine::wipe`] removes them at once.
+    /// Refuse every later call, close the cached sessions and close the
+    /// endpoint with its relays.  The stop signal goes first and outside the
+    /// lock, so a dial in progress gives way at once rather than making this
+    /// wait.  Sessions still close with their own code (1) before the
+    /// endpoint closes the rest.  Installed route credentials stay in memory
+    /// until the engine is dropped; [`Engine::wipe`] removes them at once.
     pub async fn stop(&self) {
+        if self.stop.send_replace(true) {
+            return;
+        }
         let sessions: Vec<_> = {
             let mut inner = self.inner.lock().await;
-            if inner.stopped {
-                return;
-            }
             inner.stopped = true;
             inner
                 .routes
@@ -850,24 +878,20 @@ impl Engine {
         for session in sessions {
             session.close(1).await;
         }
+        self.endpoint.close().await;
     }
 
     /// Stop, then forget every route: each paired-route secret leaves the
-    /// rendezvous book (which zeroises it), the route table is emptied, and
-    /// the endpoint closes its relays and connections.
+    /// rendezvous book (which zeroises it) and the route table is emptied.
     pub async fn wipe(&self) {
         self.stop().await;
-        let endpoint = {
-            let mut inner = self.inner.lock().await;
-            let routes = std::mem::take(&mut inner.routes);
-            if let Some(book) = inner.endpoint.rendezvous_book() {
-                for route in routes.values() {
-                    book.remove_paired(route.node);
-                }
+        let mut inner = self.inner.lock().await;
+        let routes = std::mem::take(&mut inner.routes);
+        if let Some(book) = self.endpoint.rendezvous_book() {
+            for route in routes.values() {
+                book.remove_paired(route.node);
             }
-            inner.endpoint.clone()
-        };
-        endpoint.close().await;
+        }
     }
 
     /// The cached session for a route, for tests.  Panics if another call
@@ -907,11 +931,13 @@ impl Engine {
             } else {
                 let card = route.card.clone();
                 let session = Arc::new(
-                    inner
-                        .endpoint
-                        .connect(&card)
-                        .await
-                        .map_err(|error| EngineError::Transport(error.to_string()))?,
+                    self.unless_stopped(async {
+                        self.endpoint
+                            .connect(&card)
+                            .await
+                            .map_err(|error| EngineError::Transport(error.to_string()))
+                    })
+                    .await?,
                 );
                 inner
                     .routes
@@ -1136,5 +1162,62 @@ mod tests {
         oversize.extend_from_slice(&u16::try_from(MAX_CARD_BYTES + 1).unwrap().to_be_bytes());
         oversize.resize(ROUTE_PREFIX_BYTES + MAX_CARD_BYTES + 1, 0);
         assert!(route_card(&oversize).is_err(), "above the card bound");
+    }
+
+    /// `stop` takes effect while another call holds the engine through a
+    /// long first dial: the dial gives way and reports the stop.
+    #[tokio::test]
+    async fn stop_does_not_wait_behind_a_dial() {
+        let now = rt::unix_now();
+        // A relay nothing listens on: the dial waits out its rendezvous.
+        let card = Card::sign(
+            &TransportKey::generate(),
+            now,
+            now + 600,
+            1,
+            vec![link_core::card::Hint::relay("ws://127.0.0.1:9/link")],
+        );
+        let engine = Arc::new(
+            Engine::start(EngineConfig {
+                transport_seed: vec![0x17; 32],
+                relay_urls: Vec::new(),
+                allow_direct: false,
+                routes: vec![Route {
+                    route_id: "unreachable".into(),
+                    card: card.as_bytes().to_vec(),
+                    paired_route_secret: vec![0x29; 32],
+                    card_serial: 1,
+                    card_verified_at: now,
+                }],
+            })
+            .await
+            .expect("engine"),
+        );
+        let dialling = tokio::spawn({
+            let engine = engine.clone();
+            async move {
+                engine
+                    .request_json(
+                        JsonRequest {
+                            route_id: "unreachable".into(),
+                            method: "POST".into(),
+                            path: "/cadence/v1/status".into(),
+                            authorization: "Nostr YQ==".into(),
+                            body: Vec::new(),
+                        },
+                        Duration::from_secs(60),
+                    )
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        tokio::time::timeout(Duration::from_secs(5), engine.stop())
+            .await
+            .expect("stop does not wait behind the dial");
+        let dialled = tokio::time::timeout(Duration::from_secs(5), dialling)
+            .await
+            .expect("the dial gives way")
+            .expect("dial task");
+        assert!(matches!(dialled, Err(EngineError::Stopped)), "{dialled:?}");
     }
 }
