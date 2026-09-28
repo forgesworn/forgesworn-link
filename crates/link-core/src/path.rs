@@ -1,7 +1,10 @@
 //! The path status types of spec section 5.
 
 use std::net::SocketAddr;
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use std::time::Instant;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use web_time::Instant;
 
 use serde::Serialize;
 

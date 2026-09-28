@@ -18,5 +18,14 @@ serde.workspace = true
 sha2.workspace = true
 zeroize.workspace = true
 
+# Browser: `std::time::Instant` and `SystemTime` panic there, so `web-time`
+# stands in (here and inside rustls); randomness, rand's and ring's, comes
+# from `crypto.getRandomValues`.
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
+rustls-pki-types = { version = "1", features = ["web"] }
+web-time = "1"
+
 [dev-dependencies]
 serde_json.workspace = true

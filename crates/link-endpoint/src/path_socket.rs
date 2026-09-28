@@ -2,10 +2,19 @@
 //!
 //! QUIC only ever sees a peer's synthetic address.  Underneath, each datagram
 //! goes out over the relay or over a direct UDP address this side has proved.
+//!
+//! A path socket may be relay-only: it then has no UDP socket at all, so it
+//! offers no candidates, accepts none from a peer, sends no probe and never
+//! proves a direct path.  A browser build (`wasm_browser`) is always
+//! relay-only.  It has no UDP to bind, and its direct socket type is
+//! uninhabited, so no browser build can ever attempt a direct path, a
+//! reflector query or a LAN address: the only way out is the relay.
 
 use std::collections::HashMap;
 use std::io::{self, IoSliceMut};
-use std::net::{IpAddr, SocketAddr};
+#[cfg(not(wasm_browser))]
+use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -14,18 +23,40 @@ use std::time::Duration;
 use link_core::card::unmap_ipv6;
 use link_core::id::{NodeId, TransportKey};
 use link_core::wire::{
-    MAX_DATAGRAM, PROBE_ID_BYTES, PROBE_KEY_BYTES, PROBE_PING, PROBE_PONG, Probe, REFLECT_MAGIC,
-    REFLECT_REPLY_BYTES, parse_reflect_reply, reflect_request,
+    MAX_DATAGRAM, PROBE_ID_BYTES, PROBE_KEY_BYTES, PROBE_PING, Probe, reflect_request,
 };
+#[cfg(not(wasm_browser))]
+use link_core::wire::{PROBE_PONG, REFLECT_MAGIC, REFLECT_REPLY_BYTES, parse_reflect_reply};
 use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, UdpPoller};
 use rand::RngCore;
-use tokio::net::UdpSocket;
 use tokio::sync::{Notify, mpsc, watch};
-use tracing::{debug, trace};
+#[cfg(not(wasm_browser))]
+use tracing::debug;
+use tracing::trace;
 
 use crate::relay_client::{QueueOutcome, RelayDriver, RelayInbound, RelaySpec};
 use crate::rt::{self, Instant};
+
+/// The direct half of a path socket: a real UDP socket on a native build.
+#[cfg(not(wasm_browser))]
+type DirectSocket = tokio::net::UdpSocket;
+
+/// A browser has no UDP, so its direct socket cannot exist: `Option<Arc<
+/// DirectSocket>>` is always `None` there, by type rather than by care.
+#[cfg(wasm_browser)]
+enum DirectSocket {}
+
+#[cfg(wasm_browser)]
+impl DirectSocket {
+    fn try_send_to(&self, _: &[u8], _: SocketAddr) -> io::Result<usize> {
+        match *self {}
+    }
+
+    fn poll_send_ready(&self, _: &mut Context) -> Poll<io::Result<()>> {
+        match *self {}
+    }
+}
 
 /// A direct path counts as usable only while its proof is this fresh, spec 4.1.
 pub const DIRECT_FRESH: Duration = Duration::from_secs(15);
@@ -33,9 +64,11 @@ pub const DIRECT_FRESH: Duration = Duration::from_secs(15);
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// At most one probe back per address per interval, so two peers cannot get
 /// into a ping storm.
+#[cfg(not(wasm_browser))]
 const COUNTER_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 /// At most one pong per source address per interval, so a replayed ping is
 /// a nuisance rather than a reflector, spec 4.2.
+#[cfg(not(wasm_browser))]
 const PONG_INTERVAL: Duration = Duration::from_secs(1);
 /// An address learnt from a valid ping is probed for this long; if it never
 /// proves it is forgotten, so a replayed ping cannot pad the candidate list.
@@ -102,7 +135,8 @@ struct Inner {
 /// Everything the path socket knows, shared with the sessions above it.
 pub struct Paths {
     key: TransportKey,
-    udp: Arc<UdpSocket>,
+    /// `None` for a relay-only path socket, which is never direct.
+    udp: Option<Arc<DirectSocket>>,
     relay: crate::relay_client::RelayClient,
     inner: Mutex<Inner>,
     inbound_tx: mpsc::Sender<Inbound>,
@@ -114,6 +148,7 @@ pub struct Paths {
     /// The interface monitor's generation, spec 4.2; sessions subscribe.
     net: watch::Receiver<u64>,
     local_synthetic: SocketAddr,
+    /// The UDP socket's address; unspecified with port zero when relay-only.
     udp_local: SocketAddr,
 }
 
@@ -130,6 +165,11 @@ impl Paths {
 
     pub fn udp_local(&self) -> SocketAddr {
         self.udp_local
+    }
+
+    /// No UDP socket, so no direct path, ever.  Always true in a browser.
+    pub fn is_relay_only(&self) -> bool {
+        self.udp.is_none()
     }
 
     pub fn relay(&self) -> &crate::relay_client::RelayClient {
@@ -190,6 +230,9 @@ impl Paths {
 
     /// The current direct proof, if any, regardless of freshness.
     pub fn proven_direct(&self, peer: NodeId) -> Option<Proven> {
+        if self.is_relay_only() {
+            return None;
+        }
         self.inner
             .lock()
             .expect("paths")
@@ -268,8 +311,9 @@ impl Paths {
     }
 
     fn can_reach(&self, addr: SocketAddr) -> bool {
-        // A socket bound to IPv4 cannot address a real IPv6 peer and the reverse.
-        self.udp_local.is_ipv4() == addr.is_ipv4()
+        // Relay-only reaches no address directly.  A socket bound to IPv4
+        // cannot address a real IPv6 peer and the reverse.
+        !self.is_relay_only() && self.udp_local.is_ipv4() == addr.is_ipv4()
     }
 
     /// Give a session its probe key, spec 4.2: both ends exported the same
@@ -399,6 +443,9 @@ impl Paths {
     }
 
     fn send_ping(&self, peer: NodeId, addr: SocketAddr) -> bool {
+        let Some(udp) = &self.udp else {
+            return false;
+        };
         let mut nonce = [0u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
         let wire = {
@@ -417,7 +464,7 @@ impl Paths {
             }
             .seal(&key)
         };
-        if self.udp.try_send_to(&wire, addr).is_ok() {
+        if udp.try_send_to(&wire, addr).is_ok() {
             trace!(peer = %peer, %addr, "probe ping sent");
             true
         } else {
@@ -427,10 +474,13 @@ impl Paths {
 
     /// Ask the reflector for this node's reflexive candidate, spec 3.2.
     pub fn query_reflector(&self, reflector: SocketAddr) {
+        let Some(udp) = &self.udp else {
+            return;
+        };
         let mut nonce = [0u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
         *self.reflector_nonce.lock().expect("reflector nonce") = Some(nonce);
-        let _ = self.udp.try_send_to(&reflect_request(&nonce), reflector);
+        let _ = udp.try_send_to(&reflect_request(&nonce), reflector);
     }
 
     /// Ask the configured reflector again, after an interface change.  The
@@ -453,8 +503,13 @@ impl Paths {
     }
 
     /// Local interface candidates plus the reflector result, spec 4.2.
+    /// Relay-only has none.
     pub fn local_candidates(&self) -> Vec<SocketAddr> {
         let mut out = Vec::new();
+        if self.is_relay_only() {
+            return out;
+        }
+        #[cfg(not(wasm_browser))]
         if self.udp_local.ip().is_unspecified() {
             for ip in local_addresses(self.udp_local.is_ipv4()) {
                 out.push(SocketAddr::new(ip, self.udp_local.port()));
@@ -471,6 +526,7 @@ impl Paths {
     }
 
     /// The session a probe's key id belongs to, with its key, spec 4.2.
+    #[cfg(not(wasm_browser))]
     fn probe_session(&self, key_id: &ProbeKeyId) -> Option<(NodeId, ProbeKey)> {
         let inner = self.inner.lock().expect("paths");
         let peer = *inner.by_key_id.get(key_id)?;
@@ -478,8 +534,14 @@ impl Paths {
         Some((peer, key))
     }
 
-    /// A probe that opened under `peer`'s session key, from `from`.
+    /// A probe that opened under `peer`'s session key, from `from`.  Only
+    /// the direct receive task calls this, so a browser build has none.
+    #[cfg(not(wasm_browser))]
     fn handle_probe(&self, peer: NodeId, key: ProbeKey, probe: Probe, from: SocketAddr) {
+        // Relay-only answers nothing and proves nothing.
+        let Some(udp) = &self.udp else {
+            return;
+        };
         match probe.kind {
             PROBE_PING => {
                 let now = Instant::now();
@@ -519,7 +581,7 @@ impl Paths {
                         nonce: probe.nonce,
                     }
                     .seal(&key);
-                    let _ = self.udp.try_send_to(&pong, from);
+                    let _ = udp.try_send_to(&pong, from);
                 }
                 if probe_back {
                     self.send_ping(peer, from);
@@ -566,6 +628,7 @@ pub const MAX_LOCAL_CANDIDATES: usize = 8;
 /// The address the default route would use for the given family, learnt by
 /// connecting a UDP socket to a documentation address: no traffic is sent,
 /// but the OS chooses a route and reports the source it would use.
+#[cfg(not(wasm_browser))]
 fn default_route_address(v4: bool) -> Option<IpAddr> {
     let (target, bind) = if v4 {
         ("192.0.2.1:9", "0.0.0.0:0")
@@ -583,6 +646,7 @@ fn default_route_address(v4: bool) -> Option<IpAddr> {
 /// Link-local addresses are never useful to a peer: an IPv6 one needs a
 /// scope the wire cannot carry, and an IPv4 one means no address was
 /// assigned at all.
+#[cfg(not(wasm_browser))]
 fn is_link_local(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4.is_link_local(),
@@ -597,6 +661,7 @@ fn is_link_local(ip: IpAddr) -> bool {
 /// whenever a VPN held the default route (acceptance record, 27 August 2026):
 /// the tunnel address was the only candidate, and the LAN address that would
 /// have worked was never offered.
+#[cfg(not(wasm_browser))]
 pub fn local_addresses(v4: bool) -> Vec<IpAddr> {
     let mut out: Vec<IpAddr> = Vec::new();
     let offer = |ip: IpAddr, out: &mut Vec<IpAddr>| {
@@ -640,7 +705,9 @@ impl std::fmt::Debug for PathSocket {
     }
 }
 
-/// Build the path socket and start its two receive tasks.
+/// Build the path socket over a UDP socket bound to `bind` and start its
+/// two receive tasks.
+#[cfg(not(wasm_browser))]
 pub async fn build(
     key: TransportKey,
     bind: SocketAddr,
@@ -649,8 +716,43 @@ pub async fn build(
     reflector: Option<SocketAddr>,
     net: watch::Receiver<u64>,
 ) -> io::Result<(Arc<PathSocket>, Arc<Paths>)> {
-    let udp = Arc::new(UdpSocket::bind(bind).await?);
+    let udp = Arc::new(DirectSocket::bind(bind).await?);
     let udp_local = udp.local_addr()?;
+    let (socket, paths) = assemble(
+        key,
+        Some(udp.clone()),
+        udp_local,
+        relays,
+        book,
+        reflector,
+        net,
+    );
+    spawn_direct_inbound(paths.clone(), udp);
+    Ok((socket, paths))
+}
+
+/// Build a relay-only path socket, which has no UDP socket, and start its
+/// relay receive task.  This is the only path socket a browser has.
+#[cfg(any(wasm_browser, test))]
+pub fn build_relay_only(
+    key: TransportKey,
+    relays: Vec<crate::relay_client::RelaySpec>,
+    book: Option<Arc<crate::rendezvous_book::TagBook>>,
+    net: watch::Receiver<u64>,
+) -> (Arc<PathSocket>, Arc<Paths>) {
+    let unbound = SocketAddr::from(([0, 0, 0, 0], 0));
+    assemble(key, None, unbound, relays, book, None, net)
+}
+
+fn assemble(
+    key: TransportKey,
+    udp: Option<Arc<DirectSocket>>,
+    udp_local: SocketAddr,
+    relays: Vec<crate::relay_client::RelaySpec>,
+    book: Option<Arc<crate::rendezvous_book::TagBook>>,
+    reflector: Option<SocketAddr>,
+    net: watch::Receiver<u64>,
+) -> (Arc<PathSocket>, Arc<Paths>) {
     let (inbound_tx, inbound_rx) = mpsc::channel::<Inbound>(INBOUND_CAPACITY);
     let (relay_inbound_tx, mut relay_inbound_rx) = mpsc::channel::<RelayInbound>(INBOUND_CAPACITY);
     let relay = crate::relay_client::spawn(key.clone(), relays, relay_inbound_tx, book);
@@ -658,7 +760,7 @@ pub async fn build(
     let local_synthetic = key.node_id().synthetic_addr();
     let paths = Arc::new(Paths {
         key,
-        udp: udp.clone(),
+        udp,
         relay,
         inner: Mutex::new(Inner::default()),
         inbound_tx,
@@ -687,71 +789,70 @@ pub async fn build(
         });
     }
 
-    // Direct inbound: probes, reflector replies, and datagrams from proven addresses.
-    {
-        let paths = paths.clone();
-        rt::spawn(async move {
-            let mut buf = vec![0u8; 2048];
-            loop {
-                let (len, from) = match udp.recv_from(&mut buf).await {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        debug!(error = %e, "direct socket receive failed");
-                        continue;
-                    }
-                };
-                let from = unmap_ipv6(from);
-                let data = &buf[..len];
-                if let Some(key_id) = Probe::peek_key_id(data) {
-                    // A probe names a session by key id; one that opens under
-                    // that session's key is handled, anything else is silence.
-                    if let Some((peer, key)) = paths.probe_session(&key_id)
-                        && let Some(probe) = Probe::open(data, &key)
-                    {
-                        paths.handle_probe(peer, key, probe, from);
-                    }
-                    continue;
-                }
-                if len == REFLECT_REPLY_BYTES && data[..4] == REFLECT_MAGIC {
-                    if let Some((nonce, observed)) = parse_reflect_reply(data) {
-                        // Only the reply to this node's own outstanding request
-                        // counts; anything else could plant a false reflexive
-                        // candidate.
-                        let matched = paths
-                            .reflector_nonce
-                            .lock()
-                            .expect("reflector nonce")
-                            .take_if(|expected| *expected == nonce)
-                            .is_some();
-                        if matched {
-                            *paths.reflexive.lock().expect("reflexive") =
-                                Some(unmap_ipv6(observed));
-                        }
-                    }
-                    continue;
-                }
-                // A datagram from an unproven address is dropped, spec 4.1.
-                let peer = paths
-                    .inner
-                    .lock()
-                    .expect("paths")
-                    .by_direct
-                    .get(&from)
-                    .copied();
-                match peer {
-                    Some(peer) => paths.deliver(peer.synthetic_addr(), data),
-                    None => trace!(%from, "dropped datagram from an unproven address"),
-                }
-            }
-        });
-    }
-
     let socket = Arc::new(PathSocket {
         paths: paths.clone(),
         inbound_rx: Mutex::new(inbound_rx),
         blocked_on: Arc::new(Mutex::new(None)),
     });
-    Ok((socket, paths))
+    (socket, paths)
+}
+
+/// Direct inbound: probes, reflector replies, and datagrams from proven addresses.
+#[cfg(not(wasm_browser))]
+fn spawn_direct_inbound(paths: Arc<Paths>, udp: Arc<DirectSocket>) {
+    rt::spawn(async move {
+        let mut buf = vec![0u8; 2048];
+        loop {
+            let (len, from) = match udp.recv_from(&mut buf).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    debug!(error = %e, "direct socket receive failed");
+                    continue;
+                }
+            };
+            let from = unmap_ipv6(from);
+            let data = &buf[..len];
+            if let Some(key_id) = Probe::peek_key_id(data) {
+                // A probe names a session by key id; one that opens under
+                // that session's key is handled, anything else is silence.
+                if let Some((peer, key)) = paths.probe_session(&key_id)
+                    && let Some(probe) = Probe::open(data, &key)
+                {
+                    paths.handle_probe(peer, key, probe, from);
+                }
+                continue;
+            }
+            if len == REFLECT_REPLY_BYTES && data[..4] == REFLECT_MAGIC {
+                if let Some((nonce, observed)) = parse_reflect_reply(data) {
+                    // Only the reply to this node's own outstanding request
+                    // counts; anything else could plant a false reflexive
+                    // candidate.
+                    let matched = paths
+                        .reflector_nonce
+                        .lock()
+                        .expect("reflector nonce")
+                        .take_if(|expected| *expected == nonce)
+                        .is_some();
+                    if matched {
+                        *paths.reflexive.lock().expect("reflexive") = Some(unmap_ipv6(observed));
+                    }
+                }
+                continue;
+            }
+            // A datagram from an unproven address is dropped, spec 4.1.
+            let peer = paths
+                .inner
+                .lock()
+                .expect("paths")
+                .by_direct
+                .get(&from)
+                .copied();
+            match peer {
+                Some(peer) => paths.deliver(peer.synthetic_addr(), data),
+                None => trace!(%from, "dropped datagram from an unproven address"),
+            }
+        }
+    });
 }
 
 /// Write-readiness across both paths: the real UDP socket for direct sends and
@@ -779,10 +880,12 @@ impl Drop for Poller {
 
 impl UdpPoller for Poller {
     fn poll_writable(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
-        match self.paths.udp.poll_send_ready(cx) {
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Ready(Ok(())) => {}
+        if let Some(udp) = &self.paths.udp {
+            match udp.poll_send_ready(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(())) => {}
+            }
         }
         let has_capacity = || match *self.blocked_on.lock().expect("blocked") {
             Some(id) => self
@@ -830,10 +933,11 @@ impl AsyncUdpSocket for PathSocket {
         let direct = self
             .paths
             .proven_direct(peer)
-            .filter(|p| p.proved_at.elapsed() < DIRECT_FRESH);
+            .filter(|p| p.proved_at.elapsed() < DIRECT_FRESH)
+            .zip(self.paths.udp.as_ref());
         match direct {
-            Some(proven) => {
-                match self.paths.udp.try_send_to(transmit.contents, proven.addr) {
+            Some((proven, udp)) => {
+                match udp.try_send_to(transmit.contents, proven.addr) {
                     Ok(_) => {}
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                         trace!("direct send buffer full, datagram dropped");
@@ -964,6 +1068,7 @@ mod probes {
     use super::*;
     use crate::netmon::NetMonitor;
     use link_core::wire::{PROBE_ID_BYTES, PROBE_KEY_BYTES};
+    use tokio::net::UdpSocket;
 
     async fn paths() -> Arc<Paths> {
         let net = NetMonitor::spawn(Duration::ZERO, Vec::new);
@@ -1089,6 +1194,95 @@ mod probes {
                 .probe_targets(peer)
                 .contains(&attacker.local_addr().unwrap()),
             "a forger's address is never a candidate"
+        );
+    }
+
+    /// The relay-only rule: a path socket with no UDP socket, the only kind
+    /// a browser build has, never goes direct.  It offers no candidate,
+    /// keeps none a peer sends, sends no probe or reflector query, answers
+    /// no ping, turns no pong into a proof, and hands every datagram quinn
+    /// sends to the relay.  The same pong on a direct-capable socket does
+    /// prove, so the refusal is the rule and not an accident of the setup.
+    #[tokio::test]
+    async fn a_relay_only_socket_never_goes_direct() {
+        let peer = NodeId([9u8; 32]);
+        let key = [0x42u8; PROBE_KEY_BYTES];
+        let key_id = [0x24u8; PROBE_ID_BYTES];
+        let nonce = [7u8; 16];
+        let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let pong = || Probe {
+            kind: PROBE_PONG,
+            key_id,
+            nonce,
+        };
+        let issue = |paths: &Paths| {
+            paths
+                .inner
+                .lock()
+                .unwrap()
+                .peers
+                .entry(peer)
+                .or_default()
+                .pending
+                .insert(nonce, (addr, Instant::now()));
+        };
+
+        let direct = paths().await;
+        assert!(!direct.is_relay_only());
+        direct.register_peer(peer);
+        direct.register_probe_key(peer, key_id, key);
+        issue(&direct);
+        direct.handle_probe(peer, key, pong(), addr);
+        assert_eq!(
+            direct.proven_direct(peer).map(|p| p.addr),
+            Some(addr),
+            "control: a direct-capable socket proves on this pong"
+        );
+
+        let net = NetMonitor::spawn(Duration::ZERO, Vec::new);
+        let (socket, paths) = build_relay_only(TransportKey::generate(), Vec::new(), None, net);
+        assert!(paths.is_relay_only());
+        assert!(
+            paths.local_candidates().is_empty(),
+            "no candidate is offered"
+        );
+        paths.register_peer(peer);
+        paths.register_probe_key(peer, key_id, key);
+        paths.set_peer_candidates(peer, vec![addr]);
+        assert!(
+            paths.peer_candidates(peer).is_empty(),
+            "a peer's candidates are not kept"
+        );
+        assert_eq!(paths.send_probes(peer), 0, "no probe is sent");
+        paths.query_reflector(addr);
+        let ping = Probe {
+            kind: PROBE_PING,
+            key_id,
+            nonce,
+        };
+        paths.handle_probe(peer, key, ping, addr);
+        assert!(
+            paths.probe_targets(peer).is_empty(),
+            "a ping teaches no address"
+        );
+        issue(&paths);
+        paths.handle_probe(peer, key, pong(), addr);
+        assert!(paths.proven_direct(peer).is_none(), "a pong proves nothing");
+
+        let transmit = Transmit {
+            destination: peer.synthetic_addr(),
+            ecn: None,
+            contents: &[1, 2, 3],
+            segment_size: None,
+            src_ip: None,
+        };
+        socket.try_send(&transmit).expect("handed to the relay");
+        assert!(
+            received_within(&listener, Duration::from_millis(300))
+                .await
+                .is_empty(),
+            "nothing ever reaches a UDP address"
         );
     }
 }

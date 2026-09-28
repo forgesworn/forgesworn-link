@@ -20,8 +20,8 @@ use rustls::server::AlwaysResolvesServerRawPublicKeys;
 use rustls::sign::CertifiedKey;
 use tracing::{info, warn};
 
-use crate::netmon::{NetMonitor, interface_snapshot};
-use crate::path_socket::{Paths, build};
+use crate::netmon::NetMonitor;
+use crate::path_socket::Paths;
 use crate::relay_client::{RelayActivitySnapshot, RelayDriver, RelaySpec, RelayStatus};
 use crate::rendezvous_book::{PairingRegistration, RendezvousPeer, TagBook};
 use crate::rt;
@@ -177,6 +177,13 @@ impl PairingSession {
     }
 }
 
+/// In a browser (`wasm_browser`) an endpoint is relay-only, always: its one
+/// path is the page's WebSocket to a Link relay, over `wss://` with the
+/// browser's own WebPKI verification.  `allow_direct` and `reflector` must be
+/// left off (`open` refuses them rather than ignore an explicit request),
+/// `bind` and `net_poll` are unused, and a relay spec with a pinned or
+/// insecure certificate, or a `ws://` URL, is refused.  There is no UDP, no
+/// LAN candidate and no fallback to anything but a Link relay.
 #[derive(Clone)]
 pub struct EndpointConfig {
     pub key: TransportKey,
@@ -224,10 +231,14 @@ impl EndpointConfig {
             key,
             serial_seed: None,
             relays: Vec::new(),
-            allow_direct: true,
+            allow_direct: cfg!(not(wasm_browser)),
             bind: "0.0.0.0:0".parse().expect("literal"),
             reflector: None,
-            net_poll: Duration::from_secs(5),
+            net_poll: if cfg!(wasm_browser) {
+                Duration::ZERO
+            } else {
+                Duration::from_secs(5)
+            },
             probe_delay: Duration::ZERO,
             rendezvous_timeout: Duration::from_secs(30),
             rendezvous: None,
@@ -260,16 +271,30 @@ impl Endpoint {
                 config.paired_routes.take().unwrap_or_default(),
             ))
         });
-        let net = NetMonitor::spawn(config.net_poll, interface_snapshot);
-        let (socket, paths) = build(
-            config.key.clone(),
-            config.bind,
-            config.relays.clone(),
-            book.clone(),
-            config.reflector,
-            net,
-        )
-        .await?;
+        #[cfg(not(wasm_browser))]
+        let (socket, paths) = {
+            let net = NetMonitor::spawn(config.net_poll, crate::netmon::interface_snapshot);
+            crate::path_socket::build(
+                config.key.clone(),
+                config.bind,
+                config.relays.clone(),
+                book.clone(),
+                config.reflector,
+                net,
+            )
+            .await?
+        };
+        #[cfg(wasm_browser)]
+        let (socket, paths) = {
+            browser_config_check(&config)?;
+            let net = NetMonitor::spawn(Duration::ZERO, Vec::new);
+            crate::path_socket::build_relay_only(
+                config.key.clone(),
+                config.relays.clone(),
+                book.clone(),
+                net,
+            )
+        };
 
         let mut endpoint_config = quinn::EndpointConfig::default();
         endpoint_config.max_udp_payload_size(MAX_MTU)?;
@@ -804,6 +829,24 @@ fn promote_pairing_route(
     Ok(generation)
 }
 
+/// The browser rule of [`EndpointConfig`]: relay-only, and every relay a
+/// plain `wss://` spec the browser can verify itself.
+#[cfg(any(wasm_browser, test))]
+fn browser_config_check(config: &EndpointConfig) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !config.allow_direct,
+        "a browser endpoint is relay-only; allow_direct must be false"
+    );
+    anyhow::ensure!(
+        config.reflector.is_none(),
+        "a browser endpoint is relay-only; it has no reflector"
+    );
+    for relay in &config.relays {
+        relay.browser_url()?;
+    }
+    Ok(())
+}
+
 fn classify(error: &quinn::ConnectionError) -> FailReason {
     match error {
         quinn::ConnectionError::TimedOut => FailReason::Timeout,
@@ -846,4 +889,44 @@ fn transport_config_with(max_bidi_streams: u32, idle_timeout: Duration) -> quinn
             quinn::IdleTimeout::try_from(idle_timeout).expect("idle"),
         ));
     config
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A browser endpoint is relay-only: an explicit request for a direct
+    /// path or a reflector is refused rather than ignored, and so is any
+    /// relay a browser WebSocket cannot verify itself.
+    #[test]
+    fn a_browser_endpoint_is_relay_only() {
+        let relay_only = |config: EndpointConfig| EndpointConfig {
+            allow_direct: false,
+            relays: vec![RelaySpec::plain("wss://relay.example.com")],
+            ..config
+        };
+        let base = relay_only(EndpointConfig::new(TransportKey::generate()));
+        browser_config_check(&base).expect("plain wss:// and relay-only is allowed");
+
+        let direct = EndpointConfig {
+            allow_direct: true,
+            ..base.clone()
+        };
+        assert!(browser_config_check(&direct).is_err());
+        let reflector = EndpointConfig {
+            reflector: Some("192.0.2.1:3478".parse().unwrap()),
+            ..base.clone()
+        };
+        assert!(browser_config_check(&reflector).is_err());
+        for relay in [
+            RelaySpec::plain("ws://127.0.0.1:7000"),
+            RelaySpec::pinned("wss://relay.example.com", "ab".repeat(32)),
+        ] {
+            let config = EndpointConfig {
+                relays: vec![RelaySpec::plain("wss://relay.example.com"), relay],
+                ..base.clone()
+            };
+            assert!(browser_config_check(&config).is_err());
+        }
+    }
 }

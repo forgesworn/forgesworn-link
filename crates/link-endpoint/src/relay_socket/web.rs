@@ -163,12 +163,6 @@ impl RelaySocket {
             .map_err(|e| anyhow::anyhow!("relay send failed: {e:?}"))
     }
 
-    /// A browser answers WebSocket-level pings itself and never surfaces
-    /// one, so there is never anything to send.
-    pub async fn pong(&mut self, _payload: Vec<u8>) -> anyhow::Result<()> {
-        Ok(())
-    }
-
     pub async fn next(&mut self) -> Option<anyhow::Result<WsMessage>> {
         poll_fn(|cx| {
             let mut shared = self.shared.borrow_mut();

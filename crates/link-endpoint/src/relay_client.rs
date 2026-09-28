@@ -841,11 +841,13 @@ async fn pump(
                         }
                         _ => return PumpEnd::Lost,
                     },
+                    #[cfg(not(wasm_browser))]
                     WsMessage::Ping(payload) => {
                         if ws.pong(payload).await.is_err() {
                             return PumpEnd::Lost;
                         }
                     }
+                    #[cfg(not(wasm_browser))]
                     WsMessage::Pong => {}
                     WsMessage::Other => return PumpEnd::Lost,
                 }

@@ -6,6 +6,9 @@
 //! notification would also amount to in practice; an application that has a
 //! connectivity callback calls `Session::reannounce` itself and may set the
 //! poll to zero to switch this off.
+//!
+//! A browser build has no interfaces to read and no direct path to re-announce,
+//! so its endpoint runs this with a zero poll: inert.
 
 use std::net::IpAddr;
 use std::time::Duration;
@@ -60,6 +63,7 @@ fn normalised(mut set: Vec<IpAddr>) -> Vec<IpAddr> {
 }
 
 /// Every interface address on the host, the snapshot an endpoint monitors.
+#[cfg(not(wasm_browser))]
 pub fn interface_snapshot() -> Vec<IpAddr> {
     if_addrs::get_if_addrs()
         .map(|list| list.into_iter().map(|interface| interface.ip()).collect())

@@ -9,7 +9,8 @@
 //! * `open(spec)` -- a WebSocket to the relay, ready for the challenge.  The
 //!   caller bounds it with its connect timeout.
 //! * `send(bytes)` -- one binary message.
-//! * `pong(payload)` -- answer a WebSocket-level ping.
+//! * `pong(payload)` -- answer a WebSocket-level ping (native only: a
+//!   browser answers pings itself and never surfaces one).
 //! * `next()` -- the next message, `None` once the socket has ended.  Cancel
 //!   safe, so it may sit in a `select!` arm.
 //!
@@ -30,9 +31,11 @@ pub use web::RelaySocket;
 /// One WebSocket message, as far as the relay protocol cares.
 pub enum WsMessage {
     Binary(Vec<u8>),
-    /// A WebSocket-level ping.  A browser answers these itself and never
-    /// surfaces one.
+    /// WebSocket-level ping and pong.  A browser handles these itself and
+    /// never surfaces one.
+    #[cfg(not(wasm_browser))]
     Ping(Vec<u8>),
+    #[cfg(not(wasm_browser))]
     Pong,
     /// Text, a close or a raw frame: nothing a relay sends on a live session.
     Other,
