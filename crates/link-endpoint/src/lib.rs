@@ -7,6 +7,7 @@ pub mod endpoint;
 pub mod netmon;
 pub mod path_socket;
 pub mod relay_client;
+mod relay_socket;
 mod relay_tls;
 pub mod rendezvous_book;
 mod rt;

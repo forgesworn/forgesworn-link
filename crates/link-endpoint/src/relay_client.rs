@@ -6,18 +6,18 @@ use std::sync::{Arc, Mutex};
 use std::task::Waker;
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
 use link_core::id::{NodeId, TransportKey};
 use link_core::wire::{CLOSE_REASON_SUPERSEDED, Frame, MAX_QUEUED_FRAMES};
 use rand::RngCore;
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, watch};
-use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
+use crate::relay_socket::{RelaySocket, WsMessage};
 use crate::rendezvous_book::TagBook;
 use crate::rt;
+
+#[cfg(not(wasm_browser))]
+pub use crate::relay_socket::Duplex;
 
 /// Backoff bounds of spec 4.3.
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
@@ -57,7 +57,7 @@ impl RelaySpec {
         }
     }
 
-    fn parts(&self) -> anyhow::Result<(bool, String, u16, String)> {
+    pub(crate) fn parts(&self) -> anyhow::Result<(bool, String, u16, String)> {
         let (tls, rest) = if let Some(rest) = self.url.strip_prefix("wss://") {
             (true, rest)
         } else if let Some(rest) = self.url.strip_prefix("ws://") {
@@ -82,6 +82,33 @@ impl RelaySpec {
     /// of it, which the spec does not say explicitly.
     pub fn host(&self) -> anyhow::Result<String> {
         Ok(self.parts()?.1)
+    }
+
+    /// The URL a browser opens for this relay, or why it must not open one.
+    /// A browser WebSocket verifies the relay's certificate against the
+    /// browser's own WebPKI roots and offers no hook to change that, so only
+    /// a plain `wss://` spec can be honoured as written: a pinned leaf cannot
+    /// be checked, an insecure one cannot be accepted, and `ws://` is never
+    /// offered.  Each is refused, never downgraded.
+    #[cfg(any(wasm_browser, test))]
+    pub(crate) fn browser_url(&self) -> anyhow::Result<String> {
+        anyhow::ensure!(
+            self.cert_sha256.is_none(),
+            "{} needs a pinned certificate, which a browser cannot check",
+            self.url
+        );
+        anyhow::ensure!(
+            !self.insecure_tls,
+            "{} asks for an unverified certificate, which a browser never accepts",
+            self.url
+        );
+        let (tls, host, port, path) = self.parts()?;
+        anyhow::ensure!(
+            tls,
+            "a browser reaches relays only over wss://, not {}",
+            self.url
+        );
+        Ok(format!("wss://{host}:{port}{path}"))
     }
 }
 
@@ -637,8 +664,6 @@ async fn driver(
     }
 }
 
-type Socket = tokio_tungstenite::WebSocketStream<Box<dyn Duplex>>;
-
 /// Why a relay session ended, as far as the pump can tell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PumpEnd {
@@ -651,33 +676,14 @@ enum PumpEnd {
     Superseded,
 }
 
-pub trait Duplex: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> Duplex for T {}
-
 async fn connect(
     key: &TransportKey,
     spec: &RelaySpec,
     book: Option<&TagBook>,
     activity: &RelayActivity,
-) -> anyhow::Result<Socket> {
-    let (tls, host, port, path) = spec.parts()?;
-    let stream = rt::timeout(
-        Duration::from_secs(10),
-        TcpStream::connect((host.as_str(), port)),
-    )
-    .await??;
-    stream.set_nodelay(true).ok();
-
-    let transport: Box<dyn Duplex> = if tls {
-        let connector = crate::relay_tls::connector(spec)?;
-        let server_name = rustls::pki_types::ServerName::try_from(host.clone())?;
-        Box::new(connector.connect(server_name, stream).await?)
-    } else {
-        Box::new(stream)
-    };
-
-    let request = format!("{}://{host}:{port}{path}", if tls { "wss" } else { "ws" });
-    let (mut ws, _) = tokio_tungstenite::client_async(request, transport).await?;
+) -> anyhow::Result<RelaySocket> {
+    let host = spec.host()?;
+    let mut ws = RelaySocket::open(spec).await?;
 
     // First contact: identity auth (spec 3.1) or tag registration (spec 9).
     let challenge = match next_frame(&mut ws).await? {
@@ -687,13 +693,13 @@ async fn connect(
     match book {
         None => {
             let signature = link_core::wire::sign_relay_auth(key, &host, &challenge);
-            ws.send(Message::Binary(
+            ws.send(
                 Frame::Auth {
                     node_id: key.node_id(),
                     signature,
                 }
                 .encode(),
-            ))
+            )
             .await?;
         }
         Some(book) => {
@@ -703,8 +709,7 @@ async fn connect(
             if tags.is_empty() {
                 anyhow::bail!("tag mode with no rendezvous pairs to register");
             }
-            ws.send(Message::Binary(Frame::Register { tags }.encode()))
-                .await?;
+            ws.send(Frame::Register { tags }.encode()).await?;
             activity.registrations_sent.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -714,12 +719,12 @@ async fn connect(
     }
 }
 
-async fn next_frame(ws: &mut Socket) -> anyhow::Result<Option<Frame>> {
+async fn next_frame(ws: &mut RelaySocket) -> anyhow::Result<Option<Frame>> {
     let message = rt::timeout(Duration::from_secs(10), ws.next())
         .await?
         .transpose()?;
     Ok(match message {
-        Some(Message::Binary(bytes)) => Frame::decode(&bytes),
+        Some(WsMessage::Binary(bytes)) => Frame::decode(&bytes),
         Some(_) => None,
         None => None,
     })
@@ -728,7 +733,7 @@ async fn next_frame(ws: &mut Socket) -> anyhow::Result<Option<Frame>> {
 #[allow(clippy::too_many_arguments)]
 async fn pump(
     driver_id: u64,
-    mut ws: Socket,
+    mut ws: RelaySocket,
     outbound: &mut mpsc::Receiver<Frame>,
     inbound: &mpsc::Sender<RelayInbound>,
     readiness: &WriteReadiness,
@@ -749,7 +754,7 @@ async fn pump(
         tokio::select! {
             _ = ping.tick() => {
                 rand::rngs::OsRng.fill_bytes(&mut nonce);
-                if ws.send(Message::Binary(Frame::Ping(nonce).encode())).await.is_err() {
+                if ws.send(Frame::Ping(nonce).encode()).await.is_err() {
                     return PumpEnd::Lost;
                 }
             }
@@ -761,7 +766,7 @@ async fn pump(
                     last_epoch = current;
                     last_version = version;
                     let tags = book.registration(host, rt::unix_now());
-                    if ws.send(Message::Binary(Frame::Register { tags }.encode())).await.is_err() {
+                    if ws.send(Frame::Register { tags }.encode()).await.is_err() {
                         return PumpEnd::Lost;
                     }
                     activity.registrations_sent.fetch_add(1, Ordering::Relaxed);
@@ -775,7 +780,7 @@ async fn pump(
                 last_epoch = link_core::rendezvous::epoch_index(rt::unix_now());
                 last_version = book.version();
                 let tags = book.registration(host, rt::unix_now());
-                if ws.send(Message::Binary(Frame::Register { tags }.encode())).await.is_err() {
+                if ws.send(Frame::Register { tags }.encode()).await.is_err() {
                     return PumpEnd::Lost;
                 }
                 activity.registrations_sent.fetch_add(1, Ordering::Relaxed);
@@ -783,7 +788,7 @@ async fn pump(
             frame = outbound.recv() => {
                 let Some(frame) = frame else { return PumpEnd::Lost };
                 let is_tag_datagram = matches!(frame, Frame::SendTag { .. });
-                if ws.send(Message::Binary(frame.encode())).await.is_err() {
+                if ws.send(frame.encode()).await.is_err() {
                     return PumpEnd::Lost;
                 }
                 if is_tag_datagram {
@@ -797,7 +802,7 @@ async fn pump(
             message = ws.next() => {
                 let Some(Ok(message)) = message else { return PumpEnd::Lost };
                 match message {
-                    Message::Binary(bytes) => match Frame::decode(&bytes) {
+                    WsMessage::Binary(bytes) => match Frame::decode(&bytes) {
                         Some(Frame::Recv { source, datagram }) => {
                             // Identity deliveries belong to identity sessions.
                             if book.is_some() {
@@ -836,15 +841,65 @@ async fn pump(
                         }
                         _ => return PumpEnd::Lost,
                     },
-                    Message::Ping(payload) => {
-                        if ws.send(Message::Pong(payload)).await.is_err() {
+                    WsMessage::Ping(payload) => {
+                        if ws.pong(payload).await.is_err() {
                             return PumpEnd::Lost;
                         }
                     }
-                    Message::Pong(_) => {}
-                    _ => return PumpEnd::Lost,
+                    WsMessage::Pong => {}
+                    WsMessage::Other => return PumpEnd::Lost,
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A browser opens a relay only as a plain `wss://` spec, which it
+    /// verifies against its own WebPKI roots.  A pin, an insecure flag or
+    /// `ws://` cannot be honoured by a browser WebSocket and is refused
+    /// outright rather than quietly weakened.
+    #[test]
+    fn a_browser_opens_only_plain_wss_relays() {
+        assert_eq!(
+            RelaySpec::plain("wss://Relay.Example.com/link")
+                .browser_url()
+                .unwrap(),
+            "wss://relay.example.com:443/link"
+        );
+        assert_eq!(
+            RelaySpec::plain("wss://relay.example.com:8443")
+                .browser_url()
+                .unwrap(),
+            "wss://relay.example.com:8443/"
+        );
+        assert!(
+            RelaySpec::pinned("wss://relay.example.com", "ab".repeat(32))
+                .browser_url()
+                .is_err(),
+            "a pinned leaf is refused"
+        );
+        let insecure = RelaySpec {
+            insecure_tls: true,
+            ..RelaySpec::plain("wss://relay.example.com")
+        };
+        assert!(
+            insecure.browser_url().is_err(),
+            "an insecure spec is refused"
+        );
+        assert!(
+            RelaySpec::plain("ws://127.0.0.1:7000")
+                .browser_url()
+                .is_err(),
+            "plain ws:// is refused"
+        );
+        assert!(
+            RelaySpec::plain("https://relay.example.com")
+                .browser_url()
+                .is_err()
+        );
     }
 }
