@@ -1526,6 +1526,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "link-web"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "futures-util",
+ "hex",
+ "js-sys",
+ "link-core",
+ "link-endpoint",
+ "link-engine",
+ "link-relay",
+ "link-websocket",
+ "rustls",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+]
+
+[[package]]
 name = "link-websocket"
 version = "0.1.0"
 dependencies = [

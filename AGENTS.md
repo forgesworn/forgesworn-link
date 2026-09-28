@@ -18,6 +18,7 @@ contract on top of them.
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | Lint |
 | `cargo test --workspace --all-features` | Run the test suite |
 | `python3 -m unittest discover -s deploy/founders -p 'test_*.py' -v` | Test the deployment scripts |
+| `scripts/build-link-web.sh [--target web\|bundler\|nodejs]` | Build the browser package (needs a wasm32 clang: `WASI_SDK` or `CC_wasm32_unknown_unknown`) |
 
 Toolchain is pinned at `1.94.1` in `rust-toolchain.toml`. CI (`.github/workflows/ci.yml`) runs format, clippy and test on Linux, Windows and macOS.
 
@@ -29,7 +30,9 @@ crates/link-endpoint/   Endpoint, Session, Stream, the path socket, rendezvous b
 crates/link-relay/      link-relay binary: WebSocket datagram relay + UDP reflector
 crates/link-websocket/  WebSocket transport glue
 crates/link-blossom/    hash-addressed blob-fetch protocol over a Session, optional shelter-kit adapter
+crates/link-engine/     the paired-route engine shared by link-ffi and link-web
 crates/link-ffi/        uniffi bindings (Kotlin/Android)
+crates/link-web/        wasm-bindgen browser engine, relay-only
 crates/link-spike/      link-spike binary: keygen, card, serve, send (demo/acceptance CLI)
 vectors/                frozen JSON test vectors that are the contract for link-core
 acceptance/             recorded real-network acceptance runs
@@ -60,4 +63,5 @@ SPEC.md                 the Phase 0 protocol specification
 - Plain `ws://` relay mode (`--insecure-ws`) is loopback-only; do not suggest it for a real deployment.
 - A direct path requires both sides to have probed each other; an unproven address is never trusted with traffic (see README "Deviations from the spec", point 6).
 - Session state is keyed per peer and superseded at dial/accept time; do not assume a reconnecting session reuses the old direct proof.
+- A browser build (`wasm32-unknown-unknown`) is relay-only by construction: no UDP, no direct path, `wss://` WebPKI relays only. Do not add a fallback transport to it.
 - `link-ffi` and the Android bundle (`scripts/build-android-bundle.sh`) prove native compilation only, not real device behaviour (doze, carrier handover); do not cite them as proof of mobile operation.

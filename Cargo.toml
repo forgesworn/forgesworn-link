@@ -7,6 +7,7 @@ members = [
     "crates/link-websocket",
     "crates/link-engine",
     "crates/link-ffi",
+    "crates/link-web",
     "crates/link-spike",
     "crates/link-blossom",
 ]
