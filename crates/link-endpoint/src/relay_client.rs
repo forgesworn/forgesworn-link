@@ -4,19 +4,20 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
 use link_core::id::{NodeId, TransportKey};
 use link_core::wire::{CLOSE_REASON_SUPERSEDED, Frame, MAX_QUEUED_FRAMES};
 use rand::RngCore;
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, watch};
-use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
+use crate::relay_socket::{RelaySocket, WsMessage, send_retry};
 use crate::rendezvous_book::TagBook;
+use crate::rt;
+
+#[cfg(not(wasm_browser))]
+pub use crate::relay_socket::Duplex;
 
 /// Backoff bounds of spec 4.3.
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
@@ -56,7 +57,7 @@ impl RelaySpec {
         }
     }
 
-    fn parts(&self) -> anyhow::Result<(bool, String, u16, String)> {
+    pub(crate) fn parts(&self) -> anyhow::Result<(bool, String, u16, String)> {
         let (tls, rest) = if let Some(rest) = self.url.strip_prefix("wss://") {
             (true, rest)
         } else if let Some(rest) = self.url.strip_prefix("ws://") {
@@ -64,17 +65,31 @@ impl RelaySpec {
         } else {
             anyhow::bail!("relay URL must start with ws:// or wss://");
         };
+        // Only printable ASCII, and none of the characters a URL parser
+        // rewrites or reads as structure (percent escapes, backslashes as
+        // slashes, fragments), so the path is sent as written.
+        anyhow::ensure!(
+            self.url
+                .bytes()
+                .all(|b| b.is_ascii_graphic() && !matches!(b, b'%' | b'\\' | b'#')),
+            "relay URL must be printable ASCII without %, \\ or #"
+        );
         let (authority, path) = match rest.split_once('/') {
             Some((a, p)) => (a, format!("/{p}")),
             None => (rest, "/".to_string()),
         };
         let (host, port) = match authority.rsplit_once(':') {
             Some((h, p)) if !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
-                (h.to_string(), p.parse::<u16>()?)
+                (h, p.parse::<u16>()?)
             }
-            _ => (authority.to_string(), if tls { 443 } else { 80 }),
+            _ => (authority, if tls { 443 } else { 80 }),
         };
-        Ok((tls, host.to_lowercase(), port, path))
+        let host = host.to_ascii_lowercase();
+        anyhow::ensure!(
+            canonical_host(&host),
+            "relay URL host must be a DNS name, a dotted-quad IPv4 address or a bracketed IPv6 address"
+        );
+        Ok((tls, host, port, path))
     }
 
     /// The lowercase host a node signs against, spec 3.1.  The port is not part
@@ -82,6 +97,73 @@ impl RelaySpec {
     pub fn host(&self) -> anyhow::Result<String> {
         Ok(self.parts()?.1)
     }
+
+    /// The URL a browser opens for this relay, or why it must not open one.
+    /// A browser WebSocket verifies the relay's certificate against the
+    /// browser's own WebPKI roots and offers no hook to change that, so only
+    /// a plain `wss://` spec can be honoured as written: a pinned leaf cannot
+    /// be checked, an insecure one cannot be accepted, and `ws://` is never
+    /// offered.  Each is refused, never downgraded.
+    #[cfg(any(wasm_browser, test))]
+    pub(crate) fn browser_url(&self) -> anyhow::Result<String> {
+        anyhow::ensure!(
+            self.cert_sha256.is_none(),
+            "{} needs a pinned certificate, which a browser cannot check",
+            self.url
+        );
+        anyhow::ensure!(
+            !self.insecure_tls,
+            "{} asks for an unverified certificate, which a browser never accepts",
+            self.url
+        );
+        let (tls, host, port, path) = self.parts()?;
+        anyhow::ensure!(
+            tls,
+            "a browser reaches relays only over wss://, not {}",
+            self.url
+        );
+        Ok(format!("wss://{host}:{port}{path}"))
+    }
+}
+
+/// Whether a lowercase relay host is one that a native dial and the WHATWG
+/// URL parser a browser uses read identically, so both reach, and a node
+/// signs against, the same host:
+///
+/// * a DNS name of letter-digit-hyphen labels (punycode for anything
+///   else), whose last label does not look like a number, since WHATWG
+///   would read that as an IPv4 address;
+/// * an IPv4 address in canonical dotted-decimal form (no octal, hex or
+///   short forms, which WHATWG rewrites);
+/// * an IPv6 address in brackets, in its canonical compressed form
+///   (WHATWG re-serialises any other spelling).
+fn canonical_host(host: &str) -> bool {
+    if let Some(inner) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        return inner
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok_and(|addr| !inner.contains('.') && addr.to_string() == inner);
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    let last = labels.last().copied().unwrap_or_default();
+    let numeric = !last.is_empty()
+        && (last.bytes().all(|b| b.is_ascii_digit())
+            || last
+                .strip_prefix("0x")
+                .is_some_and(|hex| hex.bytes().all(|b| b.is_ascii_hexdigit())));
+    if numeric {
+        return host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|addr| addr.to_string() == host);
+    }
+    host.len() <= 253
+        && labels.iter().all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -338,8 +420,8 @@ impl RelayDriver {
                 // Tag mode: the peer's identity never goes to the relay.  The
                 // tag depends on which relay this session is on, so nothing is
                 // sendable before the welcome names it.
-                let Some(tag) =
-                    self.with_current_host(|host| book.tag_for_send(destination, host, now_unix()))
+                let Some(tag) = self
+                    .with_current_host(|host| book.tag_for_send(destination, host, rt::unix_now()))
                 else {
                     return QueueOutcome::Dropped;
                 };
@@ -475,7 +557,7 @@ fn spawn_driver(
     );
     let stopped_events = events_tx.clone();
     let stopped_readiness = readiness.clone();
-    tokio::spawn(async move {
+    rt::spawn(async move {
         tokio::select! {
             biased;
             _ = stop_rx.changed() => {
@@ -532,7 +614,7 @@ async fn driver(
     }
     let mut index = 0usize;
     let mut backoff = BACKOFF_MIN;
-    let mut down_since: Option<std::time::Instant> = None;
+    let mut down_since: Option<rt::Instant> = None;
 
     loop {
         if let Some(book) = &book
@@ -545,7 +627,7 @@ async fn driver(
             // the next pass connect and register within a second.
             set_status(&status, &events, RelayStatus::Connecting);
             down_since = None;
-            tokio::time::sleep(BACKOFF_MIN).await;
+            rt::sleep(BACKOFF_MIN).await;
             continue;
         }
         let spec = relays[index % relays.len()].clone();
@@ -555,7 +637,7 @@ async fn driver(
         // sent to this live relay session.
         let (_idle_changes, idle_rx) = watch::channel(0u64);
         let book_changes = book.as_deref().map(TagBook::subscribe).unwrap_or(idle_rx);
-        let attempt = tokio::time::timeout(
+        let attempt = rt::timeout(
             CONNECT_TIMEOUT,
             connect(&key, &spec, book.as_deref(), &activity),
         )
@@ -604,7 +686,7 @@ async fn driver(
                     return;
                 }
                 set_status(&status, &events, RelayStatus::Reconnecting);
-                down_since = Some(std::time::Instant::now());
+                down_since = Some(rt::Instant::now());
                 readiness.wake_all();
                 // Spec 4.3: next configured relay, then the same one.
                 index += 1;
@@ -612,13 +694,13 @@ async fn driver(
                     // Tag mode cannot tell which endpoint a third holder of
                     // one pair tag replaced.  Back off before retrying so the
                     // legitimate two ends can converge without a hot loop.
-                    tokio::time::sleep(BACKOFF_MAX).await;
+                    rt::sleep(BACKOFF_MAX).await;
                 }
                 continue;
             }
             Err(e) => {
                 debug!(relay = %spec.url, error = %e, "relay connect failed");
-                let since = *down_since.get_or_insert_with(std::time::Instant::now);
+                let since = *down_since.get_or_insert_with(rt::Instant::now);
                 if since.elapsed() > RECONNECT_DEADLINE {
                     if *status.borrow() != RelayStatus::Failed {
                         warn!("no relay within 60 s; sessions fail, endpoint keeps reconnecting");
@@ -629,14 +711,12 @@ async fn driver(
                     set_status(&status, &events, RelayStatus::Reconnecting);
                 }
                 index += 1;
-                tokio::time::sleep(backoff).await;
+                rt::sleep(backoff).await;
                 backoff = (backoff * 2).min(BACKOFF_MAX);
             }
         }
     }
 }
-
-type Socket = tokio_tungstenite::WebSocketStream<Box<dyn Duplex>>;
 
 /// Why a relay session ended, as far as the pump can tell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -650,33 +730,14 @@ enum PumpEnd {
     Superseded,
 }
 
-pub trait Duplex: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> Duplex for T {}
-
 async fn connect(
     key: &TransportKey,
     spec: &RelaySpec,
     book: Option<&TagBook>,
     activity: &RelayActivity,
-) -> anyhow::Result<Socket> {
-    let (tls, host, port, path) = spec.parts()?;
-    let stream = tokio::time::timeout(
-        Duration::from_secs(10),
-        TcpStream::connect((host.as_str(), port)),
-    )
-    .await??;
-    stream.set_nodelay(true).ok();
-
-    let transport: Box<dyn Duplex> = if tls {
-        let connector = crate::relay_tls::connector(spec)?;
-        let server_name = rustls::pki_types::ServerName::try_from(host.clone())?;
-        Box::new(connector.connect(server_name, stream).await?)
-    } else {
-        Box::new(stream)
-    };
-
-    let request = format!("{}://{host}:{port}{path}", if tls { "wss" } else { "ws" });
-    let (mut ws, _) = tokio_tungstenite::client_async(request, transport).await?;
+) -> anyhow::Result<RelaySocket> {
+    let host = spec.host()?;
+    let mut ws = RelaySocket::open(spec).await?;
 
     // First contact: identity auth (spec 3.1) or tag registration (spec 9).
     let challenge = match next_frame(&mut ws).await? {
@@ -686,24 +747,23 @@ async fn connect(
     match book {
         None => {
             let signature = link_core::wire::sign_relay_auth(key, &host, &challenge);
-            ws.send(Message::Binary(
+            ws.send(
                 Frame::Auth {
                     node_id: key.node_id(),
                     signature,
                 }
                 .encode(),
-            ))
+            )
             .await?;
         }
         Some(book) => {
             // No identity and no signature ever go to the relay on this path;
             // the challenge is acknowledged by ignoring it.
-            let tags = book.registration(&host, now_unix());
+            let tags = book.registration(&host, rt::unix_now());
             if tags.is_empty() {
                 anyhow::bail!("tag mode with no rendezvous pairs to register");
             }
-            ws.send(Message::Binary(Frame::Register { tags }.encode()))
-                .await?;
+            ws.send(Frame::Register { tags }.encode()).await?;
             activity.registrations_sent.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -713,12 +773,12 @@ async fn connect(
     }
 }
 
-async fn next_frame(ws: &mut Socket) -> anyhow::Result<Option<Frame>> {
-    let message = tokio::time::timeout(Duration::from_secs(10), ws.next())
+async fn next_frame(ws: &mut RelaySocket) -> anyhow::Result<Option<Frame>> {
+    let message = rt::timeout(Duration::from_secs(10), ws.next())
         .await?
         .transpose()?;
     Ok(match message {
-        Some(Message::Binary(bytes)) => Frame::decode(&bytes),
+        Some(WsMessage::Binary(bytes)) => Frame::decode(&bytes),
         Some(_) => None,
         None => None,
     })
@@ -727,7 +787,7 @@ async fn next_frame(ws: &mut Socket) -> anyhow::Result<Option<Frame>> {
 #[allow(clippy::too_many_arguments)]
 async fn pump(
     driver_id: u64,
-    mut ws: Socket,
+    mut ws: RelaySocket,
     outbound: &mut mpsc::Receiver<Frame>,
     inbound: &mpsc::Sender<RelayInbound>,
     readiness: &WriteReadiness,
@@ -736,33 +796,31 @@ async fn pump(
     mut book_changes: watch::Receiver<u64>,
     activity: &RelayActivity,
 ) -> PumpEnd {
-    let mut ping = tokio::time::interval(PING_INTERVAL);
-    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut ping = rt::interval(PING_INTERVAL);
     // Tag mode re-registers when the epoch turns or the book changes (a card
     // rotation upsert), so the relay always holds the previous, current and
     // next epoch's tags for the current pair set.
-    let mut refresh = tokio::time::interval(Duration::from_secs(60));
-    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut last_epoch = link_core::rendezvous::epoch_index(now_unix());
+    let mut refresh = rt::interval(Duration::from_secs(60));
+    let mut last_epoch = link_core::rendezvous::epoch_index(rt::unix_now());
     let mut last_version = book.map(TagBook::version).unwrap_or(0);
     let mut nonce = [0u8; 8];
     loop {
         tokio::select! {
             _ = ping.tick() => {
                 rand::rngs::OsRng.fill_bytes(&mut nonce);
-                if ws.send(Message::Binary(Frame::Ping(nonce).encode())).await.is_err() {
+                if ws.send(Frame::Ping(nonce).encode()).await.is_err() {
                     return PumpEnd::Lost;
                 }
             }
             _ = refresh.tick(), if book.is_some() => {
                 let Some(book) = book else { continue };
-                let current = link_core::rendezvous::epoch_index(now_unix());
+                let current = link_core::rendezvous::epoch_index(rt::unix_now());
                 let version = book.version();
                 if current != last_epoch || version != last_version {
                     last_epoch = current;
                     last_version = version;
-                    let tags = book.registration(host, now_unix());
-                    if ws.send(Message::Binary(Frame::Register { tags }.encode())).await.is_err() {
+                    let tags = book.registration(host, rt::unix_now());
+                    if ws.send(Frame::Register { tags }.encode()).await.is_err() {
                         return PumpEnd::Lost;
                     }
                     activity.registrations_sent.fetch_add(1, Ordering::Relaxed);
@@ -773,18 +831,18 @@ async fn pump(
                     return PumpEnd::Lost;
                 }
                 let Some(book) = book else { continue };
-                last_epoch = link_core::rendezvous::epoch_index(now_unix());
+                last_epoch = link_core::rendezvous::epoch_index(rt::unix_now());
                 last_version = book.version();
-                let tags = book.registration(host, now_unix());
-                if ws.send(Message::Binary(Frame::Register { tags }.encode())).await.is_err() {
+                let tags = book.registration(host, rt::unix_now());
+                if ws.send(Frame::Register { tags }.encode()).await.is_err() {
                     return PumpEnd::Lost;
                 }
                 activity.registrations_sent.fetch_add(1, Ordering::Relaxed);
             }
-            frame = outbound.recv() => {
+            frame = outbound.recv(), if ws.send_ready() => {
                 let Some(frame) = frame else { return PumpEnd::Lost };
                 let is_tag_datagram = matches!(frame, Frame::SendTag { .. });
-                if ws.send(Message::Binary(frame.encode())).await.is_err() {
+                if ws.send(frame.encode()).await.is_err() {
                     return PumpEnd::Lost;
                 }
                 if is_tag_datagram {
@@ -795,10 +853,13 @@ async fn pump(
                     readiness.wake_all();
                 }
             }
+            // Only a browser is ever not ready: look again shortly, reading
+            // all the while.
+            _ = send_retry(), if !ws.send_ready() => {}
             message = ws.next() => {
                 let Some(Ok(message)) = message else { return PumpEnd::Lost };
                 match message {
-                    Message::Binary(bytes) => match Frame::decode(&bytes) {
+                    WsMessage::Binary(bytes) => match Frame::decode(&bytes) {
                         Some(Frame::Recv { source, datagram }) => {
                             // Identity deliveries belong to identity sessions.
                             if book.is_some() {
@@ -817,7 +878,7 @@ async fn pump(
                             // Attribute by this endpoint's own book; a tag it
                             // cannot resolve (a stale epoch, a removed pair) is
                             // dropped, which QUIC treats as loss.
-                            if let Some(peer) = book.resolve(&tag, host, now_unix()) {
+                            if let Some(peer) = book.resolve(&tag, host, rt::unix_now()) {
                                 activity.tag_datagrams_resolved.fetch_add(1, Ordering::Relaxed);
                                 let _ = inbound.try_send(RelayInbound {
                                     source: peer,
@@ -837,22 +898,128 @@ async fn pump(
                         }
                         _ => return PumpEnd::Lost,
                     },
-                    Message::Ping(payload) => {
-                        if ws.send(Message::Pong(payload)).await.is_err() {
+                    #[cfg(not(wasm_browser))]
+                    WsMessage::Ping(payload) => {
+                        if ws.pong(payload).await.is_err() {
                             return PumpEnd::Lost;
                         }
                     }
-                    Message::Pong(_) => {}
-                    _ => return PumpEnd::Lost,
+                    #[cfg(not(wasm_browser))]
+                    WsMessage::Pong => {}
+                    WsMessage::Other => return PumpEnd::Lost,
                 }
             }
         }
     }
 }
 
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A browser opens a relay only as a plain `wss://` spec, which it
+    /// verifies against its own WebPKI roots.  A pin, an insecure flag or
+    /// `ws://` cannot be honoured by a browser WebSocket and is refused
+    /// outright rather than quietly weakened.
+    #[test]
+    fn a_browser_opens_only_plain_wss_relays() {
+        assert_eq!(
+            RelaySpec::plain("wss://Relay.Example.com/link")
+                .browser_url()
+                .unwrap(),
+            "wss://relay.example.com:443/link"
+        );
+        assert_eq!(
+            RelaySpec::plain("wss://relay.example.com:8443")
+                .browser_url()
+                .unwrap(),
+            "wss://relay.example.com:8443/"
+        );
+        assert!(
+            RelaySpec::pinned("wss://relay.example.com", "ab".repeat(32))
+                .browser_url()
+                .is_err(),
+            "a pinned leaf is refused"
+        );
+        let insecure = RelaySpec {
+            insecure_tls: true,
+            ..RelaySpec::plain("wss://relay.example.com")
+        };
+        assert!(
+            insecure.browser_url().is_err(),
+            "an insecure spec is refused"
+        );
+        assert!(
+            RelaySpec::plain("ws://127.0.0.1:7000")
+                .browser_url()
+                .is_err(),
+            "plain ws:// is refused"
+        );
+        assert!(
+            RelaySpec::plain("https://relay.example.com")
+                .browser_url()
+                .is_err()
+        );
+    }
+
+    /// Only a canonical host (a DNS name, a dotted-quad IPv4 address or a
+    /// bracketed canonical IPv6 address) and an optional port pass, so the
+    /// host read here is the one a browser's URL parser reads.
+    #[test]
+    fn a_relay_url_authority_is_only_a_host_and_port() {
+        for (url, host, port) in [
+            ("wss://Relay.Example.com", "relay.example.com", 443),
+            (
+                "wss://relay.example.com:8443/link?x=1",
+                "relay.example.com",
+                8443,
+            ),
+            ("ws://127.0.0.1:7000", "127.0.0.1", 7000),
+            ("wss://[::1]:9000/", "[::1]", 9000),
+            ("wss://[2001:db8::1]/", "[2001:db8::1]", 443),
+            ("wss://xn--bcher-kva.example/", "xn--bcher-kva.example", 443),
+            (
+                "wss://relay-1.example.com:0443/",
+                "relay-1.example.com",
+                443,
+            ),
+        ] {
+            let (_, parsed_host, parsed_port, _) = RelaySpec::plain(url).parts().unwrap();
+            assert_eq!((parsed_host.as_str(), parsed_port), (host, port), "{url}");
+        }
+        for url in [
+            "wss://user@evil.example.com",
+            "wss://relay.example.com@evil.example.com/",
+            "wss://evil.example.com\\@relay.example.com/",
+            "wss://relay.example.com?@evil.example.com",
+            "wss://relay.example.com#@evil.example.com",
+            "wss://relay.example.com/link#fragment",
+            "wss://relay.example.com/%2e%2e/link",
+            "wss://relay%2eexample.com/",
+            "wss://bücher.example/",
+            "wss://relay_example.com/",
+            "wss://-relay.example.com/",
+            "wss://relay..example.com/",
+            "wss://relay.example.com./",
+            "wss://0x7f.0.0.1/",
+            "wss://127.1/",
+            "wss://0177.0.0.1/",
+            "wss://2130706433/",
+            "wss://relay.example.123/",
+            "wss://[0:0::1]/",
+            "wss://[::FFFF:127.0.0.1]/",
+            "wss://relay.example.com /",
+            "wss://relay.example.com/a b",
+            "wss://relay.example.com\t/",
+            "wss://",
+            "wss://:443/",
+            "wss://a:b:c/",
+            "wss://[::1/",
+            "wss://relay.example.com:/",
+        ] {
+            let spec = RelaySpec::plain(url);
+            assert!(spec.parts().is_err(), "{url:?} parses");
+            assert!(spec.browser_url().is_err(), "{url:?} opens in a browser");
+        }
+    }
 }

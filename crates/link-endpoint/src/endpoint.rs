@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use link_core::card::{Card, Hint};
 use link_core::id::{NodeId, TransportKey, node_id_from_spki};
@@ -20,10 +20,11 @@ use rustls::server::AlwaysResolvesServerRawPublicKeys;
 use rustls::sign::CertifiedKey;
 use tracing::{info, warn};
 
-use crate::netmon::{NetMonitor, interface_snapshot};
-use crate::path_socket::{Paths, build};
+use crate::netmon::NetMonitor;
+use crate::path_socket::Paths;
 use crate::relay_client::{RelayActivitySnapshot, RelayDriver, RelaySpec, RelayStatus};
 use crate::rendezvous_book::{PairingRegistration, RendezvousPeer, TagBook};
+use crate::rt;
 use crate::session::{Session, Stream};
 
 /// Cap the MTU so a QUIC packet always fits the relay's 1..=1350 frame bound.
@@ -81,18 +82,18 @@ impl PairingSession {
     fn new(session: Session, book: Arc<TagBook>, route: NodeId, generation: u64) -> Self {
         let connection = session.connection();
         let lifetime_connection = connection.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(MAX_PAIRING_SESSION_LIFETIME).await;
+        rt::spawn(async move {
+            rt::sleep(MAX_PAIRING_SESSION_LIFETIME).await;
             lifetime_connection.close(VarInt::from_u32(3), b"pairing lifetime");
         });
-        tokio::spawn(async move {
+        rt::spawn(async move {
             let reason = connection.closed().await;
             if matches!(reason, quinn::ConnectionError::LocallyClosed) {
                 // Quinn reports a local close before its CONNECTION_CLOSE has
                 // drained. Keep only the TLS-exported route (never the QR
                 // admission secret) for one full provisional-session bound so
                 // retransmission cannot be cut off by product handle teardown.
-                tokio::time::sleep(MAX_PAIRING_SESSION_LIFETIME).await;
+                rt::sleep(MAX_PAIRING_SESSION_LIFETIME).await;
             }
             book.remove_live_pairing(route, generation);
         });
@@ -176,6 +177,13 @@ impl PairingSession {
     }
 }
 
+/// In a browser (`wasm_browser`) an endpoint is relay-only, always: its one
+/// path is the page's WebSocket to a Link relay, over `wss://` with the
+/// browser's own WebPKI verification.  `allow_direct` and `reflector` must be
+/// left off (`open` refuses them rather than ignore an explicit request),
+/// `bind` and `net_poll` are unused, and a relay spec with a pinned or
+/// insecure certificate, or a `ws://` URL, is refused.  There is no UDP, no
+/// LAN candidate and no fallback to anything but a Link relay.
 #[derive(Clone)]
 pub struct EndpointConfig {
     pub key: TransportKey,
@@ -223,10 +231,14 @@ impl EndpointConfig {
             key,
             serial_seed: None,
             relays: Vec::new(),
-            allow_direct: true,
+            allow_direct: cfg!(not(wasm_browser)),
             bind: "0.0.0.0:0".parse().expect("literal"),
             reflector: None,
-            net_poll: Duration::from_secs(5),
+            net_poll: if cfg!(wasm_browser) {
+                Duration::ZERO
+            } else {
+                Duration::from_secs(5)
+            },
             probe_delay: Duration::ZERO,
             rendezvous_timeout: Duration::from_secs(30),
             rendezvous: None,
@@ -259,16 +271,30 @@ impl Endpoint {
                 config.paired_routes.take().unwrap_or_default(),
             ))
         });
-        let net = NetMonitor::spawn(config.net_poll, interface_snapshot);
-        let (socket, paths) = build(
-            config.key.clone(),
-            config.bind,
-            config.relays.clone(),
-            book.clone(),
-            config.reflector,
-            net,
-        )
-        .await?;
+        #[cfg(not(wasm_browser))]
+        let (socket, paths) = {
+            let net = NetMonitor::spawn(config.net_poll, crate::netmon::interface_snapshot);
+            crate::path_socket::build(
+                config.key.clone(),
+                config.bind,
+                config.relays.clone(),
+                book.clone(),
+                config.reflector,
+                net,
+            )
+            .await?
+        };
+        #[cfg(wasm_browser)]
+        let (socket, paths) = {
+            browser_config_check(&config)?;
+            let net = NetMonitor::spawn(Duration::ZERO, Vec::new);
+            crate::path_socket::build_relay_only(
+                config.key.clone(),
+                config.relays.clone(),
+                book.clone(),
+                net,
+            )
+        };
 
         let mut endpoint_config = quinn::EndpointConfig::default();
         endpoint_config.max_udp_payload_size(MAX_MTU)?;
@@ -294,13 +320,10 @@ impl Endpoint {
             endpoint_config,
             Some(server_config),
             socket,
-            Arc::new(quinn::TokioRuntime),
+            rt::quinn_runtime(),
         )?;
 
-        let wall_clock = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let wall_clock = rt::unix_now();
         let serial_seed = config.serial_seed.unwrap_or(0).max(wall_clock);
 
         let endpoint = Endpoint {
@@ -316,12 +339,10 @@ impl Endpoint {
         if let Some(reflector) = endpoint.config.reflector {
             endpoint.paths.query_reflector(reflector);
             // Give the reflector a moment before the first card or candidate list.
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            rt::sleep(Duration::from_millis(200)).await;
         }
 
         info!(
-            node = %endpoint.node_id(),
-            synthetic = %endpoint.node_id().synthetic_addr(),
             udp = %endpoint.paths.udp_local(),
             allow_direct = endpoint.config.allow_direct,
             "endpoint open"
@@ -365,12 +386,12 @@ impl Endpoint {
             return Err(PairingError::Lifetime);
         }
         let book = self.book.as_ref().ok_or(PairingError::TagModeRequired)?;
-        let expires_at = now_unix().saturating_add(lifetime.as_secs());
+        let expires_at = rt::unix_now().saturating_add(lifetime.as_secs());
         let registration = book.register_pairing(secret, expires_at);
         let route = registration.route();
         let weak = Arc::downgrade(book);
-        tokio::spawn(async move {
-            tokio::time::sleep(lifetime).await;
+        rt::spawn(async move {
+            rt::sleep(lifetime).await;
             if let Some(book) = weak.upgrade() {
                 book.remove_pairing(route);
             }
@@ -380,10 +401,7 @@ impl Endpoint {
 
     /// Sign a fresh `FSL-CARD-1`.  UDP hints appear only with owner consent.
     pub fn card(&self, ttl: Duration, extra: Vec<Hint>) -> Card {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let now = rt::unix_now();
         let ttl = ttl
             .as_secs()
             .clamp(1, link_core::card::MAX_LIFETIME_SECONDS);
@@ -428,7 +446,7 @@ impl Endpoint {
             RelayStatus::Failed => return Err(FailReason::Relay),
             _ => {}
         }
-        let terminal = tokio::time::timeout(deadline, driver.wait_up())
+        let terminal = rt::timeout(deadline, driver.wait_up())
             .await
             .map_err(|_| FailReason::Timeout)?;
         terminal.ok_or_else(|| match driver.status() {
@@ -504,7 +522,7 @@ impl Endpoint {
             return Err(FailReason::Identity);
         }
         if self.book.as_ref().is_some_and(|book| !book.contains(peer)) {
-            warn!(%peer, "connect refused: no rendezvous material for peer");
+            warn!("connect refused: no rendezvous material for the peer");
             return Err(FailReason::Rendezvous);
         }
         self.paths.register_peer(peer);
@@ -525,12 +543,12 @@ impl Endpoint {
         let relay = match Self::rendezvous(&driver, self.config.rendezvous_timeout).await {
             Ok(relay) => relay,
             Err(reason) => {
-                warn!(%peer, %reason, "rendezvous failed before QUIC");
+                warn!(session = session_id, %reason, "rendezvous failed before QUIC");
                 self.paths.end_session(peer, session_id);
                 return Err(reason);
             }
         };
-        info!(%peer, %relay, "rendezvous ready, starting QUIC over the relay");
+        info!(session = session_id, %relay, "rendezvous ready, starting QUIC over the relay");
 
         let client_config = self.client_config(peer, ALPN, false)?;
 
@@ -538,20 +556,19 @@ impl Endpoint {
             .quic
             .connect_with(client_config, peer.synthetic_addr(), "link")
             .map_err(|e| {
-                warn!(%peer, error = %e, "connect refused before the handshake");
+                warn!(session = session_id, error = %e, "connect refused before the handshake");
                 self.paths.end_session(peer, session_id);
                 FailReason::Relay
             })?;
         let conn = connecting.await.map_err(|e| {
             let reason = classify(&e);
-            warn!(%peer, error = %e, %reason, "QUIC handshake failed");
+            warn!(session = session_id, error = %e, %reason, "QUIC handshake failed");
             self.paths.end_session(peer, session_id);
             reason
         })?;
 
         Ok(Session::start(
             peer,
-            true,
             conn,
             self.paths.clone(),
             self.config.allow_direct,
@@ -576,11 +593,11 @@ impl Endpoint {
         let Some(book) = self.book.as_ref() else {
             return Err(FailReason::Rendezvous);
         };
-        if !registration.belongs_to(book) || !registration.is_active(now_unix()) {
+        if !registration.belongs_to(book) || !registration.is_active(rt::unix_now()) {
             return Err(FailReason::Rendezvous);
         }
         let route = registration.route();
-        if route == self.node_id() || !book.pairing_active(route, now_unix()) {
+        if route == self.node_id() || !book.pairing_active(route, rt::unix_now()) {
             return Err(FailReason::Rendezvous);
         }
 
@@ -601,20 +618,20 @@ impl Endpoint {
                 return Err(reason);
             }
         };
-        info!(%peer, %relay, "pairing rendezvous ready, starting bounded QUIC");
+        info!(session = session_id, %relay, "pairing rendezvous ready, starting bounded QUIC");
 
         let client_config = self.client_config(peer, PAIRING_ALPN, true)?;
         let connecting = self
             .quic
             .connect_with(client_config, route.synthetic_addr(), "link-pairing")
             .map_err(|error| {
-                warn!(%peer, %error, "pairing connect refused before the handshake");
+                warn!(session = session_id, %error, "pairing connect refused before the handshake");
                 self.paths.end_session(peer, session_id);
                 FailReason::Relay
             })?;
         let connection = connecting.await.map_err(|error| {
             let reason = classify(&error);
-            warn!(%peer, %error, %reason, "pairing QUIC handshake failed");
+            warn!(session = session_id, %error, %reason, "pairing QUIC handshake failed");
             self.paths.end_session(peer, session_id);
             reason
         })?;
@@ -630,7 +647,6 @@ impl Endpoint {
 
         let session = Session::start(
             peer,
-            true,
             connection,
             self.paths.clone(),
             false,
@@ -678,21 +694,21 @@ impl Endpoint {
             let incoming = self.quic.accept().await.ok_or(FailReason::Relay)?;
             let remote = incoming.remote_address();
             let Some(route) = self.paths.peer_for_synthetic(remote) else {
-                warn!(%remote, "refusing an inbound connection from an unknown synthetic address");
+                warn!("refusing an inbound connection from an unknown synthetic address");
                 incoming.refuse();
                 continue;
             };
             let pairing = self
                 .book
                 .as_ref()
-                .is_some_and(|book| book.pairing_active(route, now_unix()));
+                .is_some_and(|book| book.pairing_active(route, rt::unix_now()));
             let ordinary_slot = (!pairing).then(|| self.paths.begin_session(route));
             let server_config = self.server_config((!pairing).then_some(route))?;
 
             let connecting = match incoming.accept_with(Arc::new(server_config)) {
                 Ok(connecting) => connecting,
                 Err(e) => {
-                    warn!(%route, error = %e, pairing, "inbound refused");
+                    warn!(error = %e, pairing, "inbound refused");
                     if let Some((session_id, _)) = ordinary_slot {
                         self.paths.end_session(route, session_id);
                     }
@@ -702,7 +718,7 @@ impl Endpoint {
             let conn = match connecting.await {
                 Ok(conn) => conn,
                 Err(e) => {
-                    warn!(%route, error = %e, pairing, "inbound handshake failed");
+                    warn!(error = %e, pairing, "inbound handshake failed");
                     if let Some((session_id, _)) = ordinary_slot {
                         self.paths.end_session(route, session_id);
                     }
@@ -730,7 +746,7 @@ impl Endpoint {
                 let generation = match promote_pairing_route(book, route, &conn) {
                     Ok(generation) => generation,
                     Err(reason) => {
-                        warn!(%route, %reason, "pairing route promotion failed");
+                        warn!(%reason, "pairing route promotion failed");
                         conn.close(VarInt::from_u32(3), b"pairing route");
                         continue;
                     }
@@ -740,7 +756,6 @@ impl Endpoint {
                 let (session_id, superseded) = self.paths.begin_session(presented);
                 let session = Session::start(
                     presented,
-                    false,
                     conn,
                     self.paths.clone(),
                     false,
@@ -758,14 +773,16 @@ impl Endpoint {
 
             let (session_id, superseded) = ordinary_slot.expect("ordinary route has a slot");
             if presented != route {
-                warn!(peer = %route, %presented, "presented certificate does not match the source node ID");
+                warn!(
+                    session = session_id,
+                    "presented certificate does not match the source node ID"
+                );
                 conn.close(VarInt::from_u32(1), b"identity");
                 self.paths.end_session(route, session_id);
                 return Err(FailReason::Identity);
             }
             let session = Session::start(
                 route,
-                true,
                 conn,
                 self.paths.clone(),
                 self.config.allow_direct,
@@ -803,10 +820,28 @@ fn promote_pairing_route(
         .export_keying_material(&mut secret, PAIRING_ROUTE_EXPORT_LABEL, b"")
         .map_err(|_| FailReason::Relay)?;
     let generation = NEXT_PAIRING_ROUTE_GENERATION.fetch_add(1, Ordering::Relaxed);
-    if !book.promote_pairing(route, secret, generation, now_unix()) {
+    if !book.promote_pairing(route, secret, generation, rt::unix_now()) {
         return Err(FailReason::Rendezvous);
     }
     Ok(generation)
+}
+
+/// The browser rule of [`EndpointConfig`]: relay-only, and every relay a
+/// plain `wss://` spec the browser can verify itself.
+#[cfg(any(wasm_browser, test))]
+fn browser_config_check(config: &EndpointConfig) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !config.allow_direct,
+        "a browser endpoint is relay-only; allow_direct must be false"
+    );
+    anyhow::ensure!(
+        config.reflector.is_none(),
+        "a browser endpoint is relay-only; it has no reflector"
+    );
+    for relay in &config.relays {
+        relay.browser_url()?;
+    }
+    Ok(())
 }
 
 fn classify(error: &quinn::ConnectionError) -> FailReason {
@@ -853,9 +888,42 @@ fn transport_config_with(max_bidi_streams: u32, idle_timeout: Duration) -> quinn
     config
 }
 
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A browser endpoint is relay-only: an explicit request for a direct
+    /// path or a reflector is refused rather than ignored, and so is any
+    /// relay a browser WebSocket cannot verify itself.
+    #[test]
+    fn a_browser_endpoint_is_relay_only() {
+        let relay_only = |config: EndpointConfig| EndpointConfig {
+            allow_direct: false,
+            relays: vec![RelaySpec::plain("wss://relay.example.com")],
+            ..config
+        };
+        let base = relay_only(EndpointConfig::new(TransportKey::generate()));
+        browser_config_check(&base).expect("plain wss:// and relay-only is allowed");
+
+        let direct = EndpointConfig {
+            allow_direct: true,
+            ..base.clone()
+        };
+        assert!(browser_config_check(&direct).is_err());
+        let reflector = EndpointConfig {
+            reflector: Some("192.0.2.1:3478".parse().unwrap()),
+            ..base.clone()
+        };
+        assert!(browser_config_check(&reflector).is_err());
+        for relay in [
+            RelaySpec::plain("ws://127.0.0.1:7000"),
+            RelaySpec::pinned("wss://relay.example.com", "ab".repeat(32)),
+        ] {
+            let config = EndpointConfig {
+                relays: vec![RelaySpec::plain("wss://relay.example.com"), relay],
+                ..base.clone()
+            };
+            assert!(browser_config_check(&config).is_err());
+        }
+    }
 }

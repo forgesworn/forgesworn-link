@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use link_core::card::{Hint, to_ipv6};
 use link_core::id::NodeId;
@@ -18,6 +18,7 @@ use tracing::{info, warn};
 
 use crate::path_socket::{DIRECT_FRESH, Paths};
 use crate::relay_client::RelayStatus;
+use crate::rt::{self, Instant};
 
 /// How long a `Probing` round runs before it records `direct_failed`, spec 4.3.
 const PROBE_ROUND: Duration = Duration::from_secs(5);
@@ -85,9 +86,6 @@ impl tokio::io::AsyncWrite for Stream {
 
 pub(crate) struct SessionInner {
     peer: NodeId,
-    /// `None` for a provisional pairing key: it routes this connection but
-    /// must not become a durable identity in operator logs.
-    log_peer: Option<NodeId>,
     conn: quinn::Connection,
     paths: Arc<Paths>,
     allow_direct: bool,
@@ -109,12 +107,6 @@ pub(crate) struct SessionInner {
 }
 
 impl SessionInner {
-    fn peer_log(&self) -> impl std::fmt::Display + '_ {
-        self.log_peer
-            .map(|peer| peer.to_string())
-            .unwrap_or_else(|| "provisional".to_owned())
-    }
-
     fn transition(&self, status: PathStatus, cause: impl Into<String>) {
         let cause = cause.into();
         let relay = match self.paths.relay_for(self.peer).status() {
@@ -134,7 +126,7 @@ impl SessionInner {
         }
         // Spec 4.3: every transition is logged with its cause.
         info!(
-            peer = %self.peer_log(),
+            session = self.session_id,
             from = %report.status,
             to = %status,
             %cause,
@@ -176,7 +168,6 @@ pub struct Session {
 impl Session {
     pub(crate) async fn start(
         peer: NodeId,
-        log_peer: bool,
         conn: quinn::Connection,
         paths: Arc<Paths>,
         allow_direct: bool,
@@ -211,12 +202,7 @@ impl Session {
                 Some(key_id)
             }
             Err(e) => {
-                let peer = if log_peer {
-                    peer.to_string()
-                } else {
-                    "provisional".into()
-                };
-                warn!(%peer, error = ?e, "no exporter material: this session cannot probe");
+                warn!(session = session_id, error = ?e, "no exporter material: this session cannot probe");
                 None
             }
         };
@@ -224,7 +210,6 @@ impl Session {
         let (control_tx, control_rx) = mpsc::channel::<ControlSend>(CONTROL_QUEUE);
         let inner = Arc::new(SessionInner {
             peer,
-            log_peer: log_peer.then_some(peer),
             conn,
             paths,
             allow_direct,
@@ -247,11 +232,11 @@ impl Session {
         let control = inner.conn.open_bi().await.ok();
 
         let (tx, rx) = mpsc::channel(STREAM_QUEUE);
-        tokio::spawn(accept_loop(inner.clone(), tx));
+        rt::spawn(accept_loop(inner.clone(), tx));
         if let Some((send, recv)) = control {
-            tokio::spawn(control_initiator(inner.clone(), send, recv, control_rx));
+            rt::spawn(control_initiator(inner.clone(), send, recv, control_rx));
         }
-        tokio::spawn(drive(inner.clone(), probe_delay));
+        rt::spawn(drive(inner.clone(), probe_delay));
 
         Session {
             inner,
@@ -331,7 +316,7 @@ async fn accept_loop(inner: Arc<SessionInner>, tx: mpsc::Sender<Stream>) {
             Ok((send, recv)) => {
                 if !control_seen {
                     control_seen = true;
-                    tokio::spawn(control_acceptor(inner.clone(), send, recv));
+                    rt::spawn(control_acceptor(inner.clone(), send, recv));
                 } else if tx.send(Stream { send, recv }).await.is_err() {
                     return;
                 }
@@ -428,7 +413,7 @@ async fn control_initiator(
     };
     let first = candidates(&inner);
     info!(
-        peer = %inner.peer_log(),
+        session = inner.session_id,
         count = first.len(),
         allow_direct = inner.allow_direct,
         "sending candidates on the control stream"
@@ -445,7 +430,7 @@ async fn control_initiator(
             request = requests.recv() => match request {
                 Some(ControlSend::Candidates) => {
                     let fresh = candidates(&inner);
-                    info!(peer = %inner.peer_log(), count = fresh.len(), "re-announcing candidates");
+                    info!(session = inner.session_id, count = fresh.len(), "re-announcing candidates");
                     candidates_message(&fresh)
                 }
                 Some(ControlSend::PunchNow) => punch_now_message(),
@@ -482,7 +467,11 @@ async fn control_acceptor(
         }
         match parse_control(&body) {
             Some(Control::Candidates(candidates)) => {
-                info!(peer = %inner.peer_log(), count = candidates.len(), "peer candidates received");
+                info!(
+                    session = inner.session_id,
+                    count = candidates.len(),
+                    "peer candidates received"
+                );
                 inner.paths.set_peer_candidates(inner.peer, candidates);
             }
             Some(Control::PunchNow) => {
@@ -506,12 +495,20 @@ async fn control_acceptor(
 // State machine, spec 4.3
 // ---------------------------------------------------------------------------
 
+/// A last-probe time that makes a re-prove due at once.  A browser's clock
+/// starts with the page, so going back `REPROVE_INTERVAL` can underflow in
+/// the first seconds; it then stops at now.
+fn reprove_due() -> Instant {
+    let now = Instant::now();
+    now.checked_sub(REPROVE_INTERVAL).unwrap_or(now)
+}
+
 async fn drive(inner: Arc<SessionInner>, probe_delay: Duration) {
     let mut previous_before_reconnect = PathStatus::Relayed;
     let mut reconnect_since: Option<Instant> = None;
     let mut probe_round_ends: Option<Instant> = None;
     let mut next_probe_attempt = Instant::now() + probe_delay;
-    let mut last_probe_sent = Instant::now() - REPROVE_INTERVAL;
+    let mut last_probe_sent = reprove_due();
     let mut candidates_announced = false;
     // Why the next probing round starts, for the transition record.
     let mut round_cause = "settle delay elapsed";
@@ -579,13 +576,13 @@ async fn drive(inner: Arc<SessionInner>, probe_delay: Duration) {
             event = events.recv() => relay_event = Some(event),
             changed = net.changed(), if net_alive => match changed {
                 Ok(()) => {
-                    info!(peer = %inner.peer_log(), "interface change: re-querying the reflector");
+                    info!(session = inner.session_id, "interface change: re-querying the reflector");
                     inner.paths.requery_reflector();
                     reannounce_at = Some(Instant::now() + REFLECTOR_GRACE);
                 }
                 Err(_) => net_alive = false,
             },
-            _ = tokio::time::sleep(TICK) => {}
+            _ = rt::sleep(TICK) => {}
         }
 
         if let Some(event) = relay_event {
@@ -662,7 +659,10 @@ async fn drive(inner: Arc<SessionInner>, probe_delay: Duration) {
 
         if reannounce_at.is_some_and(|at| Instant::now() >= at) {
             reannounce_at = None;
-            info!(peer = %inner.peer_log(), "interface change: re-announcing candidates");
+            info!(
+                session = inner.session_id,
+                "interface change: re-announcing candidates"
+            );
             let _ = inner.control_tx.try_send(ControlSend::Candidates);
             let _ = inner.control_tx.try_send(ControlSend::PunchNow);
             inner.probe_now.store(PROBE_LOCAL, Ordering::SeqCst);
@@ -680,7 +680,7 @@ async fn drive(inner: Arc<SessionInner>, probe_delay: Duration) {
             };
             // While Direct, a request re-proves at once rather than waiting
             // for the next re-prove interval.
-            last_probe_sent = Instant::now() - REPROVE_INTERVAL;
+            last_probe_sent = reprove_due();
         }
 
         match status {

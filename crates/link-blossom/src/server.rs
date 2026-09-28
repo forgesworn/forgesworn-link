@@ -44,7 +44,7 @@ where
 
 /// Answer every application stream a single session opens until it closes.
 async fn serve_session<S: BlobSource>(session: Arc<Session>, source: Arc<S>) {
-    debug!(peer = %session.peer(), "link-blossom session accepted");
+    debug!("link-blossom session accepted");
     // The loop ends when accept_stream errors, which is the session closing or
     // the peer opening no more streams.
     while let Ok(stream) = session.accept_stream().await {
