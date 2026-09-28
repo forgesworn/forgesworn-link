@@ -343,8 +343,6 @@ impl Endpoint {
         }
 
         info!(
-            node = %endpoint.node_id(),
-            synthetic = %endpoint.node_id().synthetic_addr(),
             udp = %endpoint.paths.udp_local(),
             allow_direct = endpoint.config.allow_direct,
             "endpoint open"
@@ -524,7 +522,7 @@ impl Endpoint {
             return Err(FailReason::Identity);
         }
         if self.book.as_ref().is_some_and(|book| !book.contains(peer)) {
-            warn!(%peer, "connect refused: no rendezvous material for peer");
+            warn!("connect refused: no rendezvous material for the peer");
             return Err(FailReason::Rendezvous);
         }
         self.paths.register_peer(peer);
@@ -545,12 +543,12 @@ impl Endpoint {
         let relay = match Self::rendezvous(&driver, self.config.rendezvous_timeout).await {
             Ok(relay) => relay,
             Err(reason) => {
-                warn!(%peer, %reason, "rendezvous failed before QUIC");
+                warn!(session = session_id, %reason, "rendezvous failed before QUIC");
                 self.paths.end_session(peer, session_id);
                 return Err(reason);
             }
         };
-        info!(%peer, %relay, "rendezvous ready, starting QUIC over the relay");
+        info!(session = session_id, %relay, "rendezvous ready, starting QUIC over the relay");
 
         let client_config = self.client_config(peer, ALPN, false)?;
 
@@ -558,20 +556,19 @@ impl Endpoint {
             .quic
             .connect_with(client_config, peer.synthetic_addr(), "link")
             .map_err(|e| {
-                warn!(%peer, error = %e, "connect refused before the handshake");
+                warn!(session = session_id, error = %e, "connect refused before the handshake");
                 self.paths.end_session(peer, session_id);
                 FailReason::Relay
             })?;
         let conn = connecting.await.map_err(|e| {
             let reason = classify(&e);
-            warn!(%peer, error = %e, %reason, "QUIC handshake failed");
+            warn!(session = session_id, error = %e, %reason, "QUIC handshake failed");
             self.paths.end_session(peer, session_id);
             reason
         })?;
 
         Ok(Session::start(
             peer,
-            true,
             conn,
             self.paths.clone(),
             self.config.allow_direct,
@@ -621,20 +618,20 @@ impl Endpoint {
                 return Err(reason);
             }
         };
-        info!(%peer, %relay, "pairing rendezvous ready, starting bounded QUIC");
+        info!(session = session_id, %relay, "pairing rendezvous ready, starting bounded QUIC");
 
         let client_config = self.client_config(peer, PAIRING_ALPN, true)?;
         let connecting = self
             .quic
             .connect_with(client_config, route.synthetic_addr(), "link-pairing")
             .map_err(|error| {
-                warn!(%peer, %error, "pairing connect refused before the handshake");
+                warn!(session = session_id, %error, "pairing connect refused before the handshake");
                 self.paths.end_session(peer, session_id);
                 FailReason::Relay
             })?;
         let connection = connecting.await.map_err(|error| {
             let reason = classify(&error);
-            warn!(%peer, %error, %reason, "pairing QUIC handshake failed");
+            warn!(session = session_id, %error, %reason, "pairing QUIC handshake failed");
             self.paths.end_session(peer, session_id);
             reason
         })?;
@@ -650,7 +647,6 @@ impl Endpoint {
 
         let session = Session::start(
             peer,
-            true,
             connection,
             self.paths.clone(),
             false,
@@ -698,7 +694,7 @@ impl Endpoint {
             let incoming = self.quic.accept().await.ok_or(FailReason::Relay)?;
             let remote = incoming.remote_address();
             let Some(route) = self.paths.peer_for_synthetic(remote) else {
-                warn!(%remote, "refusing an inbound connection from an unknown synthetic address");
+                warn!("refusing an inbound connection from an unknown synthetic address");
                 incoming.refuse();
                 continue;
             };
@@ -712,7 +708,7 @@ impl Endpoint {
             let connecting = match incoming.accept_with(Arc::new(server_config)) {
                 Ok(connecting) => connecting,
                 Err(e) => {
-                    warn!(%route, error = %e, pairing, "inbound refused");
+                    warn!(error = %e, pairing, "inbound refused");
                     if let Some((session_id, _)) = ordinary_slot {
                         self.paths.end_session(route, session_id);
                     }
@@ -722,7 +718,7 @@ impl Endpoint {
             let conn = match connecting.await {
                 Ok(conn) => conn,
                 Err(e) => {
-                    warn!(%route, error = %e, pairing, "inbound handshake failed");
+                    warn!(error = %e, pairing, "inbound handshake failed");
                     if let Some((session_id, _)) = ordinary_slot {
                         self.paths.end_session(route, session_id);
                     }
@@ -750,7 +746,7 @@ impl Endpoint {
                 let generation = match promote_pairing_route(book, route, &conn) {
                     Ok(generation) => generation,
                     Err(reason) => {
-                        warn!(%route, %reason, "pairing route promotion failed");
+                        warn!(%reason, "pairing route promotion failed");
                         conn.close(VarInt::from_u32(3), b"pairing route");
                         continue;
                     }
@@ -760,7 +756,6 @@ impl Endpoint {
                 let (session_id, superseded) = self.paths.begin_session(presented);
                 let session = Session::start(
                     presented,
-                    false,
                     conn,
                     self.paths.clone(),
                     false,
@@ -778,14 +773,16 @@ impl Endpoint {
 
             let (session_id, superseded) = ordinary_slot.expect("ordinary route has a slot");
             if presented != route {
-                warn!(peer = %route, %presented, "presented certificate does not match the source node ID");
+                warn!(
+                    session = session_id,
+                    "presented certificate does not match the source node ID"
+                );
                 conn.close(VarInt::from_u32(1), b"identity");
                 self.paths.end_session(route, session_id);
                 return Err(FailReason::Identity);
             }
             let session = Session::start(
                 route,
-                true,
                 conn,
                 self.paths.clone(),
                 self.config.allow_direct,

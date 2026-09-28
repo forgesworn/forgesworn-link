@@ -465,7 +465,7 @@ impl Paths {
             .seal(&key)
         };
         if udp.try_send_to(&wire, addr).is_ok() {
-            trace!(peer = %peer, %addr, "probe ping sent");
+            trace!(peer = %short(&peer), %addr, "probe ping sent");
             true
         } else {
             false
@@ -603,7 +603,7 @@ impl Paths {
                 });
                 entry.learned.remove(&from);
                 if previous != Some(from) {
-                    debug!(peer = %peer, addr = %from, "direct path proved");
+                    debug!(peer = %short(&peer), addr = %from, "direct path proved");
                 }
                 inner.by_direct.insert(from, peer);
             }
@@ -618,6 +618,13 @@ impl Paths {
             data: data.to_vec(),
         });
     }
+}
+
+/// A peer as debug and trace logs name it: a short prefix of its node ID,
+/// enough to tell two peers apart in one run.  No log at info or above
+/// names a peer at all; sessions there are named by their number.
+fn short(peer: &NodeId) -> String {
+    peer.to_string().chars().take(8).collect()
 }
 
 /// At most this many local addresses are offered.  A card has 16 hint slots
