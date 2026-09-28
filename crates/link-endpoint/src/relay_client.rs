@@ -65,16 +65,37 @@ impl RelaySpec {
         } else {
             anyhow::bail!("relay URL must start with ws:// or wss://");
         };
+        // Nothing a URL parser could read differently from this one: no
+        // whitespace or control characters anywhere, and an authority that
+        // is only a host and a port (no userinfo, backslash, query or
+        // fragment).  A native dial and a browser WebSocket then always
+        // agree on the host, which is also the host the node signs against.
+        anyhow::ensure!(
+            !self
+                .url
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control()),
+            "relay URL contains whitespace or a control character"
+        );
         let (authority, path) = match rest.split_once('/') {
             Some((a, p)) => (a, format!("/{p}")),
             None => (rest, "/".to_string()),
         };
+        anyhow::ensure!(
+            !authority.contains(['@', '\\', '?', '#']),
+            "relay URL authority must be a host and optional port"
+        );
         let (host, port) = match authority.rsplit_once(':') {
             Some((h, p)) if !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
                 (h.to_string(), p.parse::<u16>()?)
             }
             _ => (authority.to_string(), if tls { 443 } else { 80 }),
         };
+        let bracketed = host.starts_with('[') && host.ends_with(']');
+        anyhow::ensure!(
+            !host.is_empty() && (bracketed || !host.contains([':', '[', ']'])),
+            "relay URL has no usable host"
+        );
         Ok((tls, host.to_lowercase(), port, path))
     }
 
@@ -906,5 +927,43 @@ mod tests {
                 .browser_url()
                 .is_err()
         );
+    }
+
+    /// Native and browser read one host from a relay URL, because anything
+    /// two URL parsers could read differently is refused outright.
+    #[test]
+    fn a_relay_url_authority_is_only_a_host_and_port() {
+        for (url, host, port) in [
+            ("wss://Relay.Example.com", "relay.example.com", 443),
+            (
+                "wss://relay.example.com:8443/link?x=1#y",
+                "relay.example.com",
+                8443,
+            ),
+            ("ws://127.0.0.1:7000", "127.0.0.1", 7000),
+            ("wss://[::1]:9000/", "[::1]", 9000),
+        ] {
+            let (_, parsed_host, parsed_port, _) = RelaySpec::plain(url).parts().unwrap();
+            assert_eq!((parsed_host.as_str(), parsed_port), (host, port), "{url}");
+        }
+        for url in [
+            "wss://user@evil.example.com",
+            "wss://relay.example.com@evil.example.com/",
+            "wss://evil.example.com\\@relay.example.com/",
+            "wss://relay.example.com?@evil.example.com",
+            "wss://relay.example.com#@evil.example.com",
+            "wss://relay.example.com /",
+            "wss://relay.example.com/a b",
+            "wss://relay.example.com\t/",
+            "wss://",
+            "wss://:443/",
+            "wss://a:b:c/",
+            "wss://[::1/",
+            "wss://relay.example.com:/",
+        ] {
+            let spec = RelaySpec::plain(url);
+            assert!(spec.parts().is_err(), "{url:?} parses");
+            assert!(spec.browser_url().is_err(), "{url:?} opens in a browser");
+        }
     }
 }
