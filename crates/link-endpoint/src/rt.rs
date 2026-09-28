@@ -108,22 +108,39 @@ mod web {
         wasm_bindgen_futures::spawn_local(future);
     }
 
-    pub fn sleep(duration: Duration) -> impl Future<Output = ()> {
-        wasmtimer::tokio::sleep(duration)
+    /// The longest single timer this module sets.  A browser fires a
+    /// `setTimeout` above 2^31 - 1 ms (about 24.8 days) at once, and
+    /// wasmtimer would then re-arm it at once and spin; its clock arithmetic
+    /// also panics near the top of the `Duration` range.  A longer wait is a
+    /// chain of these, so `Duration::MAX` waits for ever, as in tokio.
+    const MAX_TIMER: Duration = Duration::from_secs(20 * 24 * 60 * 60);
+
+    pub async fn sleep(duration: Duration) {
+        let mut left = duration;
+        while left > MAX_TIMER {
+            wasmtimer::tokio::sleep(MAX_TIMER).await;
+            left -= MAX_TIMER;
+        }
+        wasmtimer::tokio::sleep(left).await;
     }
 
+    /// Polls `future` before the deadline each time, as tokio's does.
     pub async fn timeout<F: Future>(duration: Duration, future: F) -> Result<F::Output, Elapsed> {
-        wasmtimer::tokio::timeout(duration, future)
-            .await
-            .map_err(|_| Elapsed)
+        tokio::select! {
+            biased;
+            output = future => Ok(output),
+            () = sleep(duration) => Err(Elapsed),
+        }
     }
 
     /// A periodic tick whose first tick completes at once.  A tick missed
     /// because the page was busy is delayed rather than made up in a burst.
     pub struct Interval(wasmtimer::tokio::Interval);
 
+    /// A period above `MAX_TIMER` is cut to it; the crate's periods are all
+    /// a minute or less.
     pub fn interval(period: Duration) -> Interval {
-        let mut inner = wasmtimer::tokio::interval(period);
+        let mut inner = wasmtimer::tokio::interval(period.min(MAX_TIMER));
         inner.set_missed_tick_behavior(wasmtimer::tokio::MissedTickBehavior::Delay);
         Interval(inner)
     }
@@ -161,9 +178,12 @@ mod web {
 
     /// quinn's clock (`web_time`) and the timer's clock (`wasmtimer`) both
     /// read `performance.now()` but are distinct types, so a deadline is
-    /// carried across as the time remaining until it.
+    /// carried across as the time remaining until it, at most `MAX_TIMER`.
+    /// A clamped timer fires early, which quinn tolerates: on every wake it
+    /// handles only the timeouts that have actually passed and re-arms.
     fn timer_instant(deadline: Instant) -> wasmtimer::std::Instant {
-        wasmtimer::std::Instant::now() + deadline.saturating_duration_since(Instant::now())
+        let left = deadline.saturating_duration_since(Instant::now());
+        wasmtimer::std::Instant::now() + left.min(MAX_TIMER)
     }
 
     #[derive(Debug)]
