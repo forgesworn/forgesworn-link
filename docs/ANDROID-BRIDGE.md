@@ -41,10 +41,10 @@ The records passed to `LinkEngine.start` are:
 - `LinkPairingBundle`: route id, server card, the QR's 16 raw pairing-secret
   bytes and its absolute expiry. The pairing secret is zeroised after Link
   registers the bounded provisional route and is never retained;
-- `LinkHttpRequest`: installed route id, `POST` or `PUT`, a canonical
-  `/cadence/v1/` path, one Nostr authorization value and exact JSON body bytes;
-- `LinkHttpResponse`: numeric status, exact bounded JSON body and the Link path
-  that carried it; and
+- `LinkHttpRequest`: installed route id, method, an allowlisted path, one
+  Nostr authorization value (empty for witness routes) and exact body bytes;
+- `LinkHttpResponse`: numeric status, exact bounded body (empty for a VMLS or
+  witness refusal that has none) and the Link path that carried it; and
 - `LinkPath`: status, route name and any public socket address already present
   in Link's `PathReport`; it contains no rendezvous material.
 
@@ -90,12 +90,29 @@ session and then drops the record. Kotlin persists encrypted route state; Link
 never writes it.
 
 `request_json` opens HTTP/1.1 on a stream of the installed route's cached Link
-session. Kotlin cannot supply a host or network URL: Link writes the pinned
-peer node id as `Host`, supplies `Content-Type: application/json`, never
-follows redirects and returns ordinary JSON refusal statuses to the caller.
-Only `POST` and `PUT` to a canonical `/cadence/v1/` path are accepted. The
-path is capped at 2,048 bytes, authorization at 48 KiB and each request and
-response body at 256 KiB. One 30-second deadline covers a first dial, request,
+session. Kotlin cannot supply a host, network URL or content type: Link writes
+the pinned peer node id as `Host`, takes `Content-Type` from the allowlist,
+never follows redirects and returns ordinary refusal statuses to the caller.
+The path is capped at 2,048 bytes and authorization at 48 KiB. The allowlist
+is exact; anything else is refused before a dial:
+
+| Method and path | Body | Authorization | Reply |
+| --- | --- | --- | --- |
+| `POST`, `PUT` `/cadence/v1/…` | JSON, 256 KiB | Nostr | JSON, 256 KiB |
+| `PUT /vmls/v1/mailboxes/{id}/records` | octets, 1,048,620 B | Nostr | JSON, 256 KiB |
+| `POST /vmls/v1/fetch` | JSON, 128 KiB | Nostr | JSON, 2 MiB |
+| `POST /vmls/v1/ack` | JSON, 128 KiB | Nostr | JSON, 256 KiB |
+| `PUT /vmls/v1/packages/{id}` | JSON, 128 KiB | Nostr | JSON, 256 KiB |
+| `DELETE /vmls/v1/packages/{id}` | none | Nostr | JSON, 256 KiB |
+| `PUT /vmls/v1/slots/{id}/{attempt}` | octets, 1,048,620 B | Nostr | JSON, 256 KiB |
+| `POST /vmls/v1/slots/{id}/{attempt}/status` | JSON, 128 KiB | Nostr | JSON, 256 KiB |
+| `GET /vmls/v1/capabilities` | none | Nostr | JSON, 256 KiB |
+| `POST /vmls-witness/v1/read`, `/advance` | octets, 256 B | none | 170-byte receipt on 200, 409 or 410 |
+
+`{id}` is 64 lower-case hex digits and `{attempt}` a canonical decimal `u32`,
+as Bothy parses them. A VMLS or witness refusal with no body (a box without
+VMLS answers a bare 404) returns its status and an empty body; a success
+must carry its typed body. Cadence replies are JSON whatever their status. One 30-second deadline covers a first dial, request,
 response head and response body. Debug output reports body sizes and redacts
 both authorization and body bytes.
 
@@ -137,5 +154,7 @@ The implementation is finished when tests prove:
     secrets that agree at both ends, and the retry replaces the live route.
 11. bounded cadence JSON crosses a real paired Link session with exact method,
     path, pinned host, authorization and body bytes; a second request reuses
-    that session, JSON refusal bodies return intact and a stalled response
-    reaches the fixed deadline.
+    that session, JSON refusal bodies return intact, a witness read carries
+    octets and no authorization and returns its receipt, a capabilities `GET`
+    carries no body or content type and returns a bare 404's status, and a
+    stalled response reaches the fixed deadline.

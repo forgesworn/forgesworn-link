@@ -16,7 +16,8 @@
 //!
 //! Every check is link-engine's and link-websocket's, the ones link-ffi
 //! runs: route and card verification, the pairing enrolment frames, the
-//! cadence path and authorization rules, the bounded JSON response, the
+//! request allowlist (cadence, VMLS and witness routes) with its
+//! authorization and body rules, the bounded responses, the
 //! virtual WebSocket URL, and the text size and queue bounds.  The engine is
 //! relay-only, by the endpoint's browser build: its one path is the page's
 //! WebSocket to a `wss://` Link relay the browser verifies itself, with no

@@ -323,7 +323,8 @@ impl WebEngine {
         })
     }
 
-    /// One bounded cadence JSON request over the route's pinned session.
+    /// One bounded, allowlisted request (cadence, VMLS or witness) over the
+    /// route's pinned session.
     #[wasm_bindgen(unchecked_return_type = "Promise<LinkHttpResponse>")]
     pub fn request(
         &self,

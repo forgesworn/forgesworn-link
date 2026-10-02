@@ -2,9 +2,10 @@
 //! link-ffi (Kotlin/Android) and link-web (a browser) expose.
 //!
 //! The host supplies encrypted persisted route state; this crate owns the
-//! endpoint, the one session per route, the bounded JSON request, pairing
-//! enrolment and the event WebSocket.  Cadence authorization and JSON cross
-//! as opaque bytes; Link interprets no Nostr event or application authority.
+//! endpoint, the one session per route, the bounded allowlisted request,
+//! pairing enrolment and the event WebSocket.  Cadence and VMLS
+//! authorization and bodies cross as opaque bytes; Link interprets no Nostr
+//! event, VMLS envelope or application authority.
 //! Everything here is async and runs on `link_endpoint::rt`, so the same
 //! checks and the same protocol run natively and in a browser; the
 //! wrappers only adapt calling conventions.
@@ -113,11 +114,13 @@ pub struct PathInfo {
     pub cause: String,
 }
 
-/// One JSON request sent over an already paired Link route.
+/// One allowlisted HTTP request sent over an already paired Link route. The
+/// name predates the VMLS routes, some of which carry raw bytes.
 ///
 /// The route selects a pinned peer. The engine supplies `Host` and
-/// `Content-Type`, so the host application cannot redirect this call or
-/// change its transport identity.
+/// `Content-Type` from the allowlist, so the host application cannot redirect
+/// this call, change its transport identity or relabel its body. Witness
+/// routes take an empty `authorization`.
 #[derive(Clone)]
 pub struct JsonRequest {
     pub route_id: String,
@@ -139,7 +142,8 @@ impl std::fmt::Debug for JsonRequest {
     }
 }
 
-/// A bounded JSON response and the Link path that carried it.
+/// A bounded response and the Link path that carried it. A VMLS or witness
+/// refusal without a body has an empty `body`.
 #[derive(Clone)]
 pub struct JsonResponse {
     pub status: u16,
@@ -283,73 +287,227 @@ where
     Ok(bytes.freeze())
 }
 
-pub fn validate_http_request(request: &JsonRequest) -> Result<Method, EngineError> {
+/// What a request body must be. The engine, not the host, writes the
+/// matching `Content-Type`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestBody {
+    Json,
+    Octets,
+    /// No body and no `Content-Type`.
+    Empty,
+}
+
+/// What a route answers with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResponseBody {
+    /// Every answer is bounded JSON (cadence).
+    Json,
+    /// A success is bounded JSON; a refusal is JSON or has no body (a box
+    /// without VMLS answers 404 with nothing, and the client must see that
+    /// status rather than a transport failure).
+    JsonOrEmptyRefusal,
+    /// A witness receipt: exactly [`WITNESS_RECEIPT_BYTES`] of
+    /// `application/octet-stream`, or a refusal status with no body.
+    WitnessReceipt,
+}
+
+/// One allowlisted route's bounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HttpRoute {
+    pub body: RequestBody,
+    pub max_body_bytes: usize,
+    /// Whether the request carries one Nostr authorization value. Witness
+    /// routes carry none: the witness authenticates the Link peer.
+    pub nostr_authorization: bool,
+    pub response: ResponseBody,
+    pub max_response_bytes: usize,
+}
+
+/// Bothy's `MAX_VMLS_JSON_BYTES`.
+pub const MAX_VMLS_JSON_BYTES: usize = 128 * 1_024;
+/// Bothy's `MAX_ENVELOPE_BYTES`: a canonical VMLS envelope's 44 header bytes
+/// and at most 1,048,576 ciphertext bytes.
+pub const MAX_VMLS_ENVELOPE_BYTES: usize = 44 + 1_048_576;
+/// A fetch page holds at most 1 MiB of envelopes (or one larger envelope),
+/// base64-encoded, with up to 64 records' names and a cursor.
+pub const MAX_VMLS_FETCH_RESPONSE_BYTES: usize = 2 * 1_024 * 1_024;
+/// The witness request bound (contract §4.2).
+pub const MAX_WITNESS_REQUEST_BYTES: usize = 256;
+/// A witness receipt's fixed length (contract §4.2).
+pub const WITNESS_RECEIPT_BYTES: usize = 170;
+/// A body-less refusal may carry at most this much, which is discarded.
+const MAX_DISCARDED_REFUSAL_BYTES: usize = 1_024;
+
+const CADENCE_ROUTE: HttpRoute = HttpRoute {
+    body: RequestBody::Json,
+    max_body_bytes: MAX_HTTP_BODY_BYTES,
+    nostr_authorization: true,
+    response: ResponseBody::Json,
+    max_response_bytes: MAX_HTTP_BODY_BYTES,
+};
+
+const fn vmls_route(body: RequestBody, max_response_bytes: usize) -> HttpRoute {
+    HttpRoute {
+        body,
+        max_body_bytes: match body {
+            RequestBody::Json => MAX_VMLS_JSON_BYTES,
+            RequestBody::Octets => MAX_VMLS_ENVELOPE_BYTES,
+            RequestBody::Empty => 0,
+        },
+        nostr_authorization: true,
+        response: ResponseBody::JsonOrEmptyRefusal,
+        max_response_bytes,
+    }
+}
+
+const WITNESS_ROUTE: HttpRoute = HttpRoute {
+    body: RequestBody::Octets,
+    max_body_bytes: MAX_WITNESS_REQUEST_BYTES,
+    nostr_authorization: false,
+    response: ResponseBody::WitnessReceipt,
+    max_response_bytes: WITNESS_RECEIPT_BYTES,
+};
+
+fn lower_hex_32(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Bothy's `parse_attempt`: a canonical decimal `u32`.
+fn canonical_u32(value: &str) -> bool {
+    !value.is_empty()
+        && (value.len() == 1 || !value.starts_with('0'))
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value.parse::<u32>().is_ok()
+}
+
+/// The allowlist: cadence as before, Bothy's exact `/vmls/v1/` routes and
+/// the two witness routes. Anything else is refused before a dial.
+fn allowlisted(method: &Method, path: &str) -> Option<HttpRoute> {
+    if path.starts_with("/cadence/v1/") {
+        return (*method == Method::POST || *method == Method::PUT).then_some(CADENCE_ROUTE);
+    }
+    if path == "/vmls-witness/v1/read" || path == "/vmls-witness/v1/advance" {
+        return (*method == Method::POST).then_some(WITNESS_ROUTE);
+    }
+    let segments: Vec<&str> = path.strip_prefix("/vmls/v1/")?.split('/').collect();
+    let json = vmls_route(RequestBody::Json, MAX_HTTP_BODY_BYTES);
+    match (method.as_str(), segments.as_slice()) {
+        ("PUT", ["mailboxes", mailbox, "records"]) if lower_hex_32(mailbox) => {
+            Some(vmls_route(RequestBody::Octets, MAX_HTTP_BODY_BYTES))
+        }
+        ("POST", ["fetch"]) => Some(vmls_route(RequestBody::Json, MAX_VMLS_FETCH_RESPONSE_BYTES)),
+        ("POST", ["ack"]) => Some(json),
+        ("PUT", ["packages", package]) if lower_hex_32(package) => Some(json),
+        ("DELETE", ["packages", package]) if lower_hex_32(package) => {
+            Some(vmls_route(RequestBody::Empty, MAX_HTTP_BODY_BYTES))
+        }
+        ("PUT", ["slots", slot, attempt]) if lower_hex_32(slot) && canonical_u32(attempt) => {
+            Some(vmls_route(RequestBody::Octets, MAX_HTTP_BODY_BYTES))
+        }
+        ("POST", ["slots", slot, attempt, "status"])
+            if lower_hex_32(slot) && canonical_u32(attempt) =>
+        {
+            Some(json)
+        }
+        ("GET", ["capabilities"]) => Some(vmls_route(RequestBody::Empty, MAX_HTTP_BODY_BYTES)),
+        _ => None,
+    }
+}
+
+pub fn validate_http_request(request: &JsonRequest) -> Result<(Method, HttpRoute), EngineError> {
     let method = match request.method.as_str() {
+        "GET" => Method::GET,
         "POST" => Method::POST,
         "PUT" => Method::PUT,
+        "DELETE" => Method::DELETE,
         _ => {
             return Err(EngineError::Route(
-                "cadence request method must be POST or PUT".into(),
+                "request method must be GET, POST, PUT or DELETE".into(),
             ));
         }
     };
     let path = request.path.as_bytes();
     if path.is_empty()
         || path.len() > MAX_HTTP_PATH_BYTES
-        || !request.path.starts_with("/cadence/v1/")
         || path.contains(&b'?')
         || path.contains(&b'#')
         || !path.iter().all(u8::is_ascii_graphic)
     {
-        return Err(EngineError::Route(
-            "cadence request path is not canonical".into(),
-        ));
+        return Err(EngineError::Route("request path is not canonical".into()));
     }
+    let route = allowlisted(&method, &request.path)
+        .ok_or_else(|| EngineError::Route("request method and path are not allowlisted".into()))?;
     let authorization = request.authorization.as_bytes();
-    let encoded = authorization.strip_prefix(b"Nostr ").unwrap_or_default();
-    if authorization.len() > MAX_HTTP_AUTHORIZATION_BYTES
-        || encoded.is_empty()
-        || !encoded
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
-    {
+    if route.nostr_authorization {
+        let encoded = authorization.strip_prefix(b"Nostr ").unwrap_or_default();
+        if authorization.len() > MAX_HTTP_AUTHORIZATION_BYTES
+            || encoded.is_empty()
+            || !encoded
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+        {
+            return Err(EngineError::Route(
+                "authorization is not one bounded Nostr value".into(),
+            ));
+        }
+    } else if !authorization.is_empty() {
         return Err(EngineError::Route(
-            "cadence authorization is not one bounded Nostr value".into(),
+            "witness requests carry no authorization".into(),
         ));
     }
-    if request.body.len() > MAX_HTTP_BODY_BYTES {
-        return Err(EngineError::Route(
-            "cadence request body is too large".into(),
-        ));
+    // An empty-body route's limit is 0.
+    if request.body.len() > route.max_body_bytes {
+        return Err(EngineError::Route("request body is too large".into()));
     }
-    Ok(method)
+    Ok((method, route))
 }
 
-pub async fn decode_http_response<B>(response: Response<B>) -> Result<(u16, Vec<u8>), EngineError>
+pub async fn decode_http_response<B>(
+    response: Response<B>,
+    route: &HttpRoute,
+) -> Result<(u16, Vec<u8>), EngineError>
 where
     B: Body<Data = Bytes> + Unpin,
     B::Error: std::fmt::Display,
 {
     if response.status().is_redirection() {
-        return Err(EngineError::Route(
-            "cadence response must not redirect".into(),
-        ));
+        return Err(EngineError::Route("response must not redirect".into()));
     }
+    let status = response.status();
     let content_type = response
         .headers()
         .get(hyper::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(';').next())
         .map(str::trim)
-        .filter(|value| value.eq_ignore_ascii_case("application/json"));
-    if content_type.is_none() {
+        .map(str::to_ascii_lowercase);
+    let expected = match route.response {
+        ResponseBody::Json | ResponseBody::JsonOrEmptyRefusal => "application/json",
+        ResponseBody::WitnessReceipt => "application/octet-stream",
+    };
+    let receipt_status = matches!(
+        status,
+        StatusCode::OK | StatusCode::CONFLICT | StatusCode::GONE
+    );
+    let typed = content_type.as_deref() == Some(expected)
+        && (route.response != ResponseBody::WitnessReceipt || receipt_status);
+    if !typed {
+        if route.response == ResponseBody::Json || status.is_success() {
+            return Err(EngineError::Route(format!("response is not {expected}")));
+        }
+        collect_bounded(response.into_body(), MAX_DISCARDED_REFUSAL_BYTES, "refusal").await?;
+        return Ok((status.as_u16(), Vec::new()));
+    }
+    let body = collect_bounded(response.into_body(), route.max_response_bytes, "response").await?;
+    if route.response == ResponseBody::WitnessReceipt && body.len() != WITNESS_RECEIPT_BYTES {
         return Err(EngineError::Route(
-            "cadence response is not application/json".into(),
+            "witness receipt is not 170 bytes".into(),
         ));
     }
-    let status = response.status().as_u16();
-    let body = collect_bounded(response.into_body(), MAX_HTTP_BODY_BYTES, "cadence").await?;
-    Ok((status, body.to_vec()))
+    Ok((status.as_u16(), body.to_vec()))
 }
 
 pub fn path(session: &Session) -> PathInfo {
@@ -518,14 +676,15 @@ impl Engine {
         Ok((socket, incoming, session))
     }
 
-    /// Send one bounded cadence JSON request over the route's pinned Link
-    /// session. The application supplies neither a network URL nor a `Host`.
+    /// Send one bounded, allowlisted request (cadence, VMLS or witness) over
+    /// the route's pinned Link session. The application supplies neither a
+    /// network URL, a `Host` nor a `Content-Type`.
     pub async fn request_json(
         &self,
         request: JsonRequest,
         timeout: Duration,
     ) -> Result<JsonResponse, EngineError> {
-        let method = validate_http_request(&request)?;
+        let (method, route) = validate_http_request(&request)?;
         let started = rt::Instant::now();
         let (session, node) = {
             // Match `open_socket`: holding the engine lock through a first dial
@@ -551,9 +710,7 @@ impl Engine {
                     self.unless_stopped(async {
                         rt::timeout(timeout, self.endpoint.connect(&card))
                             .await
-                            .map_err(|_| {
-                                EngineError::Transport("cadence request timed out".into())
-                            })?
+                            .map_err(|_| EngineError::Transport("request timed out".into()))?
                             .map_err(|error| EngineError::Transport(error.to_string()))
                     })
                     .await?,
@@ -570,15 +727,27 @@ impl Engine {
         let remaining = timeout
             .checked_sub(started.elapsed())
             .filter(|duration| !duration.is_zero())
-            .ok_or_else(|| EngineError::Transport("cadence request timed out".into()))?;
+            .ok_or_else(|| EngineError::Transport("request timed out".into()))?;
         let (status, body) = rt::timeout(remaining, async {
             let mut sender = http_sender(&session).await?;
-            let outgoing = Request::builder()
+            let mut outgoing = Request::builder()
                 .method(method)
                 .uri(request.path)
-                .header(hyper::header::HOST, node.to_base32())
-                .header(hyper::header::CONTENT_TYPE, "application/json")
-                .header(hyper::header::AUTHORIZATION, request.authorization)
+                .header(hyper::header::HOST, node.to_base32());
+            match route.body {
+                RequestBody::Json => {
+                    outgoing = outgoing.header(hyper::header::CONTENT_TYPE, "application/json");
+                }
+                RequestBody::Octets => {
+                    outgoing =
+                        outgoing.header(hyper::header::CONTENT_TYPE, "application/octet-stream");
+                }
+                RequestBody::Empty => {}
+            }
+            if route.nostr_authorization {
+                outgoing = outgoing.header(hyper::header::AUTHORIZATION, request.authorization);
+            }
+            let outgoing = outgoing
                 .header(hyper::header::CONNECTION, "close")
                 .body(Full::new(Bytes::from(request.body)))
                 .map_err(|error| EngineError::Route(error.to_string()))?;
@@ -586,10 +755,10 @@ impl Engine {
                 .send_request(outgoing)
                 .await
                 .map_err(|error| EngineError::Transport(error.to_string()))?;
-            decode_http_response(response).await
+            decode_http_response(response, &route).await
         })
         .await
-        .map_err(|_| EngineError::Transport("cadence request timed out".into()))??;
+        .map_err(|_| EngineError::Transport("request timed out".into()))??;
         Ok(JsonResponse {
             status,
             body,
@@ -1020,7 +1189,7 @@ mod tests {
     #[test]
     fn cadence_request_boundary_is_narrow_and_redacted() {
         let request = valid_http_request();
-        assert_eq!(validate_http_request(&request).unwrap(), Method::POST);
+        assert_eq!(validate_http_request(&request).unwrap().0, Method::POST);
         let rendered = format!("{request:?}");
         assert!(!rendered.contains("YQ=="));
         assert!(!rendered.contains(r#"{"v":1}"#));
@@ -1029,7 +1198,7 @@ mod tests {
 
         let mut put = request.clone();
         put.method = "PUT".into();
-        assert_eq!(validate_http_request(&put).unwrap(), Method::PUT);
+        assert_eq!(validate_http_request(&put).unwrap().0, Method::PUT);
 
         for method in ["GET", "post", "DELETE"] {
             let mut changed = request.clone();
@@ -1088,7 +1257,9 @@ mod tests {
             )
             .body(Full::new(Bytes::from_static(br#"{"v":1,"code":"scope"}"#)))
             .unwrap();
-        let (status, body) = decode_http_response(response).await.unwrap();
+        let (status, body) = decode_http_response(response, &CADENCE_ROUTE)
+            .await
+            .unwrap();
         assert_eq!(status, 403);
         assert_eq!(body, br#"{"v":1,"code":"scope"}"#);
 
@@ -1097,21 +1268,33 @@ mod tests {
             .header(hyper::header::CONTENT_TYPE, "application/json")
             .body(Full::new(Bytes::new()))
             .unwrap();
-        assert!(decode_http_response(redirect).await.is_err());
+        assert!(
+            decode_http_response(redirect, &CADENCE_ROUTE)
+                .await
+                .is_err()
+        );
 
         let wrong_type = Response::builder()
             .status(StatusCode::OK)
             .header(hyper::header::CONTENT_TYPE, "text/plain")
             .body(Full::new(Bytes::from_static(b"{}")))
             .unwrap();
-        assert!(decode_http_response(wrong_type).await.is_err());
+        assert!(
+            decode_http_response(wrong_type, &CADENCE_ROUTE)
+                .await
+                .is_err()
+        );
 
         let oversized = Response::builder()
             .status(StatusCode::OK)
             .header(hyper::header::CONTENT_TYPE, "application/json")
             .body(Full::new(Bytes::from(vec![0; MAX_HTTP_BODY_BYTES + 1])))
             .unwrap();
-        assert!(decode_http_response(oversized).await.is_err());
+        assert!(
+            decode_http_response(oversized, &CADENCE_ROUTE)
+                .await
+                .is_err()
+        );
 
         let response = JsonResponse {
             status: 200,
@@ -1124,6 +1307,291 @@ mod tests {
             },
         };
         assert!(!format!("{response:?}").contains("response-secret"));
+    }
+
+    const HEX: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    fn vmls(method: &str, path: &str, authorization: &str, body: &[u8]) -> JsonRequest {
+        JsonRequest {
+            route_id: "home".into(),
+            method: method.into(),
+            path: path.into(),
+            authorization: authorization.into(),
+            body: body.to_vec(),
+        }
+    }
+
+    #[test]
+    fn vmls_routes_are_exactly_bothys() {
+        let nostr = "Nostr YQ==";
+        let accepted = [
+            (
+                "PUT",
+                format!("/vmls/v1/mailboxes/{HEX}/records"),
+                RequestBody::Octets,
+            ),
+            ("POST", "/vmls/v1/fetch".into(), RequestBody::Json),
+            ("POST", "/vmls/v1/ack".into(), RequestBody::Json),
+            ("PUT", format!("/vmls/v1/packages/{HEX}"), RequestBody::Json),
+            (
+                "DELETE",
+                format!("/vmls/v1/packages/{HEX}"),
+                RequestBody::Empty,
+            ),
+            (
+                "PUT",
+                format!("/vmls/v1/slots/{HEX}/0"),
+                RequestBody::Octets,
+            ),
+            (
+                "PUT",
+                format!("/vmls/v1/slots/{HEX}/4294967295"),
+                RequestBody::Octets,
+            ),
+            (
+                "POST",
+                format!("/vmls/v1/slots/{HEX}/7/status"),
+                RequestBody::Json,
+            ),
+            ("GET", "/vmls/v1/capabilities".into(), RequestBody::Empty),
+        ];
+        for (method, path, body) in accepted {
+            let payload: &[u8] = if body == RequestBody::Empty {
+                b""
+            } else {
+                b"x"
+            };
+            let (_, route) = validate_http_request(&vmls(method, &path, nostr, payload))
+                .unwrap_or_else(|error| panic!("{method} {path}: {error}"));
+            assert_eq!(route.body, body, "{method} {path}");
+            assert!(route.nostr_authorization);
+            assert_eq!(route.response, ResponseBody::JsonOrEmptyRefusal);
+            assert!(
+                validate_http_request(&vmls(method, &path, "", payload)).is_err(),
+                "{method} {path} without authorization"
+            );
+        }
+
+        let upper = HEX.to_ascii_uppercase();
+        let refused = [
+            ("GET", "/vmls/v1/".to_string()),
+            ("GET", "/vmls/v1".into()),
+            ("POST", "/vmls/v1/capabilities".into()),
+            ("GET", "/vmls/v1/capabilities/".into()),
+            ("PUT", "/vmls/v1/fetch".into()),
+            ("POST", "/vmls/v1/fetch/".into()),
+            ("POST", "/vmls/v2/fetch".into()),
+            ("PUT", format!("/vmls/v1/mailboxes/{upper}/records")),
+            ("PUT", format!("/vmls/v1/mailboxes/{}/records", &HEX[1..])),
+            ("PUT", format!("/vmls/v1/mailboxes/{HEX}0/records")),
+            ("PUT", format!("/vmls/v1/mailboxes/{HEX}/records/")),
+            ("POST", format!("/vmls/v1/mailboxes/{HEX}/records")),
+            ("GET", format!("/vmls/v1/packages/{HEX}")),
+            ("PUT", format!("/vmls/v1/slots/{HEX}/01")),
+            ("PUT", format!("/vmls/v1/slots/{HEX}/4294967296")),
+            ("PUT", format!("/vmls/v1/slots/{HEX}/-1")),
+            ("PUT", format!("/vmls/v1/slots/{HEX}/+1")),
+            ("PUT", format!("/vmls/v1/slots/{HEX}/")),
+            ("PUT", format!("/vmls/v1/slots/{HEX}")),
+            ("POST", format!("/vmls/v1/slots/{HEX}/1/state")),
+            ("POST", format!("/vmls/v1//slots/{HEX}/1/status")),
+            ("POST", "/vmls/v1/fetch?after=x".into()),
+            ("POST", "/vmls-witness/v1/fetch".into()),
+            ("GET", "/vmls-witness/v1/read".into()),
+            ("PUT", "/events".into()),
+            ("DELETE", "/cadence/v1/status".into()),
+            ("GET", "/cadence/v1/status".into()),
+        ];
+        for (method, path) in refused {
+            assert!(
+                validate_http_request(&vmls(method, &path, nostr, b"")).is_err(),
+                "{method} {path}"
+            );
+        }
+        assert!(validate_http_request(&vmls("PATCH", "/vmls/v1/ack", nostr, b"")).is_err());
+    }
+
+    #[test]
+    fn vmls_bodies_are_bounded_per_route() {
+        let nostr = "Nostr YQ==";
+        let envelope = format!("/vmls/v1/mailboxes/{HEX}/records");
+        let mut body = vec![0; MAX_VMLS_ENVELOPE_BYTES];
+        assert!(validate_http_request(&vmls("PUT", &envelope, nostr, &body)).is_ok());
+        body.push(0);
+        assert!(validate_http_request(&vmls("PUT", &envelope, nostr, &body)).is_err());
+
+        let mut json = vec![b' '; MAX_VMLS_JSON_BYTES];
+        assert!(validate_http_request(&vmls("POST", "/vmls/v1/fetch", nostr, &json)).is_ok());
+        json.push(b' ');
+        assert!(validate_http_request(&vmls("POST", "/vmls/v1/fetch", nostr, &json)).is_err());
+
+        for (method, path) in [
+            ("GET", "/vmls/v1/capabilities".to_string()),
+            ("DELETE", format!("/vmls/v1/packages/{HEX}")),
+        ] {
+            assert!(validate_http_request(&vmls(method, &path, nostr, b"{}")).is_err());
+        }
+    }
+
+    #[test]
+    fn witness_routes_carry_bytes_and_no_authorization() {
+        for path in ["/vmls-witness/v1/read", "/vmls-witness/v1/advance"] {
+            let (method, route) =
+                validate_http_request(&vmls("POST", path, "", &[0; 256])).unwrap();
+            assert_eq!(method, Method::POST);
+            assert_eq!(route, WITNESS_ROUTE);
+            assert!(validate_http_request(&vmls("POST", path, "", &[0; 257])).is_err());
+            assert!(validate_http_request(&vmls("POST", path, "Nostr YQ==", b"x")).is_err());
+            assert!(validate_http_request(&vmls("PUT", path, "", b"x")).is_err());
+        }
+    }
+
+    fn reply(
+        status: StatusCode,
+        content_type: Option<&str>,
+        body: Vec<u8>,
+    ) -> Response<Full<Bytes>> {
+        let mut builder = Response::builder().status(status);
+        if let Some(content_type) = content_type {
+            builder = builder.header(hyper::header::CONTENT_TYPE, content_type);
+        }
+        builder.body(Full::new(Bytes::from(body))).unwrap()
+    }
+
+    #[tokio::test]
+    async fn witness_replies_are_exact_receipts_or_bare_refusals() {
+        let octets = Some("application/octet-stream");
+        for status in [StatusCode::OK, StatusCode::CONFLICT, StatusCode::GONE] {
+            let receipt = vec![1; WITNESS_RECEIPT_BYTES];
+            assert_eq!(
+                decode_http_response(reply(status, octets, receipt.clone()), &WITNESS_ROUTE)
+                    .await
+                    .unwrap(),
+                (status.as_u16(), receipt)
+            );
+            for length in [0, WITNESS_RECEIPT_BYTES - 1, WITNESS_RECEIPT_BYTES + 1] {
+                assert!(
+                    decode_http_response(reply(status, octets, vec![1; length]), &WITNESS_ROUTE)
+                        .await
+                        .is_err(),
+                    "{status} with {length} bytes"
+                );
+            }
+        }
+        // Bothy's refusals, including 409 for an exhausted counter, have no
+        // body and no content type.
+        for status in [
+            StatusCode::CONFLICT,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert_eq!(
+                decode_http_response(reply(status, None, Vec::new()), &WITNESS_ROUTE)
+                    .await
+                    .unwrap(),
+                (status.as_u16(), Vec::new())
+            );
+        }
+        for (status, content_type) in [
+            (StatusCode::OK, None),
+            (StatusCode::OK, Some("application/json")),
+            (StatusCode::NO_CONTENT, octets),
+            (StatusCode::TEMPORARY_REDIRECT, octets),
+        ] {
+            assert!(
+                decode_http_response(
+                    reply(status, content_type, vec![1; WITNESS_RECEIPT_BYTES]),
+                    &WITNESS_ROUTE
+                )
+                .await
+                .is_err(),
+                "{status} {content_type:?}"
+            );
+        }
+        let chatty = reply(
+            StatusCode::FORBIDDEN,
+            None,
+            vec![0; MAX_DISCARDED_REFUSAL_BYTES + 1],
+        );
+        assert!(decode_http_response(chatty, &WITNESS_ROUTE).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn vmls_replies_are_json_or_bare_refusals() {
+        let json = Some("application/json");
+        let (_, route) =
+            validate_http_request(&vmls("GET", "/vmls/v1/capabilities", "Nostr YQ==", b""))
+                .unwrap();
+        assert_eq!(
+            decode_http_response(reply(StatusCode::OK, json, b"{}".to_vec()), &route)
+                .await
+                .unwrap(),
+            (200, b"{}".to_vec())
+        );
+        // A box without VMLS answers 404 with nothing; the client must see
+        // the status (contract: a missing route is UnsupportedSecurityContract).
+        assert_eq!(
+            decode_http_response(reply(StatusCode::NOT_FOUND, None, Vec::new()), &route)
+                .await
+                .unwrap(),
+            (404, Vec::new())
+        );
+        assert!(
+            decode_http_response(reply(StatusCode::OK, None, Vec::new()), &route)
+                .await
+                .is_err()
+        );
+        assert!(
+            decode_http_response(
+                reply(
+                    StatusCode::OK,
+                    Some("application/octet-stream"),
+                    b"{}".to_vec()
+                ),
+                &route
+            )
+            .await
+            .is_err()
+        );
+        let oversized = vec![b' '; MAX_HTTP_BODY_BYTES + 1];
+        assert!(
+            decode_http_response(reply(StatusCode::OK, json, oversized.clone()), &route)
+                .await
+                .is_err()
+        );
+        // Cadence keeps its rule: every reply is JSON.
+        assert!(
+            decode_http_response(
+                reply(StatusCode::NOT_FOUND, None, Vec::new()),
+                &CADENCE_ROUTE
+            )
+            .await
+            .is_err()
+        );
+
+        let (_, fetch) =
+            validate_http_request(&vmls("POST", "/vmls/v1/fetch", "Nostr YQ==", b"{}")).unwrap();
+        assert_eq!(
+            decode_http_response(reply(StatusCode::OK, json, oversized), &fetch)
+                .await
+                .unwrap()
+                .1
+                .len(),
+            MAX_HTTP_BODY_BYTES + 1
+        );
+        assert!(
+            decode_http_response(
+                reply(
+                    StatusCode::OK,
+                    json,
+                    vec![b' '; MAX_VMLS_FETCH_RESPONSE_BYTES + 1]
+                ),
+                &fetch
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[test]

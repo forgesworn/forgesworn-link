@@ -271,8 +271,9 @@ impl LinkEngine {
         Ok(Arc::new(LinkSocket { socket, session }))
     }
 
-    /// Send one bounded cadence JSON request over the route's pinned Link
-    /// session. The application supplies neither a network URL nor a `Host`.
+    /// Send one bounded, allowlisted request (cadence, VMLS or witness) over
+    /// the route's pinned Link session. The application supplies neither a
+    /// network URL, a `Host` nor a `Content-Type`.
     pub fn request_json(&self, request: LinkHttpRequest) -> Result<LinkHttpResponse, LinkError> {
         self.request_json_with_timeout(request, HTTP_REQUEST_TIMEOUT)
     }
@@ -534,15 +535,28 @@ mod tests {
                     .strip_prefix("content-length: ")
                     .and_then(|value| value.parse::<usize>().ok())
             })
-            .expect("content length");
+            // hyper sends no length for an empty GET or DELETE.
+            .unwrap_or(0);
         let mut body = vec![0; content_length];
         stream.read_exact(&mut body).await.expect("request body");
         (head, body)
     }
 
     async fn write_json_response(stream: &mut link_endpoint::Stream, status: &str, body: &[u8]) {
+        write_response(stream, status, Some("application/json"), body).await;
+    }
+
+    async fn write_response(
+        stream: &mut link_endpoint::Stream,
+        status: &str,
+        content_type: Option<&str>,
+        body: &[u8],
+    ) {
+        let content_type = content_type
+            .map(|value| format!("Content-Type: {value}\r\n"))
+            .unwrap_or_default();
         let head = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 {status}\r\n{content_type}Content-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         );
         stream.write_all(head.as_bytes()).await.unwrap();
@@ -551,7 +565,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn cadence_json_crosses_one_pinned_link_session_with_exact_bytes() {
+    async fn allowlisted_requests_cross_one_pinned_link_session_with_exact_bytes() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let relay = link_relay::start(link_relay::RelayConfig {
             ws_bind: "127.0.0.1:0".parse().unwrap(),
@@ -634,6 +648,31 @@ mod tests {
                 write_json_response(&mut second, "403 Forbidden", br#"{"v":1,"code":"scope"}"#)
                     .await;
 
+                let mut witness = session.accept_stream().await.expect("witness request");
+                let (head, body) = read_http_request(&mut witness).await;
+                assert!(head.starts_with("POST /vmls-witness/v1/read HTTP/1.1\r\n"));
+                let lower = head.to_ascii_lowercase();
+                assert!(lower.contains("content-type: application/octet-stream\r\n"));
+                assert!(!lower.contains("authorization:"));
+                assert_eq!(body, [0xa1, 0x01, 0x01]);
+                write_response(
+                    &mut witness,
+                    "409 Conflict",
+                    Some("application/octet-stream"),
+                    &[0x5a; 170],
+                )
+                .await;
+
+                let mut capabilities = session.accept_stream().await.expect("capabilities");
+                let (head, body) = read_http_request(&mut capabilities).await;
+                assert!(head.starts_with("GET /vmls/v1/capabilities HTTP/1.1\r\n"));
+                let lower = head.to_ascii_lowercase();
+                assert!(!lower.contains("content-type:"));
+                assert!(head.contains("authorization: Nostr Yg==\r\n"));
+                assert!(body.is_empty());
+                // A box without VMLS: axum's bare 404.
+                write_response(&mut capabilities, "404 Not Found", None, b"").await;
+
                 let mut stalled = session.accept_stream().await.expect("stalled request");
                 let _ = read_http_request(&mut stalled).await;
                 tokio::time::sleep(Duration::from_millis(200)).await;
@@ -688,6 +727,42 @@ mod tests {
             Arc::as_ptr(&engine.core.cached_session("circle-main").unwrap()) as usize;
         assert_eq!(first_session, second_session, "requests reuse one session");
 
+        let witness = std::thread::spawn({
+            let engine = engine.clone();
+            move || {
+                engine.request_json(LinkHttpRequest {
+                    route_id: "circle-main".into(),
+                    method: "POST".into(),
+                    path: "/vmls-witness/v1/read".into(),
+                    authorization: String::new(),
+                    body: vec![0xa1, 0x01, 0x01],
+                })
+            }
+        })
+        .join()
+        .unwrap()
+        .expect("witness response");
+        assert_eq!(witness.status, 409);
+        assert_eq!(witness.body, [0x5a; 170]);
+
+        let capabilities = std::thread::spawn({
+            let engine = engine.clone();
+            move || {
+                engine.request_json(LinkHttpRequest {
+                    route_id: "circle-main".into(),
+                    method: "GET".into(),
+                    path: "/vmls/v1/capabilities".into(),
+                    authorization: "Nostr Yg==".into(),
+                    body: Vec::new(),
+                })
+            }
+        })
+        .join()
+        .unwrap()
+        .expect("capabilities response");
+        assert_eq!(capabilities.status, 404);
+        assert!(capabilities.body.is_empty());
+
         let timeout = std::thread::spawn({
             let engine = engine.clone();
             move || {
@@ -706,7 +781,7 @@ mod tests {
         .join()
         .unwrap()
         .expect_err("stalled response is bounded");
-        assert_eq!(timeout.to_string(), "transport: cadence request timed out");
+        assert_eq!(timeout.to_string(), "transport: request timed out");
 
         serving.await.unwrap();
         tokio::task::spawn_blocking(move || {
