@@ -521,11 +521,12 @@ async fn a_browser_engine_pairs_requests_and_echoes_over_a_real_relay() {
     let refused = &report["refused"];
     assert_eq!(
         refused["path"],
-        "route: cadence request path is not canonical"
+        "route: request method and path are not allowlisted"
     );
+    // GET is allowlisted only for VMLS capabilities, never for cadence.
     assert_eq!(
         refused["method"],
-        "route: cadence request method must be POST or PUT"
+        "route: request method and path are not allowlisted"
     );
     assert_eq!(
         refused["socketPath"],
