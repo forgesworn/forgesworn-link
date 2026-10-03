@@ -221,9 +221,9 @@ do not cover:
   handover behaviour.
 - **The relay under sustained multi-tenant load** or deliberate abuse.  The
   capture that showed zero plaintext was a single transfer, not a loaded relay.
-- **A full security review.**  The identity rule is implemented and tested for
-  the positive case and by unit assertions; there is no adversarial TLS test
-  that drives a full handshake with a mismatched key.
+- **A full security review.**  The identity rule is driven through full
+  TLS 1.3 handshakes, honest and hostile (`crates/link-core/tests/tls_handshake.rs`),
+  but nobody outside the project has reviewed it.
 - **The VPN-default-route LAN row, re-run.**  That row fell back to the relay
   because only the address on the default route was offered as a candidate,
   so the LAN address that would have worked never reached the peer.  Every
@@ -375,11 +375,6 @@ the suite ran at once.  Both are spec lessons, not only code fixes.
 
 ## Open problems
 
-- **No adversarial TLS handshake test.**  The one identity rule is exercised in
-  the positive direction end to end and asserted directly on the verifier.  A
-  test that drives a handshake where the presented key differs from the pin
-  needs an endpoint that can be told to lie, which the API deliberately does
-  not allow.
 - **Inbound queue overflow is silent.**  The path socket's inbound queue is 512
   datagrams; a full queue drops, which QUIC treats as loss.  There is no counter
   for it, so a saturated receiver looks like a lossy network.

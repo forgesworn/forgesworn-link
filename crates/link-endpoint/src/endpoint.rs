@@ -11,12 +11,9 @@ use link_core::id::{NodeId, TransportKey, node_id_from_spki};
 use link_core::path::FailReason;
 use link_core::rendezvous::{PAIRED_ROUTE_SECRET_BYTES, PAIRING_SECRET_BYTES};
 use link_core::tls::{
-    PinnedClientVerifier, PinnedServerVerifier, ProvisionalClientVerifier, RefusingClientVerifier,
-    node_identity,
+    self, PinnedClientVerifier, ProvisionalClientVerifier, RefusingClientVerifier, node_identity,
 };
 use quinn::VarInt;
-use rustls::client::AlwaysResolvesClientRawPublicKeys;
-use rustls::server::AlwaysResolvesServerRawPublicKeys;
 use rustls::sign::CertifiedKey;
 use tracing::{info, warn};
 
@@ -300,17 +297,10 @@ impl Endpoint {
         endpoint_config.max_udp_payload_size(MAX_MTU)?;
 
         let identity = node_identity(&config.key)?;
-        let mut server_crypto = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])?
         // The default server config can never authenticate anyone: every real
         // inbound handshake goes through accept_with and a per-connection pin.
-        .with_client_cert_verifier(RefusingClientVerifier::new())
-        .with_cert_resolver(Arc::new(AlwaysResolvesServerRawPublicKeys::new(
-            identity.clone(),
-        )));
-        server_crypto.alpn_protocols = vec![ALPN.to_vec()];
+        let server_crypto =
+            tls::server_config(identity.clone(), RefusingClientVerifier::new(), ALPN)?;
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
             quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?,
         ));
@@ -461,17 +451,8 @@ impl Endpoint {
         alpn: &[u8],
         pairing: bool,
     ) -> Result<quinn::ClientConfig, FailReason> {
-        let mut crypto = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|_| FailReason::Identity)?
-        .dangerous()
-        .with_custom_certificate_verifier(PinnedServerVerifier::new(expected_server))
-        .with_client_cert_resolver(Arc::new(AlwaysResolvesClientRawPublicKeys::new(
-            self.identity.clone(),
-        )));
-        crypto.alpn_protocols = vec![alpn.to_vec()];
+        let crypto = tls::client_config(self.identity.clone(), expected_server, alpn)
+            .map_err(|_| FailReason::Identity)?;
 
         let mut config = quinn::ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
@@ -493,17 +474,10 @@ impl Endpoint {
             Some(peer) => PinnedClientVerifier::new(peer),
             None => ProvisionalClientVerifier::new(),
         };
-        let mut crypto = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|_| FailReason::Identity)?
-        .with_client_cert_verifier(verifier)
-        .with_cert_resolver(Arc::new(AlwaysResolvesServerRawPublicKeys::new(
-            self.identity.clone(),
-        )));
         let pairing = expected_client.is_none();
-        crypto.alpn_protocols = vec![if pairing { PAIRING_ALPN } else { ALPN }.to_vec()];
+        let alpn = if pairing { PAIRING_ALPN } else { ALPN };
+        let crypto = tls::server_config(self.identity.clone(), verifier, alpn)
+            .map_err(|_| FailReason::Identity)?;
         let quic = quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
             .map_err(|_| FailReason::Identity)?;
         let mut config = quinn::ServerConfig::with_crypto(Arc::new(quic));
