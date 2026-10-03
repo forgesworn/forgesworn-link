@@ -739,7 +739,8 @@ async fn a_reconnecting_node_supersedes_its_old_session_and_does_not_stall() {
         "the second handshake was not routed by a stale proof: took {handshake:?}"
     );
     let bob_session_2 = Arc::new(accepting.await.unwrap().expect("bob accepts the second"));
-    let sink_2 = spawn_sink(bob_session_2.clone(), 1);
+    let received_2 = Arc::new(AtomicUsize::new(0));
+    let sink_2 = spawn_sink_counting(bob_session_2.clone(), 1, Some(received_2.clone()));
 
     // The old session on bob's side is told it was superseded and ends.
     let old = wait_for_history(&bob_session_1, Duration::from_secs(10), saw_failed).await;
@@ -751,20 +752,38 @@ async fn a_reconnecting_node_supersedes_its_old_session_and_does_not_stall() {
         describe(&old)
     );
 
-    // The new session moves 64 MiB.  The bound is loose on purpose: what the
-    // defect broke was the handshake, asserted tightly above; a loaded CI
-    // runner has carried this transfer in 14 s over a direct path, which is
-    // slow but not the stall.
-    let started = Instant::now();
-    send_and_verify(&session_2, 0x5eed_0011, 64 * MIB)
-        .await
-        .expect("64 MiB on the second session");
-    let took = started.elapsed();
-    assert!(
-        took < Duration::from_secs(30),
-        "the reconnected session did not stall: took {took:?}, history: {}",
-        describe(&session_2.history())
-    );
+    // The new session moves 64 MiB without stalling.  What the defect broke
+    // was the handshake, asserted tightly above; here the check is on
+    // progress, not a wall clock.  A total-time bound measured the machine:
+    // a loaded CI runner has taken 14 s and a loaded laptop 32 s, both over
+    // a direct path and both slow rather than stalled.  A stall is bytes
+    // that stop arriving.
+    const STALL: Duration = Duration::from_secs(10);
+    let transfer = send_and_verify(&session_2, 0x5eed_0011, 64 * MIB);
+    tokio::pin!(transfer);
+    let mut last = 0;
+    let mut last_moved = Instant::now();
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    loop {
+        tokio::select! {
+            done = &mut transfer => {
+                done.expect("64 MiB on the second session");
+                break;
+            }
+            _ = tick.tick() => {
+                let now = received_2.load(Ordering::SeqCst);
+                if now != last || now >= 64 * MIB {
+                    last = now;
+                    last_moved = Instant::now();
+                }
+                assert!(
+                    last_moved.elapsed() < STALL,
+                    "the reconnected session stalled at {last} bytes for {STALL:?}, history: {}",
+                    describe(&session_2.history())
+                );
+            }
+        }
+    }
     assert_eq!(sink_2.await.expect("sink"), 1);
     relay.shutdown();
 }
