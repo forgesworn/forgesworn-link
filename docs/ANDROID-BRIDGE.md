@@ -44,7 +44,8 @@ The records passed to `LinkEngine.start` are:
 - `LinkHttpRequest`: installed route id, method, an allowlisted path, one
   Nostr authorization value (empty for witness routes) and exact body bytes;
 - `LinkHttpResponse`: numeric status, exact bounded body (empty for a VMLS or
-  witness refusal that has none) and the Link path that carried it; and
+  witness refusal that has none), `witness_refused` (`witnessRefused` in the
+  browser) and the Link path that carried it; and
 - `LinkPath`: status, route name and any public socket address already present
   in Link's `PathReport`; it contains no rendezvous material.
 
@@ -110,7 +111,12 @@ is exact; anything else is refused before a dial:
 | `POST /vmls-witness/v1/read`, `/advance` | octets, 256 B | none | 170-byte receipt on 200, 409 or 410 |
 
 `{id}` is 64 lower-case hex digits and `{attempt}` a canonical decimal `u32`,
-as Bothy parses them. A VMLS or witness refusal with no body (a box without
+as Bothy parses them. `witness_refused` is true only for a witness-route 403 whose response carries
+`vmls-witness: refused` (Bothy's deliberate refusal; header name
+case-insensitive, value exactly `refused`, one header only, nothing trimmed
+beyond the HTTP parser's own optional whitespace). Any other 403, a wrong
+value, or the header on another route leaves it false, meaning "unavailable".
+No general header map is exposed. A VMLS or witness refusal with no body (a box without
 VMLS answers a bare 404) returns its status and an empty body; a success
 must carry its typed body. Cadence replies are JSON whatever their status. One 30-second deadline covers a first dial, request,
 response head and response body. Debug output reports body sizes and redacts
