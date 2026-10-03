@@ -6,8 +6,8 @@
 > wide-area transport lane: QUIC direct paths with a WebSocket relay
 > fallback, built on `quinn` and `rustls`.
 
-It is for a Bothy box or a Tor-less Wildbloom node that needs to talk to a
-peer across NATs without running its own discovery service or trusting a
+It is for a Bothy box (and, once Wildbloom Node adopts it, a Tor-less
+Wildbloom node) that needs to talk to a peer across NATs without running its own discovery service or trusting a
 relay operator with its identity. The contract is narrow: how a node
 identifies itself, how two nodes discover a route, how they attempt a direct
 connection, how they fall back to a relay, and how a transport plugs into a
