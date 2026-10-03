@@ -148,6 +148,9 @@ impl std::fmt::Debug for JsonRequest {
 pub struct JsonResponse {
     pub status: u16,
     pub body: Vec<u8>,
+    /// True only for a witness-route 403 carrying `vmls-witness: refused`
+    /// (Bothy's deliberate refusal). Any other 403 means "unavailable".
+    pub witness_refused: bool,
     pub path: PathInfo,
 }
 
@@ -156,6 +159,7 @@ impl std::fmt::Debug for JsonResponse {
         f.debug_struct("JsonResponse")
             .field("status", &self.status)
             .field("body", &format_args!("{} bytes", self.body.len()))
+            .field("witness_refused", &self.witness_refused)
             .field("path", &self.path)
             .finish()
     }
@@ -465,6 +469,31 @@ pub fn validate_http_request(request: &JsonRequest) -> Result<(Method, HttpRoute
     Ok((method, route))
 }
 
+/// Bothy's witness refusal header and its one value.
+const WITNESS_REFUSAL_HEADER: &str = "vmls-witness";
+const WITNESS_REFUSAL_VALUE: &[u8] = b"refused";
+
+/// Whether a reply is Bothy's deliberate witness refusal: the witness route,
+/// status 403, and exactly one `vmls-witness` header whose value is exactly
+/// `refused`. The header name is case-insensitive (`HeaderMap`); the value is
+/// compared byte for byte, so `Refused` or `refused!` do not match. hyper has
+/// already stripped the optional whitespace around a field value, and nothing
+/// further is trimmed. Repeated headers are ambiguous and do not match.
+pub fn is_witness_refusal(
+    route: &HttpRoute,
+    status: StatusCode,
+    headers: &hyper::HeaderMap,
+) -> bool {
+    if route.response != ResponseBody::WitnessReceipt || status != StatusCode::FORBIDDEN {
+        return false;
+    }
+    let mut values = headers.get_all(WITNESS_REFUSAL_HEADER).iter();
+    matches!(
+        (values.next(), values.next()),
+        (Some(value), None) if value.as_bytes() == WITNESS_REFUSAL_VALUE
+    )
+}
+
 pub async fn decode_http_response<B>(
     response: Response<B>,
     route: &HttpRoute,
@@ -728,7 +757,7 @@ impl Engine {
             .checked_sub(started.elapsed())
             .filter(|duration| !duration.is_zero())
             .ok_or_else(|| EngineError::Transport("request timed out".into()))?;
-        let (status, body) = rt::timeout(remaining, async {
+        let (status, body, witness_refused) = rt::timeout(remaining, async {
             let mut sender = http_sender(&session).await?;
             let mut outgoing = Request::builder()
                 .method(method)
@@ -755,13 +784,16 @@ impl Engine {
                 .send_request(outgoing)
                 .await
                 .map_err(|error| EngineError::Transport(error.to_string()))?;
-            decode_http_response(response, &route).await
+            let witness_refused = is_witness_refusal(&route, response.status(), response.headers());
+            let (status, body) = decode_http_response(response, &route).await?;
+            Ok::<_, EngineError>((status, body, witness_refused))
         })
         .await
         .map_err(|_| EngineError::Transport("request timed out".into()))??;
         Ok(JsonResponse {
             status,
             body,
+            witness_refused,
             path: path(&session),
         })
     }
@@ -1299,6 +1331,7 @@ mod tests {
         let response = JsonResponse {
             status: 200,
             body: b"response-secret".to_vec(),
+            witness_refused: false,
             path: PathInfo {
                 status: "relayed".into(),
                 relay: None,
@@ -1515,6 +1548,48 @@ mod tests {
             vec![0; MAX_DISCARDED_REFUSAL_BYTES + 1],
         );
         assert!(decode_http_response(chatty, &WITNESS_ROUTE).await.is_err());
+    }
+
+    #[test]
+    fn witness_refusal_needs_the_witness_route_403_and_the_exact_header() {
+        let with = |name: &str, value: &str| {
+            let mut headers = hyper::HeaderMap::new();
+            headers.append(
+                hyper::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+            headers
+        };
+        let refused = with("vmls-witness", "refused");
+        let forbidden = StatusCode::FORBIDDEN;
+        assert!(is_witness_refusal(&WITNESS_ROUTE, forbidden, &refused));
+        // The header name is case-insensitive; surrounding whitespace is
+        // stripped by the HTTP parser, never by us.
+        assert!(is_witness_refusal(
+            &WITNESS_ROUTE,
+            forbidden,
+            &with("VMLS-Witness", "refused")
+        ));
+        let none = hyper::HeaderMap::new();
+        assert!(!is_witness_refusal(&WITNESS_ROUTE, forbidden, &none));
+        for value in ["Refused", "refused!", "unavailable", "", "refused refused"] {
+            assert!(
+                !is_witness_refusal(&WITNESS_ROUTE, forbidden, &with("vmls-witness", value)),
+                "{value:?}"
+            );
+        }
+        let mut twice = refused.clone();
+        twice.append("vmls-witness", "refused".parse().unwrap());
+        assert!(!is_witness_refusal(&WITNESS_ROUTE, forbidden, &twice));
+        for status in [
+            StatusCode::OK,
+            StatusCode::CONFLICT,
+            StatusCode::GONE,
+            StatusCode::NOT_FOUND,
+        ] {
+            assert!(!is_witness_refusal(&WITNESS_ROUTE, status, &refused));
+        }
+        assert!(!is_witness_refusal(&CADENCE_ROUTE, forbidden, &refused));
     }
 
     #[tokio::test]

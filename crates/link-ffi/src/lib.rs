@@ -106,6 +106,10 @@ impl std::fmt::Debug for LinkHttpRequest {
 pub struct LinkHttpResponse {
     pub status: u16,
     pub body: Vec<u8>,
+    /// True only for a witness-route 403 carrying the response header
+    /// `vmls-witness: refused` (Bothy's deliberate refusal). Any other 403,
+    /// or a header on any other route, leaves it false ("unavailable").
+    pub witness_refused: bool,
     pub path: LinkPath,
 }
 impl std::fmt::Debug for LinkHttpResponse {
@@ -113,6 +117,7 @@ impl std::fmt::Debug for LinkHttpResponse {
         f.debug_struct("LinkHttpResponse")
             .field("status", &self.status)
             .field("body", &format_args!("{} bytes", self.body.len()))
+            .field("witness_refused", &self.witness_refused)
             .field("path", &self.path)
             .finish()
     }
@@ -214,6 +219,7 @@ impl From<JsonResponse> for LinkHttpResponse {
         LinkHttpResponse {
             status: response.status,
             body: response.body,
+            witness_refused: response.witness_refused,
             path: response.path.into(),
         }
     }
@@ -511,6 +517,7 @@ mod tests {
         let response = LinkHttpResponse {
             status: 200,
             body: b"response-secret".to_vec(),
+            witness_refused: false,
             path: LinkPath {
                 status: "relayed".into(),
                 relay: None,
@@ -552,11 +559,24 @@ mod tests {
         content_type: Option<&str>,
         body: &[u8],
     ) {
+        write_response_with_header(stream, status, content_type, None, body).await;
+    }
+
+    async fn write_response_with_header(
+        stream: &mut link_endpoint::Stream,
+        status: &str,
+        content_type: Option<&str>,
+        header: Option<&str>,
+        body: &[u8],
+    ) {
         let content_type = content_type
             .map(|value| format!("Content-Type: {value}\r\n"))
             .unwrap_or_default();
+        let header = header
+            .map(|value| format!("{value}\r\n"))
+            .unwrap_or_default();
         let head = format!(
-            "HTTP/1.1 {status}\r\n{content_type}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 {status}\r\n{content_type}{header}Content-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         );
         stream.write_all(head.as_bytes()).await.unwrap();
@@ -663,6 +683,32 @@ mod tests {
                 )
                 .await;
 
+                // Witness refusals: only a 403 with the exact header is
+                // deliberate; a bare 403, a wrong value and a 409 are not.
+                for (status, header) in [
+                    ("403 Forbidden", Some("Vmls-Witness: refused")),
+                    ("403 Forbidden", None),
+                    ("403 Forbidden", Some("vmls-witness: Refused")),
+                    ("409 Conflict", Some("vmls-witness: refused")),
+                ] {
+                    let mut stream = session.accept_stream().await.expect("witness refusal");
+                    let (head, _) = read_http_request(&mut stream).await;
+                    assert!(head.starts_with("POST /vmls-witness/v1/advance HTTP/1.1\r\n"));
+                    write_response_with_header(&mut stream, status, None, header, b"").await;
+                }
+
+                // The same header on a cadence route means nothing.
+                let mut cadence = session.accept_stream().await.expect("cadence refusal");
+                let _ = read_http_request(&mut cadence).await;
+                write_response_with_header(
+                    &mut cadence,
+                    "403 Forbidden",
+                    Some("application/json"),
+                    Some("vmls-witness: refused"),
+                    br#"{"v":1,"code":"scope"}"#,
+                )
+                .await;
+
                 let mut capabilities = session.accept_stream().await.expect("capabilities");
                 let (head, body) = read_http_request(&mut capabilities).await;
                 assert!(head.starts_with("GET /vmls/v1/capabilities HTTP/1.1\r\n"));
@@ -744,6 +790,57 @@ mod tests {
         .expect("witness response");
         assert_eq!(witness.status, 409);
         assert_eq!(witness.body, [0x5a; 170]);
+        assert!(!witness.witness_refused, "a 409 receipt is not a refusal");
+
+        let advance = |path: &str| {
+            let engine = engine.clone();
+            let path = path.to_string();
+            std::thread::spawn(move || {
+                engine.request_json(LinkHttpRequest {
+                    route_id: "circle-main".into(),
+                    method: "POST".into(),
+                    path,
+                    authorization: String::new(),
+                    body: vec![0xa1, 0x01, 0x01],
+                })
+            })
+            .join()
+            .unwrap()
+            .expect("witness refusal response")
+        };
+        let advance_path = "/vmls-witness/v1/advance";
+        let refused = advance(advance_path);
+        assert_eq!(refused.status, 403);
+        assert!(refused.body.is_empty());
+        assert!(refused.witness_refused, "403 with the exact header");
+        let bare = advance(advance_path);
+        assert_eq!(bare.status, 403);
+        assert!(!bare.witness_refused, "403 without the header");
+        let wrong = advance(advance_path);
+        assert_eq!(wrong.status, 403);
+        assert!(!wrong.witness_refused, "403 with a wrong value");
+        let exhausted = advance(advance_path);
+        assert_eq!(exhausted.status, 409);
+        assert!(exhausted.body.is_empty());
+        assert!(!exhausted.witness_refused, "an empty 409 stays a 409");
+
+        let cadence = std::thread::spawn({
+            let engine = engine.clone();
+            move || {
+                engine.request_json(LinkHttpRequest {
+                    route_id: "circle-main".into(),
+                    method: "POST".into(),
+                    path: "/cadence/v1/status".into(),
+                    authorization: "Nostr YQ==".into(),
+                    body: br#"{"v":1}"#.to_vec(),
+                })
+            }
+        })
+        .join()
+        .unwrap()
+        .expect("cadence refusal response");
+        assert_eq!(cadence.status, 403);
+        assert!(!cadence.witness_refused, "header off the witness route");
 
         let capabilities = std::thread::spawn({
             let engine = engine.clone();

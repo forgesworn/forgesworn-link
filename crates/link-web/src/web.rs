@@ -59,6 +59,7 @@ export interface LinkHttpRequest {
 export interface LinkHttpResponse {
   status: number;
   body: Uint8Array;
+  witnessRefused: boolean;
   path: LinkPath;
 }
 export interface LinkSocketListener {
@@ -350,6 +351,11 @@ impl WebEngine {
             let object = Object::new();
             set(&object, "status", &JsValue::from(response.status));
             set(&object, "body", &Uint8Array::from(response.body.as_slice()));
+            set(
+                &object,
+                "witnessRefused",
+                &JsValue::from_bool(response.witness_refused),
+            );
             set(&object, "path", &path_out(response.path));
             Ok(object.into())
         })
