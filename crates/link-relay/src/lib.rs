@@ -452,163 +452,170 @@ async fn serve_session(
     let mut token = [0u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut token);
     let token_hex = hex_lower(&token);
-    ws.send(binary(Frame::Welcome(token))).await?;
-    // Tokens and counters only in the journal, spec 3.1: no node ID, no tag,
-    // and no source address at info, so an operator running at info holds no
-    // address ledger.  The source stays visible at debug for local diagnosis.
-    info!(token = %token_hex, "relay session up");
-    debug!(token = %token_hex, source = %peer.ip(), "relay session source");
-
-    let mut last_ping = Instant::now();
-    let mut idle_check = tokio::time::interval(Duration::from_secs(5));
-    idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut budget = ByteBudget::new(config.bytes_per_second);
     let mut frames_in = 0u64;
     let mut frames_out = 0u64;
     let mut bytes_in = 0u64;
     let mut dropped = 0u64;
 
-    let result: anyhow::Result<()> = loop {
-        tokio::select! {
-            _ = stop_rx.changed() => {
-                let _ = ws.send(binary(Frame::Close(0))).await;
-                break Ok(());
-            }
-            _ = idle_check.tick() => {
-                if last_ping.elapsed() > Duration::from_secs(IDLE_CLOSE_SECONDS) {
+    // The session is registered from here on.  Every exit, an I/O error's `?`
+    // included, leaves this block and reaches the cleanup below, so a socket
+    // reset cannot leave a ghost registration behind (issue #58).
+    let result: anyhow::Result<()> = async {
+        ws.send(binary(Frame::Welcome(token))).await?;
+        // Tokens and counters only in the journal, spec 3.1: no node ID, no tag,
+        // and no source address at info, so an operator running at info holds no
+        // address ledger.  The source stays visible at debug for local diagnosis.
+        info!(token = %token_hex, "relay session up");
+        debug!(token = %token_hex, source = %peer.ip(), "relay session source");
+
+        let mut last_ping = Instant::now();
+        let mut idle_check = tokio::time::interval(Duration::from_secs(5));
+        idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut budget = ByteBudget::new(config.bytes_per_second);
+
+        loop {
+            tokio::select! {
+                _ = stop_rx.changed() => {
                     let _ = ws.send(binary(Frame::Close(0))).await;
-                    break Err(anyhow::anyhow!("idle"));
+                    break Ok(());
                 }
-            }
-            outbound = rx.recv() => {
-                match outbound {
-                    Some(frame) => {
-                        frames_out += 1;
-                        let closing = matches!(frame, Frame::Close(_));
-                        ws.send(binary(frame)).await?;
-                        if closing {
-                            // A queued Close means a newer registration
-                            // superseded this session; the frame said why and
-                            // there is nothing left to route.
-                            break Err(anyhow::anyhow!("superseded"));
-                        }
-                    }
-                    None => break Ok(()),
-                }
-            }
-            incoming = ws.next() => {
-                let Some(message) = incoming else { break Ok(()) };
-                let message = message?;
-                match message {
-                    Message::Binary(_) => {}
-                    Message::Ping(p) => { ws.send(Message::Pong(p)).await?; continue }
-                    Message::Pong(_) => continue,
-                    Message::Close(_) => break Ok(()),
-                    // Text and continuation frames are malformed for this protocol.
-                    _ => {
-                        let _ = ws.send(binary(Frame::Close(CLOSE_REASON_MALFORMED))).await;
-                        break Err(anyhow::anyhow!("non-binary frame"));
+                _ = idle_check.tick() => {
+                    if last_ping.elapsed() > Duration::from_secs(IDLE_CLOSE_SECONDS) {
+                        let _ = ws.send(binary(Frame::Close(0))).await;
+                        break Err(anyhow::anyhow!("idle"));
                     }
                 }
-                let Some(frame) = decode_binary(&message) else {
-                    let _ = ws.send(binary(Frame::Close(CLOSE_REASON_MALFORMED))).await;
-                    break Err(anyhow::anyhow!("oversize or malformed frame"));
-                };
-                frames_in += 1;
-                match frame {
-                    Frame::Send { destination, datagram } => {
-                        let Mode::Identity(node_id) = &mode else {
-                            let _ = ws.send(binary(Frame::Close(CLOSE_REASON_MALFORMED))).await;
-                            break Err(anyhow::anyhow!("identity frame on a tag session"));
-                        };
-                        let source = *node_id;
-                        bytes_in += datagram.len() as u64;
-                        if !budget.allow(datagram.len() as u64) {
-                            dropped += 1;
-                            continue;
-                        }
-                        let target = registry
-                            .lock()
-                            .expect("registry")
-                            .sessions
-                            .get(&destination)
-                            .cloned();
-                        // A destination with no session is dropped silently, which
-                        // QUIC treats as loss.  So is a full queue.
-                        match target {
-                            Some(target) => {
-                                if target
-                                    .try_send(Frame::Recv { source, datagram })
-                                    .is_err()
-                                {
-                                    dropped += 1;
-                                }
-                            }
-                            None => dropped += 1,
-                        }
-                    }
-                    Frame::SendTag { tag, datagram } => {
-                        if !matches!(mode, Mode::Tags(_)) {
-                            let _ = ws.send(binary(Frame::Close(CLOSE_REASON_MALFORMED))).await;
-                            break Err(anyhow::anyhow!("tag frame on an identity session"));
-                        }
-                        bytes_in += datagram.len() as u64;
-                        if !budget.allow(datagram.len() as u64) {
-                            dropped += 1;
-                            continue;
-                        }
-                        // Deliver to every other session registered with this
-                        // tag.  A tag nobody has registered is dropped silently,
-                        // so the relay never amplifies.
-                        let targets: Vec<mpsc::Sender<Frame>> = registry
-                            .lock()
-                            .expect("registry")
-                            .tags
-                            .get(&tag)
-                            .map(|entries| {
-                                entries
-                                    .iter()
-                                    .filter(|(id, _)| *id != session_id)
-                                    .map(|(_, sender)| sender.clone())
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        if targets.is_empty() {
-                            dropped += 1;
-                        } else {
-                            for target in targets {
-                                if target
-                                    .try_send(Frame::RecvTag { tag, datagram: datagram.clone() })
-                                    .is_err()
-                                {
-                                    dropped += 1;
-                                }
+                outbound = rx.recv() => {
+                    match outbound {
+                        Some(frame) => {
+                            frames_out += 1;
+                            let closing = matches!(frame, Frame::Close(_));
+                            ws.send(binary(frame)).await?;
+                            if closing {
+                                // A queued Close means a newer registration
+                                // superseded this session; the frame said why and
+                                // there is nothing left to route.
+                                break Err(anyhow::anyhow!("superseded"));
                             }
                         }
+                        None => break Ok(()),
                     }
-                    Frame::Register { tags: next } => {
-                        let Mode::Tags(current) = &mode else {
+                }
+                incoming = ws.next() => {
+                    let Some(message) = incoming else { break Ok(()) };
+                    let message = message?;
+                    match message {
+                        Message::Binary(_) => {}
+                        Message::Ping(p) => { ws.send(Message::Pong(p)).await?; continue }
+                        Message::Pong(_) => continue,
+                        Message::Close(_) => break Ok(()),
+                        // Text and continuation frames are malformed for this protocol.
+                        _ => {
                             let _ = ws.send(binary(Frame::Close(CLOSE_REASON_MALFORMED))).await;
-                            break Err(anyhow::anyhow!("register on an identity session"));
-                        };
-                        register_tags(&registry, session_id, &tx, current, &next);
-                        mode = Mode::Tags(next);
+                            break Err(anyhow::anyhow!("non-binary frame"));
+                        }
                     }
-                    Frame::Ping(opaque) => {
-                        last_ping = Instant::now();
-                        ws.send(binary(Frame::Pong(opaque))).await?;
-                    }
-                    Frame::Pong(_) => last_ping = Instant::now(),
-                    Frame::Close(_) => break Ok(()),
-                    // A client may only send, register, ping, pong or close.
-                    _ => {
+                    let Some(frame) = decode_binary(&message) else {
                         let _ = ws.send(binary(Frame::Close(CLOSE_REASON_MALFORMED))).await;
-                        break Err(anyhow::anyhow!("unexpected frame from client"));
+                        break Err(anyhow::anyhow!("oversize or malformed frame"));
+                    };
+                    frames_in += 1;
+                    match frame {
+                        Frame::Send { destination, datagram } => {
+                            let Mode::Identity(node_id) = &mode else {
+                                let _ = ws.send(binary(Frame::Close(CLOSE_REASON_MALFORMED))).await;
+                                break Err(anyhow::anyhow!("identity frame on a tag session"));
+                            };
+                            let source = *node_id;
+                            bytes_in += datagram.len() as u64;
+                            if !budget.allow(datagram.len() as u64) {
+                                dropped += 1;
+                                continue;
+                            }
+                            let target = registry
+                                .lock()
+                                .expect("registry")
+                                .sessions
+                                .get(&destination)
+                                .cloned();
+                            // A destination with no session is dropped silently, which
+                            // QUIC treats as loss.  So is a full queue.
+                            match target {
+                                Some(target) => {
+                                    if target
+                                        .try_send(Frame::Recv { source, datagram })
+                                        .is_err()
+                                    {
+                                        dropped += 1;
+                                    }
+                                }
+                                None => dropped += 1,
+                            }
+                        }
+                        Frame::SendTag { tag, datagram } => {
+                            if !matches!(mode, Mode::Tags(_)) {
+                                let _ = ws.send(binary(Frame::Close(CLOSE_REASON_MALFORMED))).await;
+                                break Err(anyhow::anyhow!("tag frame on an identity session"));
+                            }
+                            bytes_in += datagram.len() as u64;
+                            if !budget.allow(datagram.len() as u64) {
+                                dropped += 1;
+                                continue;
+                            }
+                            // Deliver to every other session registered with this
+                            // tag.  A tag nobody has registered is dropped silently,
+                            // so the relay never amplifies.
+                            let targets: Vec<mpsc::Sender<Frame>> = registry
+                                .lock()
+                                .expect("registry")
+                                .tags
+                                .get(&tag)
+                                .map(|entries| {
+                                    entries
+                                        .iter()
+                                        .filter(|(id, _)| *id != session_id)
+                                        .map(|(_, sender)| sender.clone())
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            if targets.is_empty() {
+                                dropped += 1;
+                            } else {
+                                for target in targets {
+                                    if target
+                                        .try_send(Frame::RecvTag { tag, datagram: datagram.clone() })
+                                        .is_err()
+                                    {
+                                        dropped += 1;
+                                    }
+                                }
+                            }
+                        }
+                        Frame::Register { tags: next } => {
+                            let Mode::Tags(current) = &mode else {
+                                let _ = ws.send(binary(Frame::Close(CLOSE_REASON_MALFORMED))).await;
+                                break Err(anyhow::anyhow!("register on an identity session"));
+                            };
+                            register_tags(&registry, session_id, &tx, current, &next);
+                            mode = Mode::Tags(next);
+                        }
+                        Frame::Ping(opaque) => {
+                            last_ping = Instant::now();
+                            ws.send(binary(Frame::Pong(opaque))).await?;
+                        }
+                        Frame::Pong(_) => last_ping = Instant::now(),
+                        Frame::Close(_) => break Ok(()),
+                        // A client may only send, register, ping, pong or close.
+                        _ => {
+                            let _ = ws.send(binary(Frame::Close(CLOSE_REASON_MALFORMED))).await;
+                            break Err(anyhow::anyhow!("unexpected frame from client"));
+                        }
                     }
                 }
             }
         }
-    };
+    }
+    .await;
 
     // Whatever the session registered leaves the relay's memory with it.
     match &mode {

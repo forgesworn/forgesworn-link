@@ -368,3 +368,43 @@ async fn a_third_tag_registrant_evicts_the_oldest() {
     }
     relay.shutdown();
 }
+
+/// An end that vanishes without a Close (a socket reset, a crash) must still
+/// leave the tag, issue #58.  Otherwise its reconnection is a third
+/// registrant and evicts the healthy peer, which then backs off for up to
+/// thirty seconds.
+#[tokio::test]
+async fn an_end_that_drops_without_a_close_leaves_its_tags() {
+    let relay = start_relay().await;
+    let url = relay.url("127.0.0.1");
+    let t = tag(0x58);
+    let mut a = open_tags(&url, vec![t]).await;
+    let b = open_tags(&url, vec![t]).await;
+    // Dropping the stream closes the socket without a WebSocket Close, which
+    // the relay reads as an I/O error rather than a clean end.
+    drop(b);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let mut b_again = open_tags(&url, vec![t]).await;
+    assert!(
+        silent(&mut a, Duration::from_millis(500)).await,
+        "the healthy end was evicted by its peer's reconnection"
+    );
+    a.send(Message::Binary(
+        Frame::SendTag {
+            tag: t,
+            datagram: vec![5, 8],
+        }
+        .encode(),
+    ))
+    .await
+    .unwrap();
+    match next_frame(&mut b_again).await {
+        Some(Frame::RecvTag { tag, datagram }) => {
+            assert_eq!(tag, t);
+            assert_eq!(datagram, vec![5, 8]);
+        }
+        other => panic!("the reconnected end should receive on the tag, got {other:?}"),
+    }
+    relay.shutdown();
+}
