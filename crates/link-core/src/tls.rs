@@ -11,12 +11,14 @@
 
 use std::sync::Arc;
 
+use rustls::client::AlwaysResolvesClientRawPublicKeys;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, verify_tls13_signature_with_raw_key};
 use rustls::pki_types::{
     CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, SubjectPublicKeyInfoDer,
     UnixTime,
 };
+use rustls::server::AlwaysResolvesServerRawPublicKeys;
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::sign::CertifiedKey;
 use rustls::{DigitallySignedStruct, DistinguishedName, Error as TlsError, SignatureScheme};
@@ -33,6 +35,39 @@ pub fn node_identity(key: &TransportKey) -> Result<Arc<CertifiedKey>, TlsError> 
     let signing = rustls::crypto::ring::sign::any_supported_type(&private)?;
     let spki = CertificateDer::from(key.node_id().spki_der().to_vec());
     Ok(Arc::new(CertifiedKey::new(vec![spki], signing)))
+}
+
+/// The TLS half of a dialling endpoint: TLS 1.3 only, the server pinned to
+/// `expected_server`, and `identity` presented as the client's raw public key.
+/// The endpoint wraps this for quinn; the adversarial handshake tests drive it
+/// directly, so what they prove holds for the configuration actually used.
+pub fn client_config(
+    identity: Arc<CertifiedKey>,
+    expected_server: NodeId,
+    alpn: &[u8],
+) -> Result<rustls::ClientConfig, TlsError> {
+    let mut config = rustls::ClientConfig::builder_with_provider(provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .dangerous()
+        .with_custom_certificate_verifier(PinnedServerVerifier::new(expected_server))
+        .with_client_cert_resolver(Arc::new(AlwaysResolvesClientRawPublicKeys::new(identity)));
+    config.alpn_protocols = vec![alpn.to_vec()];
+    Ok(config)
+}
+
+/// The TLS half of an accepting endpoint: TLS 1.3 only, `identity` presented
+/// as the server's raw public key, and the client judged by `verifier`.
+pub fn server_config(
+    identity: Arc<CertifiedKey>,
+    verifier: Arc<dyn ClientCertVerifier>,
+    alpn: &[u8],
+) -> Result<rustls::ServerConfig, TlsError> {
+    let mut config = rustls::ServerConfig::builder_with_provider(provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_client_cert_verifier(verifier)
+        .with_cert_resolver(Arc::new(AlwaysResolvesServerRawPublicKeys::new(identity)));
+    config.alpn_protocols = vec![alpn.to_vec()];
+    Ok(config)
 }
 
 fn provider() -> Arc<CryptoProvider> {
