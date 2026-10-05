@@ -6,6 +6,8 @@ on:
     paths:
       - "crates/link-core/**"
       - "crates/link-endpoint/**"
+      - "crates/link-engine/**"
+      - "crates/link-relay/**"
       - "crates/link-websocket/**"
       - "crates/link-ffi/**"
       - "scripts/build-android-bundle.sh"
@@ -16,6 +18,8 @@ on:
     paths:
       - "crates/link-core/**"
       - "crates/link-endpoint/**"
+      - "crates/link-engine/**"
+      - "crates/link-relay/**"
       - "crates/link-websocket/**"
       - "crates/link-ffi/**"
       - "scripts/build-android-bundle.sh"
