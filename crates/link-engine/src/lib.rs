@@ -333,7 +333,8 @@ pub const MAX_VMLS_JSON_BYTES: usize = 128 * 1_024;
 /// and at most 1,048,576 ciphertext bytes.
 pub const MAX_VMLS_ENVELOPE_BYTES: usize = 44 + 1_048_576;
 /// A fetch page holds at most 1 MiB of envelopes (or one larger envelope),
-/// base64-encoded, with up to 64 records' names and a cursor.
+/// base64-encoded, with up to 64 records' names and a cursor. A filled
+/// slot's status answers its whole envelope, so it has the same bound.
 pub const MAX_VMLS_FETCH_RESPONSE_BYTES: usize = 2 * 1_024 * 1_024;
 /// The witness request bound (contract §4.2).
 pub const MAX_WITNESS_REQUEST_BYTES: usize = 256;
@@ -411,10 +412,12 @@ fn allowlisted(method: &Method, path: &str) -> Option<HttpRoute> {
         ("PUT", ["slots", slot, attempt]) if lower_hex_32(slot) && canonical_u32(attempt) => {
             Some(vmls_route(RequestBody::Octets, MAX_HTTP_BODY_BYTES))
         }
+        // A filled slot answers its envelope: a commit in the 1 MiB bucket
+        // is about 1.4 MB of base64, beyond ordinary JSON's bound.
         ("POST", ["slots", slot, attempt, "status"])
             if lower_hex_32(slot) && canonical_u32(attempt) =>
         {
-            Some(json)
+            Some(vmls_route(RequestBody::Json, MAX_VMLS_FETCH_RESPONSE_BYTES))
         }
         ("GET", ["capabilities"]) => Some(vmls_route(RequestBody::Empty, MAX_HTTP_BODY_BYTES)),
         _ => None,
@@ -1663,6 +1666,31 @@ mod tests {
                     vec![b' '; MAX_VMLS_FETCH_RESPONSE_BYTES + 1]
                 ),
                 &fetch
+            )
+            .await
+            .is_err()
+        );
+
+        // A filled slot in the 1 MiB bucket is read back through its status.
+        let slot = format!("/vmls/v1/slots/{}/7/status", "a".repeat(64));
+        let (_, status) = validate_http_request(&vmls("POST", &slot, "Nostr YQ==", b"{}")).unwrap();
+        let filled = vec![b' '; MAX_VMLS_ENVELOPE_BYTES.div_ceil(3) * 4 + 1_024];
+        assert_eq!(
+            decode_http_response(reply(StatusCode::OK, json, filled.clone()), &status)
+                .await
+                .unwrap()
+                .1
+                .len(),
+            filled.len()
+        );
+        assert!(
+            decode_http_response(
+                reply(
+                    StatusCode::OK,
+                    json,
+                    vec![b' '; MAX_VMLS_FETCH_RESPONSE_BYTES + 1]
+                ),
+                &status
             )
             .await
             .is_err()
