@@ -31,3 +31,6 @@ tokio = { version = "1", default-features = false, features = ["sync", "macros",
 
 [dev-dependencies]
 tokio.workspace = true
+link-relay = { path = "../link-relay" }
+rustls.workspace = true
+tokio-tungstenite.workspace = true

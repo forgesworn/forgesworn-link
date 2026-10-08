@@ -679,7 +679,12 @@ impl Engine {
                 .ok_or_else(|| EngineError::Route("route is not installed".into()))?;
             link_websocket::validate_virtual_url(&url, route.node)
                 .map_err(|error| EngineError::Socket(error.to_string()))?;
-            if let Some(session) = &route.session {
+            // A restarted peer leaves the previous session closed. Re-dial
+            // it just as HTTP requests do, while still coalescing live opens.
+            let current = route.session.as_ref().filter(|session| {
+                !session.is_closed() && !matches!(session.path().status, PathStatus::Failed(_))
+            });
+            if let Some(session) = current {
                 session.clone()
             } else {
                 let card = route.card.clone();
@@ -730,10 +735,9 @@ impl Engine {
                 .get(&request.route_id)
                 .ok_or_else(|| EngineError::Route("route is not installed".into()))?;
             let node = route.node;
-            let current = route
-                .session
-                .as_ref()
-                .filter(|session| !matches!(session.path().status, PathStatus::Failed(_)));
+            let current = route.session.as_ref().filter(|session| {
+                !session.is_closed() && !matches!(session.path().status, PathStatus::Failed(_))
+            });
             let session = if let Some(session) = current {
                 session.clone()
             } else {
@@ -1733,6 +1737,94 @@ mod tests {
         oversize.extend_from_slice(&u16::try_from(MAX_CARD_BYTES + 1).unwrap().to_be_bytes());
         oversize.resize(ROUTE_PREFIX_BYTES + MAX_CARD_BYTES + 1, 0);
         assert!(route_card(&oversize).is_err(), "above the card bound");
+    }
+
+    /// A peer restart must not poison every subsequent WebSocket open.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn websocket_replaces_closed_cached_session() {
+        use link_endpoint::AcceptedSession;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let relay = link_relay::start(link_relay::RelayConfig {
+            ws_bind: "127.0.0.1:0".parse().unwrap(),
+            udp_bind: "127.0.0.1:0".parse().unwrap(),
+            hosts: vec!["127.0.0.1".into()],
+            tls: None,
+            bytes_per_second: 0,
+            max_sessions: 16,
+            max_sessions_per_source: 0,
+            reflector_per_second: 100.0,
+        })
+        .await
+        .unwrap();
+        let client_seed = [0x35; 32];
+        let shared = [0x73; 32];
+        let mut config = EndpointConfig::new(TransportKey::generate());
+        config.relays = vec![RelaySpec::plain(relay.url("127.0.0.1"))];
+        config.allow_direct = false;
+        config.bind = "127.0.0.1:0".parse().unwrap();
+        config.paired_routes = Some(HashMap::from([(
+            TransportKey::from_seed(client_seed).node_id(),
+            Zeroizing::new(shared),
+        )]));
+        let server = Arc::new(Endpoint::open(config).await.unwrap());
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            server.paths().relay().home().wait_up(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let card = server.card(Duration::from_secs(600), Vec::new());
+        let engine = Engine::start(EngineConfig {
+            transport_seed: client_seed.to_vec(),
+            relay_urls: Vec::new(),
+            allow_direct: false,
+            routes: vec![Route {
+                route_id: "room".into(),
+                card: card.as_bytes().to_vec(),
+                paired_route_secret: shared.to_vec(),
+                card_serial: card.serial,
+                card_verified_at: rt::unix_now(),
+            }],
+        })
+        .await
+        .unwrap();
+        let url = format!("ws://{}/events", server.node_id().to_base32());
+        let serve = |server: Arc<Endpoint>| {
+            tokio::spawn(async move {
+                let AcceptedSession::Pinned(session) = server.accept_any().await.unwrap() else {
+                    panic!("pinned session")
+                };
+                let stream = session.accept_stream().await.unwrap();
+                let socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                (session, socket)
+            })
+        };
+        let first_server = serve(server.clone());
+        let (_, _, first) =
+            tokio::time::timeout(Duration::from_secs(20), engine.open_socket(&url, "room"))
+                .await
+                .unwrap()
+                .unwrap();
+        let (peer, _socket) = first_server.await.unwrap();
+        peer.close(0).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !first.is_closed() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let second_server = serve(server.clone());
+        let (_, _, second) =
+            tokio::time::timeout(Duration::from_secs(20), engine.open_socket(&url, "room"))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(!matches!(second.path().status, PathStatus::Failed(_)));
+        let _ = second_server.await.unwrap();
+        engine.stop().await;
     }
 
     /// `stop` takes effect while another call holds the engine through a
