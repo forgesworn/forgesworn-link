@@ -51,7 +51,7 @@ export interface LinkPath {
 }
 export interface LinkHttpRequest {
   routeId: string;
-  method: "POST" | "PUT";
+  method: "GET" | "POST" | "PUT" | "DELETE";
   path: string;
   authorization: string;
   body: Uint8Array;
