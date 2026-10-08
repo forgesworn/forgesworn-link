@@ -285,6 +285,12 @@ impl Session {
         self.inner.punch_requests.load(Ordering::SeqCst)
     }
 
+    /// Whether the QUIC connection has ended, including a graceful peer
+    /// shutdown which deliberately preserves its final path report.
+    pub fn is_closed(&self) -> bool {
+        self.inner.conn.close_reason().is_some()
+    }
+
     pub async fn open_stream(&self) -> anyhow::Result<Stream> {
         let (send, recv) = self.inner.conn.open_bi().await?;
         Ok(Stream { send, recv })
