@@ -112,7 +112,9 @@ socket.disconnect()
 report.socket.closed = await within(gotClose, 'socket close')
 report.socket.events = events
 
-await engine.stop()
+const stopping = engine.stop()
+if (engine.stop() !== stopping) throw new Error("repeated stop did not return the completion barrier")
+await within(stopping, "engine shutdown", 5_000)
 report.refusedAfterStop = await refused(engine.request(echoRequest('stopped')))
 
 // A restarted page: the same seed and only the persisted record.
@@ -123,7 +125,7 @@ await within(again.retireRoute('box'), 'retire')
 await within(again.finalizeRoute('box'), 'finalize')
 await again.removeRoute('box')
 report.removedRefuses = await refused(again.request(echoRequest('removed')))
-await again.stop()
+await within(again.stop(), "restarted engine shutdown", 5_000)
 
 console.log(`E2E_REPORT ${JSON.stringify(report)}`)
 process.exit(0)

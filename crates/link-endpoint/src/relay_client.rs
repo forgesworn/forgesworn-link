@@ -12,7 +12,7 @@ use rand::RngCore;
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, info, warn};
 
-use crate::relay_socket::{RelaySocket, WsMessage, send_retry};
+use crate::relay_socket::{RelaySocket, SocketShutdown, WsMessage, send_retry};
 use crate::rendezvous_book::TagBook;
 use crate::rt;
 
@@ -254,6 +254,7 @@ pub struct RelayDriver {
     host_memo: Arc<Mutex<Option<(String, String)>>>,
     activity: Arc<RelayActivity>,
     stop: watch::Sender<bool>,
+    finished: watch::Receiver<bool>,
 }
 
 #[derive(Default)]
@@ -329,6 +330,26 @@ impl RelayClient {
         let _extra = self.extra.lock().expect("drivers");
         for driver in self.by_id.lock().expect("drivers").values() {
             driver.stop.send_replace(true);
+        }
+    }
+
+    /// Wait for every driver to exit and every browser socket it opened to
+    /// reach CLOSED. `close` prevents new drivers before this snapshot.
+    pub async fn closed(&self) {
+        self.close();
+        let drivers: Vec<_> = self
+            .by_id
+            .lock()
+            .expect("drivers")
+            .values()
+            .cloned()
+            .collect();
+        for driver in drivers {
+            let mut finished = driver.finished.clone();
+            finished
+                .wait_for(|done| *done)
+                .await
+                .expect("driver completion sender retained");
         }
     }
 
@@ -410,6 +431,9 @@ impl RelayDriver {
     /// Queue a datagram for the relay.  Never blocks, so it is safe to call
     /// from quinn's driver.
     pub fn try_send(&self, destination: NodeId, datagram: &[u8]) -> QueueOutcome {
+        if *self.stop.borrow() {
+            return QueueOutcome::Dropped;
+        }
         let up = matches!(&*self.status.borrow(), RelayStatus::Up(_));
         let frame = match &self.book {
             None => Frame::Send {
@@ -541,6 +565,8 @@ fn spawn_driver(
     let (status_tx, status_rx) = watch::channel(RelayStatus::Connecting);
     let (events_tx, _) = broadcast::channel(EVENT_CAPACITY);
     let (stop_tx, mut stop_rx) = watch::channel(false);
+    let (finished_tx, finished_rx) = watch::channel(false);
+    let sockets = SocketShutdown::default();
     let activity = Arc::new(RelayActivity::default());
     let urls: Vec<String> = relays.iter().map(|spec| spec.url.clone()).collect();
     let work = driver(
@@ -554,6 +580,7 @@ fn spawn_driver(
         readiness.clone(),
         book.clone(),
         activity.clone(),
+        sockets.clone(),
     );
     let stopped_events = events_tx.clone();
     let stopped_readiness = readiness.clone();
@@ -566,6 +593,11 @@ fn spawn_driver(
             }
             _ = work => {}
         }
+        // The select has dropped the driver and its outbound receiver. Its
+        // browser sockets may still be closing asynchronously.
+        stopped_readiness.wake_all();
+        sockets.wait().await;
+        finished_tx.send_replace(true);
     });
     RelayDriver {
         id,
@@ -578,6 +610,7 @@ fn spawn_driver(
         host_memo: Arc::new(Mutex::new(None)),
         activity,
         stop: stop_tx,
+        finished: finished_rx,
     }
 }
 
@@ -607,6 +640,7 @@ async fn driver(
     readiness: Arc<WriteReadiness>,
     book: Option<Arc<TagBook>>,
     activity: Arc<RelayActivity>,
+    sockets: SocketShutdown,
 ) {
     if relays.is_empty() {
         set_status(&status, &events, RelayStatus::Failed);
@@ -639,7 +673,7 @@ async fn driver(
         let book_changes = book.as_deref().map(TagBook::subscribe).unwrap_or(idle_rx);
         let attempt = rt::timeout(
             CONNECT_TIMEOUT,
-            connect(&key, &spec, book.as_deref(), &activity),
+            connect(&key, &spec, book.as_deref(), &activity, &sockets),
         )
         .await
         .map_err(anyhow::Error::from)
@@ -735,9 +769,10 @@ async fn connect(
     spec: &RelaySpec,
     book: Option<&TagBook>,
     activity: &RelayActivity,
+    sockets: &SocketShutdown,
 ) -> anyhow::Result<RelaySocket> {
     let host = spec.host()?;
-    let mut ws = RelaySocket::open(spec).await?;
+    let mut ws = RelaySocket::open(spec, sockets).await?;
 
     // First contact: identity auth (spec 3.1) or tag registration (spec 9).
     let challenge = match next_frame(&mut ws).await? {
@@ -913,7 +948,7 @@ async fn pump(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(wasm_browser)))]
 mod tests {
     use super::*;
 

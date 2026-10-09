@@ -198,6 +198,7 @@ fn callback(listener: &JsValue, name: &str) -> Result<Option<Function>, JsError>
 pub struct WebEngine {
     /// `None` once stopped; in-flight calls hold their own reference.
     engine: RefCell<Option<Rc<Engine>>>,
+    shutdown: RefCell<Option<Promise>>,
 }
 
 #[wasm_bindgen(js_class = LinkEngine)]
@@ -229,6 +230,7 @@ impl WebEngine {
             .map_err(|error| JsError::new(&error.to_string()))?;
         Ok(WebEngine {
             engine: RefCell::new(Some(Rc::new(engine))),
+            shutdown: RefCell::new(None),
         })
     }
 
@@ -415,13 +417,18 @@ impl WebEngine {
     /// every route secret from it and close the endpoint.
     #[wasm_bindgen(unchecked_return_type = "Promise<void>")]
     pub fn stop(&self) -> Promise {
+        if let Some(shutdown) = self.shutdown.borrow().as_ref() {
+            return shutdown.clone();
+        }
         let engine = self.engine.borrow_mut().take();
-        future_to_promise(async move {
+        let shutdown = future_to_promise(async move {
             if let Some(engine) = engine {
                 engine.wipe().await;
             }
             Ok(JsValue::UNDEFINED)
-        })
+        });
+        *self.shutdown.borrow_mut() = Some(shutdown.clone());
+        shutdown
     }
 }
 

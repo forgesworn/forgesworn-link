@@ -21,7 +21,10 @@ pub fn send_retry() -> std::future::Pending<()> {
 pub struct RelaySocket(tokio_tungstenite::WebSocketStream<Box<dyn Duplex>>);
 
 impl RelaySocket {
-    pub async fn open(spec: &RelaySpec) -> anyhow::Result<RelaySocket> {
+    pub async fn open(
+        spec: &RelaySpec,
+        _shutdown: &super::SocketShutdown,
+    ) -> anyhow::Result<RelaySocket> {
         let (tls, host, port, path) = spec.parts()?;
         let stream = crate::rt::timeout(
             Duration::from_secs(10),
