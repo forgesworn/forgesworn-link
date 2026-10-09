@@ -553,7 +553,7 @@ impl TagBook {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(wasm_browser)))]
 mod tests {
     use super::*;
 

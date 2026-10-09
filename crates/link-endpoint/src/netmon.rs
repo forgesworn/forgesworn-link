@@ -70,7 +70,7 @@ pub fn interface_snapshot() -> Vec<IpAddr> {
         .unwrap_or_default()
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(wasm_browser)))]
 mod tests {
     use super::*;
     use std::net::IpAddr;

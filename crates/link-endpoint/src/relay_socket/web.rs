@@ -55,6 +55,7 @@ pub fn send_retry() -> impl std::future::Future<Output = ()> {
 
 pub struct RelaySocket {
     ws: WebSocket,
+    shutdown: Option<super::SocketGuard>,
     shared: Rc<RefCell<Shared>>,
     _on_open: Closure<dyn FnMut(Event)>,
     _on_message: Closure<dyn FnMut(MessageEvent)>,
@@ -63,7 +64,10 @@ pub struct RelaySocket {
 }
 
 impl RelaySocket {
-    pub async fn open(spec: &RelaySpec) -> anyhow::Result<RelaySocket> {
+    pub async fn open(
+        spec: &RelaySpec,
+        shutdown: &super::SocketShutdown,
+    ) -> anyhow::Result<RelaySocket> {
         let url = spec.browser_url()?;
         let ws = WebSocket::new(&url)
             .map_err(|e| anyhow::anyhow!("the browser refused the relay WebSocket: {e:?}"))?;
@@ -128,6 +132,7 @@ impl RelaySocket {
         // future closes the socket.
         let socket = RelaySocket {
             ws,
+            shutdown: Some(shutdown.opened()),
             shared,
             _on_open: on_open,
             _on_message: on_message,
@@ -190,7 +195,89 @@ impl Drop for RelaySocket {
         self.ws.set_onopen(None);
         self.ws.set_onmessage(None);
         self.ws.set_onerror(None);
-        self.ws.set_onclose(None);
-        let _ = self.ws.close();
+        // Dropping a browser WebSocket only requests closure. Keep a close
+        // listener and the shutdown guard alive until the browser confirms
+        // CLOSED, including cancelled handshakes and sockets being replaced.
+        let ws = self.ws.clone();
+        let shutdown = self.shutdown.take();
+        let (closed, done) = tokio::sync::oneshot::channel();
+        let mut closed = Some(closed);
+        let on_close = Closure::<dyn FnMut(CloseEvent)>::new(move |_: CloseEvent| {
+            if let Some(closed) = closed.take() {
+                let _ = closed.send(());
+            }
+        });
+        ws.set_onclose(Some(on_close.as_ref().unchecked_ref()));
+        let _ = ws.close();
+        crate::rt::spawn(async move {
+            if ws.ready_state() != WebSocket::CLOSED {
+                let _ = done.await;
+            }
+            ws.set_onclose(None);
+            drop(on_close);
+            drop(shutdown);
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::FutureExt;
+    use wasm_bindgen::prelude::wasm_bindgen;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    // A controlled browser socket. Closing remains pending until the test
+    // delivers the real terminal event, independently for each socket.
+    #[wasm_bindgen(inline_js = "
+        let original, sockets;
+        export function installSockets() {
+            original = globalThis.WebSocket; sockets = [];
+            globalThis.WebSocket = class {
+                static CLOSED = 3;
+                constructor() { this.readyState = 0; sockets.push(this); }
+                close() { if (this.readyState !== 3) this.readyState = 2; }
+                send() { throw new Error('no send expected'); }
+            };
+        }
+        export function openLast() { const s = sockets.at(-1); s.readyState = 1; s.onopen?.({}); }
+        export function closeSocket(index) { const s = sockets[index]; s.readyState = 3; s.onclose?.({code:1000}); }
+        export function restoreSockets() { globalThis.WebSocket = original; }
+    ")]
+    extern "C" {
+        fn installSockets();
+        fn openLast();
+        fn closeSocket(index: u32);
+        fn restoreSockets();
+    }
+
+    #[wasm_bindgen_test]
+    async fn cancelled_open_and_replaced_sockets_stay_in_the_shutdown_barrier() {
+        installSockets();
+        let shutdown = super::super::SocketShutdown::default();
+        let spec = RelaySpec::plain("wss://relay.example/link");
+        // Cancel an open while CONNECTING. No driver owns the socket now,
+        // but its asynchronous close must still hold the barrier.
+        assert!(RelaySocket::open(&spec, &shutdown).now_or_never().is_none());
+        assert!(shutdown.wait().now_or_never().is_none());
+        closeSocket(0);
+        shutdown.wait().await;
+
+        // A failed/replaced socket can remain CLOSING while its successor
+        // connects and then closes. Waiting only for the latest is unsafe.
+        let mut first = Box::pin(RelaySocket::open(&spec, &shutdown));
+        assert!(first.as_mut().now_or_never().is_none());
+        openLast();
+        drop(first.await.unwrap());
+        let mut second = Box::pin(RelaySocket::open(&spec, &shutdown));
+        assert!(second.as_mut().now_or_never().is_none());
+        openLast();
+        drop(second.await.unwrap());
+        closeSocket(2);
+        crate::rt::sleep(std::time::Duration::from_millis(1)).await;
+        assert!(shutdown.wait().now_or_never().is_none());
+        closeSocket(1);
+        shutdown.wait().await;
+        restoreSockets();
     }
 }

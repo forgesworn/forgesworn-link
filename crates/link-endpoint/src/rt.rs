@@ -98,7 +98,9 @@ mod native {
 #[cfg(wasm_browser)]
 mod web {
     use super::*;
-    use std::future::Future;
+    use gloo_timers::future::TimeoutFuture;
+    use send_wrapper::SendWrapper;
+    use std::future::{Future, poll_fn};
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
@@ -113,18 +115,17 @@ mod web {
 
     /// The longest single timer this module sets.  A browser fires a
     /// `setTimeout` above 2^31 - 1 ms (about 24.8 days) at once, and
-    /// wasmtimer would then re-arm it at once and spin; its clock arithmetic
-    /// also panics near the top of the `Duration` range.  A longer wait is a
+    /// re-arming it would then spin. A longer wait is a
     /// chain of these, so `Duration::MAX` waits for ever, as in tokio.
     const MAX_TIMER: Duration = Duration::from_secs(20 * 24 * 60 * 60);
 
     pub async fn sleep(duration: Duration) {
         let mut left = duration;
         while left > MAX_TIMER {
-            wasmtimer::tokio::sleep(MAX_TIMER).await;
+            delay(MAX_TIMER).await;
             left -= MAX_TIMER;
         }
-        wasmtimer::tokio::sleep(left).await;
+        delay(left).await;
     }
 
     /// Polls `future` before the deadline each time, as tokio's does.
@@ -138,20 +139,25 @@ mod web {
 
     /// A periodic tick whose first tick completes at once.  A tick missed
     /// because the page was busy is delayed rather than made up in a burst.
-    pub struct Interval(wasmtimer::tokio::Interval);
+    pub struct Interval {
+        period: Duration,
+        timer: WebTimer,
+    }
 
-    /// A period above `MAX_TIMER` is cut to it; the crate's periods are all
-    /// a minute or less.
     pub fn interval(period: Duration) -> Interval {
-        let mut inner = wasmtimer::tokio::interval(period.min(MAX_TIMER));
-        inner.set_missed_tick_behavior(wasmtimer::tokio::MissedTickBehavior::Delay);
-        Interval(inner)
+        assert!(!period.is_zero(), "an interval period must be nonzero");
+        Interval {
+            period: period.min(MAX_TIMER),
+            timer: WebTimer(delay(Duration::ZERO)),
+        }
     }
 
     impl Interval {
-        /// Cancel safe, so it may sit in a `select!` arm.
+        /// The timer belongs to the interval, so cancelling a tick does not
+        /// postpone it. A completed tick starts the next period from now.
         pub async fn tick(&mut self) {
-            self.0.tick().await;
+            poll_fn(|cx| Pin::new(&mut self.timer.0).poll(cx)).await;
+            self.timer.0 = delay(self.period);
         }
     }
 
@@ -169,9 +175,9 @@ mod web {
 
     impl quinn::Runtime for WebRuntime {
         fn new_timer(&self, deadline: Instant) -> Pin<Box<dyn quinn::AsyncTimer>> {
-            Box::pin(WebTimer(wasmtimer::tokio::sleep_until(timer_instant(
-                deadline,
-            ))))
+            Box::pin(WebTimer(delay(
+                deadline.saturating_duration_since(Instant::now()),
+            )))
         }
 
         fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) {
@@ -179,22 +185,22 @@ mod web {
         }
     }
 
-    /// quinn's clock (`web_time`) and the timer's clock (`wasmtimer`) both
-    /// read `performance.now()` but are distinct types, so a deadline is
-    /// carried across as the time remaining until it, at most `MAX_TIMER`.
-    /// A clamped timer fires early, which quinn tolerates: on every wake it
-    /// handles only the timeouts that have actually passed and re-arms.
-    fn timer_instant(deadline: Instant) -> wasmtimer::std::Instant {
-        let left = deadline.saturating_duration_since(Instant::now());
-        wasmtimer::std::Instant::now() + left.min(MAX_TIMER)
+    /// One cancellable browser timeout per deadline. Reset drops the old
+    /// callback instead of leaving competing callbacks on a shared timer
+    /// queue. Quinn requires Send; SendWrapper enforces that this browser
+    /// timer is polled and dropped on the event-loop thread that created it.
+    fn delay(duration: Duration) -> SendWrapper<TimeoutFuture> {
+        // Round up so sub-millisecond deadlines do not repeatedly fire early.
+        let millis = duration.min(MAX_TIMER).as_nanos().div_ceil(1_000_000) as u32;
+        SendWrapper::new(TimeoutFuture::new(millis))
     }
 
     #[derive(Debug)]
-    struct WebTimer(wasmtimer::tokio::Sleep);
+    struct WebTimer(SendWrapper<TimeoutFuture>);
 
     impl quinn::AsyncTimer for WebTimer {
         fn reset(self: Pin<&mut Self>, deadline: Instant) {
-            Pin::new(&mut self.get_mut().0).reset(timer_instant(deadline));
+            self.get_mut().0 = delay(deadline.saturating_duration_since(Instant::now()));
         }
 
         fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<()> {

@@ -33,3 +33,6 @@
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 mod web;
+
+#[cfg(all(test, target_family = "wasm", target_os = "unknown"))]
+mod timer_tests;

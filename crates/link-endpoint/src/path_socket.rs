@@ -1026,7 +1026,7 @@ impl AsyncUdpSocket for PathSocket {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(wasm_browser)))]
 mod candidates {
     use super::*;
 
@@ -1070,7 +1070,7 @@ mod candidates {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(wasm_browser)))]
 mod probes {
     use super::*;
     use crate::netmon::NetMonitor;

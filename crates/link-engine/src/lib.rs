@@ -590,6 +590,7 @@ struct Inner {
 pub struct Engine {
     endpoint: Arc<Endpoint>,
     stop: watch::Sender<bool>,
+    shutdown: Mutex<()>,
     inner: Mutex<Inner>,
 }
 
@@ -636,6 +637,7 @@ impl Engine {
         Ok(Engine {
             endpoint: Arc::new(endpoint),
             stop: watch::Sender::new(false),
+            shutdown: Mutex::new(()),
             inner: Mutex::new(Inner {
                 routes,
                 stopped: false,
@@ -1071,9 +1073,10 @@ impl Engine {
     /// endpoint closes the rest.  Installed route credentials stay in memory
     /// until the engine is dropped; [`Engine::wipe`] removes them at once.
     pub async fn stop(&self) {
-        if self.stop.send_replace(true) {
-            return;
-        }
+        self.stop.send_replace(true);
+        // Every caller waits for shutdown. If one close future is cancelled,
+        // the next caller resumes endpoint closure rather than assuming done.
+        let _closing = self.shutdown.lock().await;
         let sessions: Vec<_> = {
             let mut inner = self.inner.lock().await;
             inner.stopped = true;
@@ -1825,6 +1828,37 @@ mod tests {
         assert!(!matches!(second.path().status, PathStatus::Failed(_)));
         let _ = second_server.await.unwrap();
         engine.stop().await;
+    }
+
+    #[tokio::test]
+    async fn repeated_and_cancelled_stop_wait_for_shutdown() {
+        let engine = Engine::start(EngineConfig {
+            transport_seed: vec![0x41; 32],
+            relay_urls: Vec::new(),
+            allow_direct: false,
+            routes: Vec::new(),
+        })
+        .await
+        .unwrap();
+        // Hold shutdown before sessions can be collected. The first stop is
+        // cancelled after setting the stop flag; a second must not mistake
+        // that flag for completed transport teardown.
+        let held = engine.inner.lock().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), engine.stop())
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), engine.stop())
+                .await
+                .is_err()
+        );
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(2), engine.stop())
+            .await
+            .unwrap();
+        let ((), ()) = tokio::join!(engine.stop(), engine.stop());
     }
 
     /// `stop` takes effect while another call holds the engine through a

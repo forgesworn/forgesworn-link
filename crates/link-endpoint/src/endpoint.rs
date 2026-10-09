@@ -772,6 +772,7 @@ impl Endpoint {
         self.quic.close(VarInt::from_u32(0), b"closing");
         self.paths.relay().close();
         self.quic.wait_idle().await;
+        self.paths.relay().closed().await;
     }
 }
 
@@ -862,7 +863,7 @@ fn transport_config_with(max_bidi_streams: u32, idle_timeout: Duration) -> quinn
     config
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(wasm_browser)))]
 mod tests {
     use super::*;
 

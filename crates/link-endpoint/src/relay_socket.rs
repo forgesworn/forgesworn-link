@@ -47,3 +47,37 @@ pub enum WsMessage {
     /// Text, a close or a raw frame: nothing a relay sends on a live session.
     Other,
 }
+
+/// Tracks browser sockets whose close handshake outlives the relay future.
+/// Native TCP streams close synchronously when their driver is dropped.
+#[derive(Clone, Debug)]
+pub struct SocketShutdown(tokio::sync::watch::Sender<usize>);
+
+impl Default for SocketShutdown {
+    fn default() -> Self {
+        Self(tokio::sync::watch::Sender::new(0))
+    }
+}
+
+impl SocketShutdown {
+    #[cfg(wasm_browser)]
+    fn opened(&self) -> SocketGuard {
+        self.0.send_modify(|count| *count += 1);
+        SocketGuard(self.clone())
+    }
+
+    pub async fn wait(&self) {
+        let mut pending = self.0.subscribe();
+        let _ = pending.wait_for(|count| *count == 0).await;
+    }
+}
+
+#[cfg(wasm_browser)]
+struct SocketGuard(SocketShutdown);
+
+#[cfg(wasm_browser)]
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        self.0.0.send_modify(|count| *count -= 1);
+    }
+}

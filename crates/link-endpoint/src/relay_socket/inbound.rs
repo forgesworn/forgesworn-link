@@ -62,7 +62,7 @@ fn is_datagram(message: &WsMessage) -> bool {
         if matches!(bytes.first(), Some(&FRAME_RECV) | Some(&FRAME_RECV_TAG)))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(wasm_browser)))]
 mod tests {
     use super::*;
     use link_core::wire::{FRAME_CLOSE, FRAME_PONG};
