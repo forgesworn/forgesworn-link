@@ -1,5 +1,5 @@
-//! These exercise the actual WASM runtime, with the test runner's independent
-//! JavaScript watchdog bounding a stalled timer.
+//! These exercise the actual WASM runtime, checking elapsed deadlines.
+//! CI also applies a wall-clock bound to the test process.
 use futures_util::FutureExt;
 use link_endpoint::rt;
 use std::future::poll_fn;

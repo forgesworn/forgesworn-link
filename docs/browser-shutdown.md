@@ -39,7 +39,7 @@ WASI_SDK=/path/to/wasi-sdk-34.0 scripts/test-link-web.sh
 WASI_SDK=/path/to/wasi-sdk-34.0 cargo test -p link-web --test browser_e2e
 ```
 
-The WASM tests run with an independent JavaScript watchdog and cover reset
+The WASM tests have a CI wall-clock bound and cover reset
 churn, concurrent deadlines, interval cancellation, long waits, cancelled socket
 opens and a replacement socket closing before its predecessor. The native
 engine regression cancels shutdown and retries it before the first barrier can
@@ -51,3 +51,22 @@ The owner-authorised independent reviewer found no security or lifetime blocker
 in the implementation. That source review is separate from automated and live
 lab results; it is not a human cryptographic audit or production MLS approval.
 The result does not establish physical-device behaviour or MLS room acceptance.
+
+
+## Recorded local results, 9 October 2026
+
+- Formatting, workspace clippy and the native workspace suite passed (138
+  passing results; one explicitly ignored public-relay test).
+- Three WASM regressions passed. The reset-churn regression, copied to the
+  unmodified runtime at `8f7bebd`, failed its two-second elapsed assertion:
+  it completed only after the old 60-second deadline. The repaired test
+  suite completed in under a second.
+- The Node WebPKI pairing/request/socket/restart test passed, including shared
+  stop-Promise identity and the five-second shutdown bound.
+- Six extended real-Bothy journeys passed across Chromium, Firefox and WebKit
+  in 2.9 minutes; all observed sockets were closed at each returned operation.
+- The owner-authorised independent reviewer inspected `2fa7f23`, found no
+  blocker, and separately passed formatting and diff checks. Heavy test results
+  above were run by the implementation agent, not independently repeated.
+
+These are disposable loopback lab results, not physical-device acceptance.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WASM timer and shutdown regressions; Node supplies the independent watchdog.
+# WASM timer and shutdown regressions, run in Node.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 scripts/build-link-web.sh --check
