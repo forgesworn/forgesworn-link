@@ -530,7 +530,7 @@ async fn a_browser_engine_pairs_requests_and_echoes_over_a_real_relay() {
     );
     assert_eq!(
         refused["socketPath"],
-        "socket: Link WebSocket URL path must be /events"
+        "socket: Link WebSocket URL path must be /events or /drops"
     );
     assert_eq!(
         refused["socketPeer"],
