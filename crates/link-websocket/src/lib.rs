@@ -24,7 +24,7 @@ pub enum SocketError {
     Scheme,
     #[error("Link WebSocket URL must not contain credentials, a port, query, or fragment")]
     Authority,
-    #[error("Link WebSocket URL path must be /events")]
+    #[error("Link WebSocket URL path must be /events or /drops")]
     Path,
     #[error("Link WebSocket URL host must be a canonical Link node id")]
     Host,
@@ -104,7 +104,7 @@ pub fn validate_virtual_url(url: &Url, peer: NodeId) -> Result<(), SocketError> 
     {
         return Err(SocketError::Authority);
     }
-    if url.path() != "/events" {
+    if !matches!(url.path(), "/events" | "/drops") {
         return Err(SocketError::Path);
     }
     let host = url.host_str().ok_or(SocketError::Host)?;
@@ -239,8 +239,9 @@ mod tests {
     }
 
     #[test]
-    fn accepts_only_the_peer_events_url() {
+    fn accepts_the_peer_event_and_drop_urls() {
         assert_eq!(validate_virtual_url(&url("/events"), node()), Ok(()));
+        assert_eq!(validate_virtual_url(&url("/drops"), node()), Ok(()));
     }
 
     #[test]
@@ -266,9 +267,36 @@ mod tests {
     #[test]
     fn rejects_a_different_peer() {
         let other = NodeId([8; 32]);
-        assert_eq!(
-            validate_virtual_url(&url("/events"), other),
-            Err(SocketError::PeerMismatch)
-        );
+        for path in ["/events", "/drops"] {
+            assert_eq!(
+                validate_virtual_url(&url(path), other),
+                Err(SocketError::PeerMismatch)
+            );
+        }
+    }
+
+    #[test]
+    fn drop_urls_retain_exact_path_and_authority_bounds() {
+        for suffix in [
+            "/drops/",
+            "/drops/other",
+            "/%64rops",
+            "/drops?q=1",
+            "/drops#fragment",
+        ] {
+            assert!(validate_virtual_url(&url(suffix), node()).is_err());
+        }
+        for authority in [
+            format!("user@{}", node().to_base32()),
+            format!("{}:1234", node().to_base32()),
+        ] {
+            assert_eq!(
+                validate_virtual_url(
+                    &Url::parse(&format!("ws://{authority}/drops")).unwrap(),
+                    node()
+                ),
+                Err(SocketError::Authority)
+            );
+        }
     }
 }

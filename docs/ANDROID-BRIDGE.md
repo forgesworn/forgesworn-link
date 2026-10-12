@@ -7,10 +7,17 @@ contract remains `vennel/docs/gate/2026-09-10-g3-g4-integration-contracts.md`.
 
 `link-websocket` owns an HTTP/1.1 WebSocket upgrade over a
 `link_endpoint::Stream`. Its public opener takes a `Session` and a virtual URL.
-It accepts only canonical `ws://<52-character node id>/events`, requires that
-host to equal `Session::peer()`, and passes the already-open Link stream to
+It accepts only canonical `ws://<52-character node id>/events` and
+`ws://<52-character node id>/drops`, requires that host to equal `Session::peer()`, and passes the already-open Link stream to
 `tokio_tungstenite::client_async`; it never resolves the virtual host through
-DNS.
+DNS. `/events` carries circle events; `/drops` carries the node’s quiet-message
+wrap tier. The product still owns consent and subscription routing; allowing
+the second path does not merge the two relay protocols or grant room access.
+
+Bounded HTTP timeout errors identify connection, HTTP stream setup, response
+headers or response body using static labels. They expose no peer, route,
+URL, authentication or payload. All HTTP phases share the original request
+time budget.
 
 The socket driver owns the WebSocket and exposes a synchronous, cloneable send
 handle plus one asynchronous inbound receiver. The outbound command channel is

@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -658,7 +659,7 @@ impl Engine {
         }
     }
 
-    /// Open the route's event WebSocket.  The virtual URL must name the
+    /// Open the route's event or drop WebSocket. The virtual URL must name the
     /// route's pinned peer, as `link_websocket::validate_virtual_url` rules.
     pub async fn open_socket(
         &self,
@@ -748,7 +749,9 @@ impl Engine {
                     self.unless_stopped(async {
                         rt::timeout(timeout, self.endpoint.connect(&card))
                             .await
-                            .map_err(|_| EngineError::Transport("request timed out".into()))?
+                            .map_err(|_| {
+                                EngineError::Transport("request timed out during connection".into())
+                            })?
                             .map_err(|error| EngineError::Transport(error.to_string()))
                     })
                     .await?,
@@ -765,7 +768,11 @@ impl Engine {
         let remaining = timeout
             .checked_sub(started.elapsed())
             .filter(|duration| !duration.is_zero())
-            .ok_or_else(|| EngineError::Transport("request timed out".into()))?;
+            .ok_or_else(|| EngineError::Transport("request timed out during connection".into()))?;
+        // Static phase labels diagnose a stalled request without exposing its
+        // peer, route, URL, authentication or body. The original total timeout
+        // still covers all phases; no phase gets a new request budget.
+        let phase = AtomicU8::new(0);
         let (status, body, witness_refused) = rt::timeout(remaining, async {
             let mut sender = http_sender(&session).await?;
             let mut outgoing = Request::builder()
@@ -789,16 +796,27 @@ impl Engine {
                 .header(hyper::header::CONNECTION, "close")
                 .body(Full::new(Bytes::from(request.body)))
                 .map_err(|error| EngineError::Route(error.to_string()))?;
+            phase.store(1, Ordering::Relaxed);
             let response = sender
                 .send_request(outgoing)
                 .await
                 .map_err(|error| EngineError::Transport(error.to_string()))?;
             let witness_refused = is_witness_refusal(&route, response.status(), response.headers());
+            phase.store(2, Ordering::Relaxed);
             let (status, body) = decode_http_response(response, &route).await?;
             Ok::<_, EngineError>((status, body, witness_refused))
         })
         .await
-        .map_err(|_| EngineError::Transport("request timed out".into()))??;
+        .map_err(|_| {
+            EngineError::Transport(
+                match phase.load(Ordering::Relaxed) {
+                    0 => "request timed out during HTTP stream setup",
+                    1 => "request timed out waiting for response headers",
+                    _ => "request timed out reading response body",
+                }
+                .into(),
+            )
+        })??;
         Ok(JsonResponse {
             status,
             body,
@@ -1745,6 +1763,15 @@ mod tests {
     /// A peer restart must not poison every subsequent WebSocket open.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn websocket_replaces_closed_cached_session() {
+        websocket_replaces_closed_cached_session_at("/events").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn quiet_drop_websocket_replaces_closed_cached_session() {
+        websocket_replaces_closed_cached_session_at("/drops").await;
+    }
+
+    async fn websocket_replaces_closed_cached_session_at(path: &str) {
         use link_endpoint::AcceptedSession;
         let _ = rustls::crypto::ring::default_provider().install_default();
         let relay = link_relay::start(link_relay::RelayConfig {
@@ -1792,7 +1819,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let url = format!("ws://{}/events", server.node_id().to_base32());
+        let url = format!("ws://{}{path}", server.node_id().to_base32());
         let serve = |server: Arc<Endpoint>| {
             tokio::spawn(async move {
                 let AcceptedSession::Pinned(session) = server.accept_any().await.unwrap() else {

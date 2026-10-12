@@ -721,7 +721,14 @@ mod tests {
 
                 let mut stalled = session.accept_stream().await.expect("stalled request");
                 let _ = read_http_request(&mut stalled).await;
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    drop(stalled);
+                });
+                let mut body_stalled = session.accept_stream().await.expect("stalled body request");
+                let _ = read_http_request(&mut body_stalled).await;
+                body_stalled.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n").await.unwrap();
+                tokio::time::sleep(Duration::from_secs(2)).await;
             }
         });
 
@@ -878,7 +885,33 @@ mod tests {
         .join()
         .unwrap()
         .expect_err("stalled response is bounded");
-        assert_eq!(timeout.to_string(), "transport: request timed out");
+        assert_eq!(
+            timeout.to_string(),
+            "transport: request timed out waiting for response headers"
+        );
+
+        let body_timeout = std::thread::spawn({
+            let engine = engine.clone();
+            move || {
+                engine.request_json_with_timeout(
+                    LinkHttpRequest {
+                        route_id: "circle-main".into(),
+                        method: "POST".into(),
+                        path: "/cadence/v1/status".into(),
+                        authorization: "Nostr YQ==".into(),
+                        body: br#"{"v":1,"request":"body-stalled"}"#.to_vec(),
+                    },
+                    Duration::from_millis(500),
+                )
+            }
+        })
+        .join()
+        .unwrap()
+        .expect_err("stalled body remains bounded");
+        assert_eq!(
+            body_timeout.to_string(),
+            "transport: request timed out reading response body"
+        );
 
         serving.await.unwrap();
         tokio::task::spawn_blocking(move || {
