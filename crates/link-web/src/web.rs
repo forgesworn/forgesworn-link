@@ -10,8 +10,8 @@ use std::sync::Arc;
 use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
 use link_endpoint::Session;
 use link_engine::{
-    Engine, EngineConfig, EngineError, HTTP_REQUEST_TIMEOUT, JsonRequest, PairingBundle, PathInfo,
-    Route,
+    Engine, EngineConfig, EngineError, FileRequestPermit, HTTP_REQUEST_TIMEOUT, JsonRequest,
+    PairingBundle, PathInfo, Route,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{future_to_promise, spawn_local};
@@ -193,6 +193,90 @@ fn callback(listener: &JsValue, name: &str) -> Result<Option<Function>, JsError>
         .map_err(|_| invalid(&format!("listener {name} must be a function")))
 }
 
+// Read internal typed-array extent through captured intrinsic accessors. Caller
+// properties (including length/buffer/byteOffset getters) never drive Rust
+// allocation. The fresh view is not exposed; its length cannot change between
+// js-sys's repeated reads. Shared/resizable backing stores are refused.
+// https://tc39.es/ecma262/#sec-get-%typedarray%.prototype.length
+#[wasm_bindgen(inline_js = r#"
+const NativeUint8Array = Uint8Array;
+const apply = Reflect.apply;
+const defineProperty = Object.defineProperty;
+const typed = Object.getPrototypeOf(NativeUint8Array.prototype);
+const getBuffer = Object.getOwnPropertyDescriptor(typed, 'buffer').get;
+const getOffset = Object.getOwnPropertyDescriptor(typed, 'byteOffset').get;
+const getLength = Object.getOwnPropertyDescriptor(typed, 'length').get;
+const getName = Object.getOwnPropertyDescriptor(typed, Symbol.toStringTag).get;
+const setBytes = typed.set;
+const getBufferLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength').get;
+const getResizable = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'resizable')?.get;
+export function stableRequestBody(value) {
+    if (apply(getName, value, []) !== 'Uint8Array') {
+        throw new TypeError('body must be a Uint8Array');
+    }
+    const buffer = apply(getBuffer, value, []);
+    // The ArrayBuffer intrinsic rejects SharedArrayBuffer, including growable
+    // storage. The constructor below rejects detached buffers.
+    apply(getBufferLength, buffer, []);
+    if (getResizable && apply(getResizable, buffer, [])) {
+        throw new TypeError('body must use a fixed ArrayBuffer');
+    }
+    const offset = apply(getOffset, value, []);
+    const length = apply(getLength, value, []);
+    const view = new NativeUint8Array(buffer, offset, length);
+    defineProperty(view, 'length', { value: length });
+    return view;
+}
+export function copyRequestBody(view) {
+    const length = apply(getLength, view, []);
+    const snapshot = new NativeUint8Array(length);
+    apply(setBytes, snapshot, [view]);
+    defineProperty(snapshot, 'length', { value: length });
+    return snapshot;
+}
+"#)]
+extern "C" {
+    #[wasm_bindgen(catch, js_name = stableRequestBody)]
+    fn stable_request_body(value: &JsValue) -> Result<Uint8Array, JsValue>;
+    #[wasm_bindgen(catch, js_name = copyRequestBody)]
+    fn copy_request_body(view: &Uint8Array) -> Result<Uint8Array, JsValue>;
+}
+
+/// Snapshot metadata, validate the JS byte count and reserve before copying.
+/// Later getters cannot redirect the request whose body we accepted.
+fn capture_request(
+    engine: &Engine,
+    request: &JsValue,
+) -> Result<(JsonRequest, Option<FileRequestPermit>), JsError> {
+    let mut captured = JsonRequest {
+        route_id: string(request, "routeId")?,
+        method: string(request, "method")?,
+        path: string(request, "path")?,
+        authorization: string(request, "authorization")?,
+        body: Vec::new(),
+    };
+    let body = stable_request_body(&field(request, "body")?)
+        .map_err(|_| invalid("body must be a Uint8Array over a fixed, non-shared buffer"))?;
+    let (_, route) = link_engine::validate_http_request_length(&captured, body.length() as usize)
+        .map_err(|error| JsError::new(&error.to_string()))?;
+    let permit = if route.is_file() {
+        Some(
+            engine
+                .reserve_file_request()
+                .map_err(|error| JsError::new(&error.to_string()))?,
+        )
+    } else {
+        None
+    };
+    // A caller may supply a view into this module's memory. Rust allocation
+    // could grow that memory and detach its buffer; take a JS-owned snapshot
+    // after validation/reservation and before allocating the Rust copy.
+    let snapshot = copy_request_body(&body)
+        .map_err(|_| invalid("body could not be copied from its fixed buffer"))?;
+    captured.body = snapshot.to_vec();
+    Ok((captured, permit))
+}
+
 /// The browser Link engine.
 #[wasm_bindgen(js_name = LinkEngine)]
 pub struct WebEngine {
@@ -326,28 +410,24 @@ impl WebEngine {
         })
     }
 
-    /// One bounded, allowlisted request (cadence, VMLS or witness) over the
+    /// One bounded, allowlisted request (cadence, VMLS, witness or file) over the
     /// route's pinned session.
     #[wasm_bindgen(unchecked_return_type = "Promise<LinkHttpResponse>")]
     pub fn request(
         &self,
         #[wasm_bindgen(unchecked_param_type = "LinkHttpRequest")] request: JsValue,
     ) -> Promise {
-        let request = match (|| {
-            Ok::<_, JsError>(JsonRequest {
-                route_id: string(&request, "routeId")?,
-                method: string(&request, "method")?,
-                path: string(&request, "path")?,
-                authorization: string(&request, "authorization")?,
-                body: bytes(&request, "body")?,
-            })
-        })() {
+        let engine = match self.engine() {
+            Ok(engine) => engine,
+            Err(error) => return Promise::reject(&error),
+        };
+        let (request, permit) = match capture_request(&engine, &request) {
             Ok(request) => request,
             Err(error) => return Promise::reject(&error.into()),
         };
         self.run(|engine| async move {
             let response = engine
-                .request_json(request, HTTP_REQUEST_TIMEOUT)
+                .request_json_reserved(request, HTTP_REQUEST_TIMEOUT, permit)
                 .await
                 .map_err(engine_error)?;
             let object = Object::new();
@@ -460,5 +540,168 @@ impl WebSocketHandle {
     #[wasm_bindgen(unchecked_return_type = "LinkPath")]
     pub fn path(&self) -> JsValue {
         path_out(link_engine::path(&self.session))
+    }
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+    use wasm_bindgen_futures::JsFuture;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    async fn engine() -> WebEngine {
+        WebEngine {
+            engine: RefCell::new(Some(Rc::new(
+                Engine::start(EngineConfig {
+                    transport_seed: vec![7; 32],
+                    relay_urls: Vec::new(),
+                    allow_direct: false,
+                    routes: Vec::new(),
+                })
+                .await
+                .unwrap(),
+            ))),
+            shutdown: RefCell::new(None),
+        }
+    }
+
+    fn upload(body: &Uint8Array) -> Object {
+        let request = Object::new();
+        for (key, value) in [
+            ("routeId", "selected"),
+            ("method", "PUT"),
+            ("path", "/upload"),
+            ("authorization", "Nostr YQ=="),
+        ] {
+            set(&request, key, &JsValue::from_str(value));
+        }
+        set(&request, "body", body);
+        request
+    }
+
+    fn message(error: JsValue) -> String {
+        Reflect::get(&error, &"message".into())
+            .unwrap()
+            .as_string()
+            .unwrap()
+    }
+
+    #[wasm_bindgen_test]
+    async fn file_capture_keeps_metadata_and_owned_bytes_after_js_changes() {
+        let web = engine().await;
+        let engine = web.engine().unwrap();
+        let body = Uint8Array::from(b"hello".as_slice());
+        let request = upload(&body);
+        // A getter is allowed to mutate the original object. Already captured
+        // metadata must retain the authorised operation and destination.
+        let descriptor = Object::new();
+        let getter = Function::new_no_args(
+            "this.path = '/elsewhere'; this.routeId = 'other'; return this.savedBody;",
+        );
+        set(&request, "savedBody", &body);
+        set(&descriptor, "get", &getter);
+        Object::define_property(&request, &"body".into(), &descriptor);
+        let (captured, permit) = capture_request(&engine, request.as_ref()).unwrap();
+        body.fill(0, 0, body.length());
+        assert_eq!(captured.path, "/upload");
+        assert_eq!(captured.route_id, "selected");
+        assert_eq!(captured.body, b"hello");
+        assert!(engine.reserve_file_request().is_err());
+        drop(permit);
+        assert!(engine.reserve_file_request().is_ok());
+        JsFuture::from(web.stop()).await.unwrap();
+    }
+
+    #[wasm_bindgen_test]
+    async fn file_capture_ignores_overridden_typed_array_extent() {
+        let web = engine().await;
+        let engine = web.engine().unwrap();
+        let backing = Uint8Array::from(b"xhello!".as_slice());
+        let body = backing.subarray(1, 6);
+        let descriptor = Object::new();
+        set(&descriptor, "get", &Function::new_no_args("return 0;"));
+        Object::define_property(&body, &"length".into(), &descriptor);
+        let forbidden = Object::new();
+        set(
+            &forbidden,
+            "get",
+            &Function::new_no_args("throw new Error('caller extent getter was read');"),
+        );
+        for key in ["buffer", "byteOffset", "byteLength"] {
+            Object::define_property(&body, &key.into(), &forbidden);
+        }
+        // The old boundary rejects this falsely empty body before to_vec,
+        // giving a safe regression without executing the unsafe copy path.
+        let (captured, permit) = capture_request(&engine, upload(&body).as_ref()).unwrap();
+        assert_eq!(captured.body, b"hello");
+        drop(permit);
+        JsFuture::from(web.stop()).await.unwrap();
+    }
+
+    #[wasm_bindgen_test]
+    async fn owned_body_snapshot_survives_wasm_memory_growth() {
+        let memory = wasm_bindgen::memory();
+        let buffer = Reflect::get(&memory, &"buffer".into()).unwrap();
+        let source = Uint8Array::new_with_byte_offset_and_length(&buffer, 0, 8);
+        let view = stable_request_body(source.as_ref()).unwrap();
+        let snapshot = copy_request_body(&view).unwrap();
+        let expected = snapshot.to_vec();
+        let grow = Reflect::get(&memory, &"grow".into())
+            .unwrap()
+            .dyn_into::<Function>()
+            .unwrap();
+        grow.call1(&memory, &1.into()).unwrap();
+        assert_eq!(source.byte_length(), 0, "original wasm backing detached");
+        assert_eq!(snapshot.to_vec(), expected);
+    }
+
+    #[wasm_bindgen_test]
+    async fn file_capture_refuses_shared_resizable_and_detached_storage() {
+        let web = engine().await;
+        let engine = web.engine().unwrap();
+        for expression in [
+            "return new Uint8Array(new SharedArrayBuffer(5));",
+            "return new Uint8Array(new ArrayBuffer(5, {maxByteLength: 20}));",
+            "const b = new ArrayBuffer(5); const v = new Uint8Array(b); structuredClone(b, {transfer:[b]}); return v;",
+        ] {
+            let body = Function::new_no_args(expression)
+                .call0(&JsValue::UNDEFINED)
+                .unwrap();
+            let request = upload(&Uint8Array::new_with_length(1));
+            set(&request, "body", &body);
+            assert!(capture_request(&engine, request.as_ref()).is_err());
+            assert!(engine.reserve_file_request().is_ok());
+        }
+        JsFuture::from(web.stop()).await.unwrap();
+    }
+
+    #[wasm_bindgen_test]
+    async fn file_request_refuses_oversize_and_busy_before_any_route_dial() {
+        let web = engine().await;
+        let engine = web.engine().unwrap();
+        let body = Uint8Array::new_with_length((link_engine::MAX_BLOB_BYTES + 1) as u32);
+        let rejected = JsFuture::from(web.request(upload(&body).into()))
+            .await
+            .unwrap_err();
+        assert!(message(rejected).contains("body is too large"));
+        let permit = engine.reserve_file_request().unwrap();
+        let small = Uint8Array::from(b"hello".as_slice());
+        let rejected = JsFuture::from(web.request(upload(&small).into()))
+            .await
+            .unwrap_err();
+        assert!(message(rejected).contains("another file request is still active"));
+        drop(permit);
+        // With capacity available the same request reaches route lookup, not
+        // any external dial: this fixture deliberately has no installed route.
+        let rejected = JsFuture::from(web.request(upload(&small).into()))
+            .await
+            .unwrap_err();
+        assert!(message(rejected).contains("route is not installed"));
+        assert!(engine.reserve_file_request().is_ok());
+        JsFuture::from(web.stop()).await.unwrap();
+        let rejected = JsFuture::from(web.request(upload(&small).into()))
+            .await
+            .unwrap_err();
+        assert!(message(rejected).contains("stopped"));
     }
 }

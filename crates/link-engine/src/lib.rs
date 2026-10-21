@@ -31,6 +31,9 @@ use tokio::sync::{Mutex, mpsc, watch};
 use url::Url;
 use zeroize::{Zeroize as _, Zeroizing};
 
+mod blob_http;
+pub use blob_http::{BlobResponse, FileRequestPermit, MAX_BLOB_BYTES};
+
 /// What the host starts an engine with.
 pub struct EngineConfig {
     pub transport_seed: Vec<u8>,
@@ -314,6 +317,8 @@ pub enum ResponseBody {
     /// A witness receipt: exactly [`WITNESS_RECEIPT_BYTES`] of
     /// `application/octet-stream`, or a refusal status with no body.
     WitnessReceipt,
+    /// Existing Blossom file operations, with distinct status and byte bounds.
+    Blob(BlobResponse),
 }
 
 /// One allowlisted route's bounds.
@@ -326,6 +331,12 @@ pub struct HttpRoute {
     pub nostr_authorization: bool,
     pub response: ResponseBody,
     pub max_response_bytes: usize,
+}
+
+impl HttpRoute {
+    pub fn is_file(&self) -> bool {
+        matches!(self.response, ResponseBody::Blob(_))
+    }
 }
 
 /// Bothy's `MAX_VMLS_JSON_BYTES`.
@@ -392,6 +403,9 @@ fn canonical_u32(value: &str) -> bool {
 /// The allowlist: cadence as before, Bothy's exact `/vmls/v1/` routes and
 /// the two witness routes. Anything else is refused before a dial.
 fn allowlisted(method: &Method, path: &str) -> Option<HttpRoute> {
+    if let Some(route) = blob_http::route(method, path) {
+        return Some(route);
+    }
     if path.starts_with("/cadence/v1/") {
         return (*method == Method::POST || *method == Method::PUT).then_some(CADENCE_ROUTE);
     }
@@ -426,6 +440,15 @@ fn allowlisted(method: &Method, path: &str) -> Option<HttpRoute> {
 }
 
 pub fn validate_http_request(request: &JsonRequest) -> Result<(Method, HttpRoute), EngineError> {
+    validate_http_request_length(request, request.body.len())
+}
+
+/// Validate the captured metadata and byte count before a binding copies the
+/// caller's body. The actual owned request is checked again before any dial.
+pub fn validate_http_request_length(
+    request: &JsonRequest,
+    body_bytes: usize,
+) -> Result<(Method, HttpRoute), EngineError> {
     let method = match request.method.as_str() {
         "GET" => Method::GET,
         "POST" => Method::POST,
@@ -463,12 +486,15 @@ pub fn validate_http_request(request: &JsonRequest) -> Result<(Method, HttpRoute
         }
     } else if !authorization.is_empty() {
         return Err(EngineError::Route(
-            "witness requests carry no authorization".into(),
+            "this route carries no authorization".into(),
         ));
     }
     // An empty-body route's limit is 0.
-    if request.body.len() > route.max_body_bytes {
+    if body_bytes > route.max_body_bytes {
         return Err(EngineError::Route("request body is too large".into()));
+    }
+    if route.response == ResponseBody::Blob(BlobResponse::Upload) && body_bytes == 0 {
+        return Err(EngineError::Route("file upload body is empty".into()));
     }
     Ok((method, route))
 }
@@ -509,6 +535,9 @@ where
     if response.status().is_redirection() {
         return Err(EngineError::Route("response must not redirect".into()));
     }
+    if let ResponseBody::Blob(kind) = route.response {
+        return blob_http::decode(response, kind).await;
+    }
     let status = response.status();
     let content_type = response
         .headers()
@@ -520,6 +549,7 @@ where
     let expected = match route.response {
         ResponseBody::Json | ResponseBody::JsonOrEmptyRefusal => "application/json",
         ResponseBody::WitnessReceipt => "application/octet-stream",
+        ResponseBody::Blob(_) => unreachable!("file responses decoded separately"),
     };
     let receipt_status = matches!(
         status,
@@ -571,6 +601,95 @@ async fn http_sender(
     Ok(sender)
 }
 
+/// The driver retains the file reservation until its stream actually ends.
+/// Dropping the caller or stopping the engine closes this driver, without
+/// claiming that the remote box did not already commit an upload.
+struct FileConnection {
+    close: Option<watch::Sender<()>>,
+    done: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl FileConnection {
+    async fn finish(mut self) -> Result<(), EngineError> {
+        self.close.take();
+        self.done
+            .await
+            .map_err(|_| EngineError::Transport("file stream driver did not settle".into()))
+    }
+}
+
+async fn file_http_sender(
+    session: &Session,
+    mut stopped: watch::Receiver<bool>,
+    guard: Arc<blob_http::FileRequestGuard>,
+) -> Result<
+    (
+        hyper::client::conn::http1::SendRequest<Full<Bytes>>,
+        FileConnection,
+    ),
+    EngineError,
+> {
+    let stream = session
+        .open_stream()
+        .await
+        .map_err(|error| EngineError::Transport(error.to_string()))?;
+    let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .map_err(|error| EngineError::Transport(error.to_string()))?;
+    let (close, mut cancelled) = watch::channel(());
+    let (settled, done) = tokio::sync::oneshot::channel();
+    rt::spawn(async move {
+        tokio::select! {
+            _ = connection => {},
+            _ = cancelled.changed() => {},
+            _ = stopped.changed() => {},
+        }
+        drop(guard);
+        let _ = settled.send(());
+    });
+    Ok((
+        sender,
+        FileConnection {
+            close: Some(close),
+            done,
+        },
+    ))
+}
+
+fn outgoing_http_request(
+    request: JsonRequest,
+    method: Method,
+    route: &HttpRoute,
+    node: NodeId,
+) -> Result<Request<Full<Bytes>>, EngineError> {
+    let mut outgoing = Request::builder()
+        .method(method)
+        .uri(request.path)
+        .header(hyper::header::HOST, node.to_base32());
+    match route.body {
+        RequestBody::Json => {
+            outgoing = outgoing.header(hyper::header::CONTENT_TYPE, "application/json");
+        }
+        RequestBody::Octets => {
+            if route.response == ResponseBody::Blob(BlobResponse::Upload) {
+                use sha2::{Digest as _, Sha256};
+                outgoing = outgoing
+                    .header("x-sha-256", hex::encode(Sha256::digest(&request.body)))
+                    .header(hyper::header::CONTENT_LENGTH, request.body.len());
+            }
+            outgoing = outgoing.header(hyper::header::CONTENT_TYPE, "application/octet-stream");
+        }
+        RequestBody::Empty => {}
+    }
+    if route.nostr_authorization {
+        outgoing = outgoing.header(hyper::header::AUTHORIZATION, request.authorization);
+    }
+    outgoing
+        .header(hyper::header::CONNECTION, "close")
+        .body(Full::new(Bytes::from(request.body)))
+        .map_err(|error| EngineError::Route(error.to_string()))
+}
+
 struct RouteState {
     node: NodeId,
     serial: u64,
@@ -593,6 +712,7 @@ pub struct Engine {
     stop: watch::Sender<bool>,
     shutdown: Mutex<()>,
     inner: Mutex<Inner>,
+    file_requests: Arc<tokio::sync::Semaphore>,
 }
 
 impl Engine {
@@ -639,6 +759,7 @@ impl Engine {
             endpoint: Arc::new(endpoint),
             stop: watch::Sender::new(false),
             shutdown: Mutex::new(()),
+            file_requests: Arc::new(tokio::sync::Semaphore::new(1)),
             inner: Mutex::new(Inner {
                 routes,
                 stopped: false,
@@ -716,7 +837,7 @@ impl Engine {
         Ok((socket, incoming, session))
     }
 
-    /// Send one bounded, allowlisted request (cadence, VMLS or witness) over
+    /// Send one bounded, allowlisted request (cadence, VMLS, witness or file) over
     /// the route's pinned Link session. The application supplies neither a
     /// network URL, a `Host` nor a `Content-Type`.
     pub async fn request_json(
@@ -724,7 +845,40 @@ impl Engine {
         request: JsonRequest,
         timeout: Duration,
     ) -> Result<JsonResponse, EngineError> {
+        let (_, route) = validate_http_request(&request)?;
+        let permit = if route.is_file() {
+            Some(self.reserve_file_request()?)
+        } else {
+            None
+        };
+        self.request_json_reserved(request, timeout, permit).await
+    }
+
+    /// Reserve before copying a browser file body. The permit is private to
+    /// this engine and cannot be cloned to start multiple file requests.
+    pub fn reserve_file_request(&self) -> Result<FileRequestPermit, EngineError> {
+        if *self.stop.borrow() {
+            return Err(EngineError::Stopped);
+        }
+        FileRequestPermit::acquire(&self.file_requests)
+    }
+
+    pub async fn request_json_reserved(
+        &self,
+        request: JsonRequest,
+        timeout: Duration,
+        permit: Option<FileRequestPermit>,
+    ) -> Result<JsonResponse, EngineError> {
         let (method, route) = validate_http_request(&request)?;
+        match (&permit, route.is_file()) {
+            (Some(permit), true) if Arc::ptr_eq(&permit.guard.gate, &self.file_requests) => {}
+            (None, false) => {}
+            _ => {
+                return Err(EngineError::Route(
+                    "file reservation does not match this engine and request".into(),
+                ));
+            }
+        }
         let started = rt::Instant::now();
         let (session, node) = {
             // Match `open_socket`: holding the engine lock through a first dial
@@ -774,28 +928,19 @@ impl Engine {
         // still covers all phases; no phase gets a new request budget.
         let phase = AtomicU8::new(0);
         let (status, body, witness_refused) = rt::timeout(remaining, async {
-            let mut sender = http_sender(&session).await?;
-            let mut outgoing = Request::builder()
-                .method(method)
-                .uri(request.path)
-                .header(hyper::header::HOST, node.to_base32());
-            match route.body {
-                RequestBody::Json => {
-                    outgoing = outgoing.header(hyper::header::CONTENT_TYPE, "application/json");
-                }
-                RequestBody::Octets => {
-                    outgoing =
-                        outgoing.header(hyper::header::CONTENT_TYPE, "application/octet-stream");
-                }
-                RequestBody::Empty => {}
-            }
-            if route.nostr_authorization {
-                outgoing = outgoing.header(hyper::header::AUTHORIZATION, request.authorization);
-            }
-            let outgoing = outgoing
-                .header(hyper::header::CONNECTION, "close")
-                .body(Full::new(Bytes::from(request.body)))
-                .map_err(|error| EngineError::Route(error.to_string()))?;
+            let (mut sender, file_connection) = if let Some(permit) = &permit {
+                let (sender, close) = self
+                    .unless_stopped(file_http_sender(
+                        &session,
+                        self.stop.subscribe(),
+                        permit.guard.clone(),
+                    ))
+                    .await?;
+                (sender, Some(close))
+            } else {
+                (http_sender(&session).await?, None)
+            };
+            let outgoing = outgoing_http_request(request, method, &route, node)?;
             phase.store(1, Ordering::Relaxed);
             let response = sender
                 .send_request(outgoing)
@@ -803,7 +948,11 @@ impl Engine {
                 .map_err(|error| EngineError::Transport(error.to_string()))?;
             let witness_refused = is_witness_refusal(&route, response.status(), response.headers());
             phase.store(2, Ordering::Relaxed);
-            let (status, body) = decode_http_response(response, &route).await?;
+            let decoded = decode_http_response(response, &route).await;
+            if let Some(connection) = file_connection {
+                connection.finish().await?;
+            }
+            let (status, body) = decoded?;
             Ok::<_, EngineError>((status, body, witness_refused))
         })
         .await
@@ -1517,6 +1666,44 @@ mod tests {
             builder = builder.header(hyper::header::CONTENT_TYPE, content_type);
         }
         builder.body(Full::new(Bytes::from(body))).unwrap()
+    }
+
+    #[test]
+    fn file_http_upload_uses_the_existing_paired_request() {
+        let (_, route) = validate_http_request(&vmls("PUT", "/upload", "Nostr YQ==", b"hello"))
+            .expect("a signed encrypted-file upload has an exact existing Blossom path");
+        assert!(route.nostr_authorization);
+        assert!(validate_http_request(&vmls("PUT", "/upload", "", b"hello")).is_err());
+    }
+
+    #[tokio::test]
+    async fn file_http_download_checks_the_requested_ciphertext_digest() {
+        let hash = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+        let (_, route) = validate_http_request(&vmls("GET", &format!("/{hash}"), "", b""))
+            .expect("a paired file read names only its ciphertext hash");
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(
+                hyper::header::CONTENT_TYPE,
+                "application/vnd.forgesworn.encrypted",
+            )
+            .header(hyper::header::CONTENT_LENGTH, "5")
+            .body(Full::new(Bytes::from_static(b"hello")))
+            .unwrap();
+        assert_eq!(
+            decode_http_response(response, &route).await.unwrap(),
+            (200, b"hello".to_vec())
+        );
+    }
+
+    #[test]
+    fn file_http_delete_requires_a_separate_signed_empty_request() {
+        let path = format!("/{HEX}");
+        let (_, route) = validate_http_request(&vmls("DELETE", &path, "Nostr YQ==", b""))
+            .expect("claim cleanup uses the existing signed Blossom delete");
+        assert!(route.nostr_authorization);
+        assert!(validate_http_request(&vmls("DELETE", &path, "", b"")).is_err());
+        assert!(validate_http_request(&vmls("DELETE", &path, "Nostr YQ==", b"x")).is_err());
     }
 
     #[tokio::test]

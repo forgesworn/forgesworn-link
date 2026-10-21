@@ -769,9 +769,18 @@ impl Endpoint {
     }
 
     pub async fn close(&self) {
+        // Keep carriers alive while QUIC drains close/reset notifications.
+        // Cancellation must still stop their retrying drivers immediately.
+        struct CloseRelays<'a>(&'a Paths);
+        impl Drop for CloseRelays<'_> {
+            fn drop(&mut self) {
+                self.0.relay().close();
+            }
+        }
+        let close_relays = CloseRelays(&self.paths);
         self.quic.close(VarInt::from_u32(0), b"closing");
-        self.paths.relay().close();
         self.quic.wait_idle().await;
+        drop(close_relays);
         self.paths.relay().closed().await;
     }
 }
