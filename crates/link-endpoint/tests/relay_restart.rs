@@ -184,3 +184,35 @@ async fn closing_the_pool_cancels_a_handshake_and_refuses_new_drivers() {
             .is_err()
     );
 }
+
+/// Cancelling graceful QUIC drain must not leave relay reconnect loops alive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelling_endpoint_close_still_stops_its_relays() {
+    use futures_util::FutureExt;
+    let relay = start_relay().await;
+    let mut endpoints = Vec::new();
+    for _ in 0..2 {
+        let mut config = EndpointConfig::new(TransportKey::generate());
+        config.relays = vec![RelaySpec::plain(relay.url("127.0.0.1"))];
+        config.bind = "127.0.0.1:0".parse().unwrap();
+        config.allow_direct = false;
+        endpoints.push(Endpoint::open(config).await.unwrap());
+    }
+    let card = exchange_card(&endpoints[1]);
+    let (a, b) = tokio::join!(endpoints[0].connect(&card), endpoints[1].accept());
+    let (_a, _b) = (a.unwrap(), b.unwrap());
+    let mut close = Box::pin(endpoints[0].close());
+    assert!(
+        close.as_mut().now_or_never().is_none(),
+        "live QUIC close drains asynchronously"
+    );
+    drop(close);
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        endpoints[0].paths().relay().closed(),
+    )
+    .await
+    .expect("cancelled close still settles relay drivers");
+    endpoints[0].close().await;
+    endpoints[1].close().await;
+}
