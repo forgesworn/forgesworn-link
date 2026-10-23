@@ -21,6 +21,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
+      - name: Refuse while the founders' relay is switched off
+        run: |
+          echo "link1 was switched off on 2026-10-22 and stays off until the owner reopens it." >&2
+          echo "See deploy/founders/README.md, 'Status'. Remove this step only as part of that decision." >&2
+          exit 1
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Require reviewed source and an approved host

@@ -1,5 +1,24 @@
 # Founders' Link relay
 
+## Status: switched off on 2026-10-22
+
+`link1.forgesworn.dev` is closed. The vhost answers `410` to every request,
+the service on the host is stopped and disabled, and a systemd drop-in
+refuses to start it. The deploy workflow fails at its first step.
+
+The relay could not be limited to the operator's own nodes. Tag-mode
+sessions (spec section 9) carry no identity by design, so there is nothing
+to check against a list, and a secret path would not stay secret because
+each node's relay hint is on its signed card. Open to anyone, it would be a
+public service run by ForgeSworn, which the owner has decided not to run.
+
+Bringing it back closed needs an operator admission key in the tag-mode
+`Register` frame, with the matching client change, before it is deployed
+again. Reopening it is the owner's decision.
+
+The rest of this file records how the deployment was set up.
+
+
 Bothy's default `wss://link1.forgesworn.dev/link` needs a running Link relay.
 This deployment puts that service on an approved existing Linux host. It
 does not require a new VPS for each keeper. Bothy can configure other Link
