@@ -45,6 +45,8 @@ is listed under [What this does NOT prove](#what-this-does-not-prove).
 | `link-blossom` | The hash-addressed blob-fetch protocol over a `Session` stream, a transport-neutral `BlobSource` serving trait, and an optional `LinkFetcher` (behind the `shelter-kit` feature) implementing `shelter_kit::BlobFetcher` for mirror and repair |
 | `link-spike` | The `link-spike` binary: `keygen`, `card`, `serve`, `send` |
 
+How these crates relate to Bothy Node, KithMoot, Shelter Kit, Wildbloom Node and Link relays: [`docs/ECOSYSTEM.md`](docs/ECOSYSTEM.md).
+
 ## Running the loopback demo
 
 Build first:
