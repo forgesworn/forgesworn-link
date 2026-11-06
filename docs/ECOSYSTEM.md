@@ -50,4 +50,4 @@ flowchart LR
 - A reopened shared relay. Bringing `link1` back closed needs an operator admission key in the tag-mode `Register` frame, with a matching client change (`deploy/founders/README.md`).
 - Recorded phone and hostile-network runs: a handset on a carrier network, Android background operation, and a direct path between two hostile NATs. The README lists these under "What this does NOT prove".
 
-Checked against forgesworn-link 7aad8bf, shelter-kit v0.5.3, kithmoot a7129a90 and kithmoot-android d387de4f on 6 November 2026.
+Checked against forgesworn-link 7aad8bf, shelter-kit v0.5.3, kithmoot cede413c and kithmoot-android d387de4f on 6 November 2026.
