@@ -1534,9 +1534,9 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.38.2"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8"
+checksum = "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
 dependencies = [
  "cc",
  "pkg-config",
@@ -2254,9 +2254,9 @@ dependencies = [
 
 [[package]]
 name = "rusqlite"
-version = "0.40.2"
+version = "0.41.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23f2a97da3e3873c73cb2a2e71b35c40ff95e0b1eefa8d72d8499a6928c3b5b3"
+checksum = "da9bba6f3506135e120a6586df05be18b48d18896600646a4bec8f993d91a594"
 dependencies = [
  "bitflags 2.13.1",
  "fallible-iterator",
@@ -2615,8 +2615,8 @@ dependencies = [
 
 [[package]]
 name = "shelter-kit"
-version = "0.5.3"
-source = "git+https://github.com/forgesworn/shelter-kit?tag=v0.5.3#0258345c3bfa743dda3948b02b35a2cfe4b48022"
+version = "0.6.0"
+source = "git+https://github.com/forgesworn/shelter-kit?tag=v0.6.0#ea54357c94caa2176912485c89a1c7446a231e32"
 dependencies = [
  "axum",
  "base64 0.23.1",
