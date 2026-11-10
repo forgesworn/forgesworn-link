@@ -33,7 +33,7 @@ hex = "0.4"
 if-addrs = "0.15"
 hkdf = "0.12"
 hmac = "0.12"
-k256 = { version = "0.13", default-features = false, features = ["ecdh", "arithmetic", "std"] }
+k256 = { version = "0.14", default-features = false, features = ["ecdh", "arithmetic", "std"] }
 libc = "0.2"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rand = "0.8"
@@ -42,7 +42,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-shelter-kit = { git = "https://github.com/forgesworn/shelter-kit", tag = "v0.5.3" }
+shelter-kit = { git = "https://github.com/forgesworn/shelter-kit", tag = "v0.6.0" }
 thiserror = "2"
 url = "2"
 webpki-roots = "0.26"

@@ -187,7 +187,18 @@ pub fn valid_compressed_point(bytes: &[u8]) -> bool {
 /// private scalar, and every tag and `eph_x` derived from it, MUST be erased
 /// when the card expires or rotates.  That erasure is the forward secrecy.
 pub fn generate_ephemeral() -> ([u8; 32], [u8; 33]) {
-    let secret = k256::SecretKey::random(&mut rand::rngs::OsRng);
+    use rand::RngCore;
+    // Rejection sampling, as `SecretKey::random` does, over the same OS
+    // source as the rest of the crate (`crypto.getRandomValues` in a
+    // browser). 32 random bytes fail only when zero or not below the group
+    // order, with probability about 2^-128.
+    let secret = loop {
+        let mut bytes = Zeroizing::new([0u8; 32]);
+        rand::rngs::OsRng.fill_bytes(&mut bytes[..]);
+        if let Ok(secret) = k256::SecretKey::from_slice(&bytes[..]) {
+            break secret;
+        }
+    };
     let public = secret.public_key();
     let mut scalar = [0u8; 32];
     scalar.copy_from_slice(&secret.to_bytes());
