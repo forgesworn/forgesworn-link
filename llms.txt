@@ -15,6 +15,12 @@ Blossom store. Every cryptographic primitive, the TLS stack and the QUIC
 stack come from independently maintained crates; this project owns only the
 protocol on top of them.
 
+## ForgeSworn ecosystem
+
+- [ForgeSworn library guide](https://forgesworn.dev/llms.txt): Find related libraries, tools and integration guides by task and runtime.
+- [ForgeSworn on GitHub](https://github.com/forgesworn): Browse the organisation’s public repositories.
+- [Project source](https://github.com/forgesworn/forgesworn-link): Canonical source repository, documentation and release information.
+
 ## Getting Started
 
 This is a Rust workspace of unpublished crates (`publish = false`); consume
