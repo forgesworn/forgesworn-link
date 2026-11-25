@@ -6,8 +6,8 @@
 //!
 //! Both builds offer the same `RelaySocket`:
 //!
-//! * `open(spec)` -- a WebSocket to the relay, ready for the challenge.  The
-//!   caller bounds it with its connect timeout.
+//! * `open` -- a WebSocket to the relay, ready for the challenge. The caller
+//!   bounds the entire connection attempt with its connect timeout.
 //! * `send_ready()` -- whether to take another datagram off the queue.
 //!   Always true natively, where `send` itself waits for the socket; in a
 //!   browser, whether the page's send buffer is below its high-water mark.
@@ -19,21 +19,32 @@
 //! * `next()` -- the next message, `None` once the socket has ended.  Cancel
 //!   safe, so it may sit in a `select!` arm.
 //!
-//! A native build dials TCP itself and runs TLS with `relay_tls`.  A browser
-//! build opens the page's `WebSocket`, which does its own WebPKI
-//! verification and therefore accepts only a plain `wss://` spec.
+//! A native build dials TCP or uses a required SOCKS5 proxy, then runs TLS
+//! with `relay_tls`. A browser build opens the page's `WebSocket`, which
+//! does its own WebPKI verification and accepts only a plain `wss://` spec.
 
 #[cfg(any(wasm_browser, test))]
 mod inbound;
 #[cfg(not(wasm_browser))]
 mod native;
+#[cfg(not(wasm_browser))]
+mod proxy;
 #[cfg(wasm_browser)]
 mod web;
 
 #[cfg(not(wasm_browser))]
 pub use native::{Duplex, RelaySocket, send_retry};
+#[cfg(not(wasm_browser))]
+pub use proxy::RelayProxy;
 #[cfg(wasm_browser)]
 pub use web::{RelaySocket, send_retry};
+
+#[derive(Clone, Copy)]
+pub(crate) enum RelayRoute {
+    Tcp,
+    #[cfg(not(wasm_browser))]
+    ProxyRequired(RelayProxy),
+}
 
 /// One WebSocket message, as far as the relay protocol cares.
 pub enum WsMessage {

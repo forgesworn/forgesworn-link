@@ -36,6 +36,7 @@ use tracing::debug;
 use tracing::trace;
 
 use crate::relay_client::{QueueOutcome, RelayDriver, RelayInbound, RelaySpec};
+use crate::relay_socket::RelayRoute;
 use crate::rt::{self, Instant};
 
 /// The direct half of a path socket: a real UDP socket on a native build.
@@ -733,6 +734,7 @@ pub async fn build(
         book,
         reflector,
         net,
+        RelayRoute::Tcp,
     );
     spawn_direct_inbound(paths.clone(), udp);
     Ok((socket, paths))
@@ -746,10 +748,21 @@ pub fn build_relay_only(
     book: Option<Arc<crate::rendezvous_book::TagBook>>,
     net: watch::Receiver<u64>,
 ) -> (Arc<PathSocket>, Arc<Paths>) {
-    let unbound = SocketAddr::from(([0, 0, 0, 0], 0));
-    assemble(key, None, unbound, relays, book, None, net)
+    build_relay_only_with_route(key, relays, book, net, RelayRoute::Tcp)
 }
 
+pub(crate) fn build_relay_only_with_route(
+    key: TransportKey,
+    relays: Vec<RelaySpec>,
+    book: Option<Arc<crate::rendezvous_book::TagBook>>,
+    net: watch::Receiver<u64>,
+    route: RelayRoute,
+) -> (Arc<PathSocket>, Arc<Paths>) {
+    let unbound = SocketAddr::from(([0, 0, 0, 0], 0));
+    assemble(key, None, unbound, relays, book, None, net, route)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn assemble(
     key: TransportKey,
     udp: Option<Arc<DirectSocket>>,
@@ -758,10 +771,12 @@ fn assemble(
     book: Option<Arc<crate::rendezvous_book::TagBook>>,
     reflector: Option<SocketAddr>,
     net: watch::Receiver<u64>,
+    route: RelayRoute,
 ) -> (Arc<PathSocket>, Arc<Paths>) {
     let (inbound_tx, inbound_rx) = mpsc::channel::<Inbound>(INBOUND_CAPACITY);
     let (relay_inbound_tx, mut relay_inbound_rx) = mpsc::channel::<RelayInbound>(INBOUND_CAPACITY);
-    let relay = crate::relay_client::spawn(key.clone(), relays, relay_inbound_tx, book);
+    let relay =
+        crate::relay_client::spawn_with_route(key.clone(), relays, relay_inbound_tx, book, route);
 
     let local_synthetic = key.node_id().synthetic_addr();
     let paths = Arc::new(Paths {

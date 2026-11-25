@@ -23,5 +23,7 @@ pub use link_core::id::{NodeId, TransportKey};
 pub use link_core::path::{FailReason, PathReport, PathStatus};
 pub use link_core::rendezvous::TagCase;
 pub use relay_client::{RelayActivitySnapshot, RelaySpec, RelayStatus};
+#[cfg(not(wasm_browser))]
+pub use relay_socket::RelayProxy;
 pub use rendezvous_book::{PairingRegistration, RendezvousPeer, TagBook};
 pub use session::{Session, Stream};
