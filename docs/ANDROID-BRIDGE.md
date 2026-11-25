@@ -41,8 +41,8 @@ directory.
 
 The records passed to `LinkEngine.start` are:
 
-- `LinkConfig`: 32-byte transport seed, relay URLs, direct-path consent and a
-  list of routes;
+- `LinkConfig`: 32-byte transport seed, owner-approved relay URLs, direct-path
+  consent and a list of routes;
 - `LinkRoute`: opaque product `route_id`, verified card bytes, 32-byte paired
   route secret, retained card serial and the time that card was accepted;
 - `LinkPairingBundle`: route id, server card, the QR's 16 raw pairing-secret
@@ -84,6 +84,11 @@ not revoke an enrolled route. A live `upsert_route` requires a strictly greater
 serial than the route already holds. Start always supplies
 `Some(paired_routes)`, including an empty map, so later route additions remain
 in tag mode. It zeroises decoded route material after ownership passes to Link.
+
+Before pairing or restoring a route, pass the approved Link relay destinations
+in `LinkConfig.relay_urls`. The card can select a configured relay. Supply
+the updated approved list on engine start when the user's relay settings
+change. Retained cards and paired route secrets can be loaded as before.
 
 `pair_route` verifies and pins the QR's server card, opens Link's one-stream
 provisional session, sends the caller's signed card to `PUT /events/route`,

@@ -101,7 +101,7 @@ async fn file_http_roundtrip_cancellation_and_timeout_use_one_pinned_session() {
     let engine = Arc::new(
         Engine::start(EngineConfig {
             transport_seed: seed.to_vec(),
-            relay_urls: Vec::new(),
+            relay_urls: vec![relay.url("127.0.0.1")],
             allow_direct: false,
             routes: vec![Route {
                 route_id: "selected".into(),

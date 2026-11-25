@@ -159,16 +159,19 @@ One self-hostable binary, `link-relay`, offers two services.  Operators may
 run several from different organisations; a client may remove every
 ForgeSworn-operated instance and still work.
 
-A node keeps one session on its own configured relay list (its **home**
-relay, with the failover of 4.3) and, per peer, a session on the relays the
-peer's card names (hint `0x01`), started when the node dials that peer.  The
-accepting side answers on whichever relay the dialer's datagrams arrived on.
-Two nodes therefore need no shared configuration to meet: the dialer chooses,
-the acceptor follows.  A card with no relay hint means the dialer's own relay.
-Per-peer sessions are bounded (sixteen beyond the home session; past that a
-peer is dialled on the home relay).  A hint carries a URL only, so a hinted
-`wss://` relay is verified against the WebPKI roots; a relay that needs a
-pinned certificate is reachable only from configuration.
+A node keeps one session on its configured relay list (its **home** relay,
+with the failover of 4.3). When a peer's card advertises relays (hint `0x01`),
+the dialler selects the destinations that match its owner-configured relay
+specifications by scheme, host, effective port and path. It MUST refuse a
+nonempty hint list with no permitted destination before starting a peer relay
+driver. Matching destinations use the owner's TLS settings and failover
+order. A card with no relay hint uses the home relay.
+
+The owner MAY explicitly permit following unconfigured card hints. These
+hints follow the configured matches in the dial order and use WebPKI for
+`wss://`. The accepting side answers on the relay that carried the dialler's
+datagrams. Per-peer drivers are bounded at sixteen beyond the home driver.
+At the limit the endpoint uses its configured home driver.
 
 ### 3.1 Relay session over WebSocket Secure
 

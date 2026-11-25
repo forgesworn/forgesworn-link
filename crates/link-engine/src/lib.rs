@@ -37,6 +37,7 @@ pub use blob_http::{BlobResponse, FileRequestPermit, MAX_BLOB_BYTES};
 /// What the host starts an engine with.
 pub struct EngineConfig {
     pub transport_seed: Vec<u8>,
+    /// Owner-approved relay destinations for saved routes and first contact.
     pub relay_urls: Vec<String>,
     pub allow_direct: bool,
     pub routes: Vec<Route>,
@@ -1994,7 +1995,7 @@ mod tests {
         let card = server.card(Duration::from_secs(600), Vec::new());
         let engine = Engine::start(EngineConfig {
             transport_seed: client_seed.to_vec(),
-            relay_urls: Vec::new(),
+            relay_urls: vec![relay.url("127.0.0.1")],
             allow_direct: false,
             routes: vec![Route {
                 route_id: "room".into(),
@@ -2091,7 +2092,7 @@ mod tests {
         let engine = Arc::new(
             Engine::start(EngineConfig {
                 transport_seed: vec![0x17; 32],
-                relay_urls: Vec::new(),
+                relay_urls: card.relay_urls(),
                 allow_direct: false,
                 routes: vec![Route {
                     route_id: "unreachable".into(),
