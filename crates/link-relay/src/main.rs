@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 
 use clap::Parser;
 use link_relay::{RelayConfig, TlsMaterial};
+use tracing_subscriber::{filter::filter_fn, prelude::*};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -26,7 +27,7 @@ struct Args {
     /// Per-session outbound byte budget.  Zero means no budget.
     #[arg(long, default_value_t = 0)]
     bytes_per_second: u64,
-    /// Cap on concurrent authenticated sessions.
+    /// Cap on concurrent sessions, including handshakes.
     #[arg(long, default_value_t = 1024)]
     max_sessions: usize,
     /// Cap on concurrent sessions from one source address.  Zero means none.
@@ -39,9 +40,16 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
+    tracing_subscriber::registry()
+        .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        // WebSocket trace events can contain frame contents. Keep dependency
+        // diagnostics out of the journal even if the operator selects TRACE.
+        .with(
+            tracing_subscriber::fmt::layer().with_filter(filter_fn(|metadata| {
+                metadata.target() == link_relay::LOG_TARGET
+            })),
         )
         .init();
 

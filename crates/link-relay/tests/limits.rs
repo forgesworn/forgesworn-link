@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use link_relay::{RelayConfig, RelayHandle};
+use link_relay::{RelayConfig, RelayHandle, TlsMaterial};
 
 async fn start(max_sessions_per_source: usize) -> RelayHandle {
     link_relay::start(RelayConfig {
@@ -20,6 +20,20 @@ async fn start(max_sessions_per_source: usize) -> RelayHandle {
     })
     .await
     .expect("relay starts")
+}
+
+#[test]
+fn relay_config_debug_redacts_the_tls_key() {
+    let config = RelayConfig {
+        tls: Some(TlsMaterial {
+            cert_der: vec![1, 2, 3],
+            key_der: vec![159, 211, 214],
+        }),
+        ..RelayConfig::default()
+    };
+    let debug = format!("{config:?}");
+    assert!(debug.contains("[redacted]"));
+    assert!(!debug.contains("159, 211, 214"));
 }
 
 #[tokio::test]

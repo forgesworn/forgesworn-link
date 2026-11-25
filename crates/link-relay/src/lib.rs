@@ -9,6 +9,7 @@
 //! relay on that path, and the relay never logs a tag.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,7 +28,12 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
+
+/// The relay's process-level diagnostics. Embedding applications can enable
+/// this target without enabling the WebSocket dependency's frame logging.
+pub const LOG_TARGET: &str = "link_relay::summary";
+const ACTIVITY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// Anything the relay can speak WebSocket over: plain TCP or TLS.
 pub trait Duplex: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -57,10 +63,19 @@ pub struct RelayConfig {
     pub reflector_per_second: f64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct TlsMaterial {
     pub cert_der: Vec<u8>,
     pub key_der: Vec<u8>,
+}
+
+impl fmt::Debug for TlsMaterial {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TlsMaterial")
+            .field("cert_der_len", &self.cert_der.len())
+            .field("key_der", &"[redacted]")
+            .finish()
+    }
 }
 
 impl TlsMaterial {
@@ -146,24 +161,92 @@ struct Registry {
     /// entry leaves the map when its count reaches zero, so the map never
     /// grows with the history of addresses seen.
     by_source: HashMap<IpAddr, usize>,
+    activity: RelayActivity,
 }
 
 type Shared = Arc<Mutex<Registry>>;
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Default)]
+struct RelayActivity {
+    accepted: u64,
+    refused_capacity: u64,
+    refused_source: u64,
+    session_errors: u64,
+    accept_errors: u64,
+    reflector_errors: u64,
+    traffic: TrafficCounts,
+}
+
+#[derive(Default, PartialEq, Eq)]
+struct TrafficCounts {
+    frames_in: u64,
+    frames_out: u64,
+    bytes_in: u64,
+    dropped: u64,
+}
+
+impl TrafficCounts {
+    /// Batch on the session's existing idle tick and when the session ends,
+    /// so reporting adds no shared lock or atomic operation per datagram.
+    fn flush(&mut self, registry: &Shared) {
+        if *self == Self::default() {
+            return;
+        }
+        let mut guard = registry.lock().expect("registry");
+        let total = &mut guard.activity.traffic;
+        total.frames_in += self.frames_in;
+        total.frames_out += self.frames_out;
+        total.bytes_in += self.bytes_in;
+        total.dropped += self.dropped;
+        *self = Self::default();
+    }
+}
+
+fn report_activity(registry: &Shared) {
+    let (active, activity) = {
+        let mut guard = registry.lock().expect("registry");
+        (guard.live, std::mem::take(&mut guard.activity))
+    };
+    if activity.accept_errors != 0 || activity.reflector_errors != 0 {
+        warn!(
+            target: LOG_TARGET,
+            accept_errors = activity.accept_errors,
+            reflector_errors = activity.reflector_errors,
+            "relay socket errors"
+        );
+    }
+    info!(
+        target: LOG_TARGET,
+        active,
+        accepted = activity.accepted,
+        refused_capacity = activity.refused_capacity,
+        refused_source = activity.refused_source,
+        session_errors = activity.session_errors,
+        accept_errors = activity.accept_errors,
+        reflector_errors = activity.reflector_errors,
+        frames_in = activity.traffic.frames_in,
+        frames_out = activity.traffic.frames_out,
+        bytes_in = activity.traffic.bytes_in,
+        dropped = activity.traffic.dropped,
+        "relay activity"
+    );
+}
+
 /// Start both services.  Returns once the sockets are bound.
-pub async fn start(config: RelayConfig) -> anyhow::Result<RelayHandle> {
+pub async fn start(mut config: RelayConfig) -> anyhow::Result<RelayHandle> {
     let listener = TcpListener::bind(config.ws_bind).await?;
     let ws_addr = listener.local_addr()?;
     let udp = Arc::new(UdpSocket::bind(config.udp_bind).await?);
     let udp_addr = udp.local_addr()?;
     let (stop, _) = watch::channel(false);
-    let tls_fingerprint = config.tls.as_ref().map(TlsMaterial::fingerprint);
-
-    let acceptor = match &config.tls {
-        Some(material) => Some(build_acceptor(material)?),
-        None => None,
+    let (acceptor, tls_fingerprint) = match config.tls.take() {
+        Some(material) => {
+            let fingerprint = material.fingerprint();
+            (Some(build_acceptor(material)?), Some(fingerprint))
+        }
+        None => (None, None),
     };
 
     let registry: Shared = Arc::new(Mutex::new(Registry::default()));
@@ -175,16 +258,25 @@ pub async fn start(config: RelayConfig) -> anyhow::Result<RelayHandle> {
         let config = config.clone();
         let mut stop_rx = stop.subscribe();
         let session_stop = stop.subscribe();
+        let mut report_tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + ACTIVITY_INTERVAL,
+            ACTIVITY_INTERVAL,
+        );
+        report_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         tokio::spawn(async move {
             loop {
                 let accepted = tokio::select! {
                     _ = stop_rx.changed() => break,
+                    _ = report_tick.tick() => {
+                        report_activity(&registry);
+                        continue;
+                    }
                     accepted = listener.accept() => accepted,
                 };
                 let (stream, peer) = match accepted {
                     Ok(pair) => pair,
-                    Err(e) => {
-                        warn!(error = %e, "relay accept failed");
+                    Err(_) => {
+                        registry.lock().expect("registry").activity.accept_errors += 1;
                         continue;
                     }
                 };
@@ -192,10 +284,7 @@ pub async fn start(config: RelayConfig) -> anyhow::Result<RelayHandle> {
                 {
                     let mut guard = registry.lock().expect("registry");
                     if guard.live >= config.max_sessions {
-                        debug!(
-                            live = guard.live,
-                            "relay at session cap, dropping connection"
-                        );
+                        guard.activity.refused_capacity += 1;
                         continue;
                     }
                     let from_source = guard.by_source.get(&source_ip).copied().unwrap_or(0);
@@ -203,29 +292,25 @@ pub async fn start(config: RelayConfig) -> anyhow::Result<RelayHandle> {
                         && from_source >= config.max_sessions_per_source
                     {
                         // Refused before any frame, so it costs the relay a
-                        // TCP accept and nothing else.  The address is not
-                        // logged: it is the one thing a tag-mode relay holds.
-                        debug!(
-                            from_source,
-                            "relay at per-source session cap, dropping connection"
-                        );
+                        // TCP accept and nothing else.
+                        guard.activity.refused_source += 1;
                         continue;
                     }
                     *guard.by_source.entry(source_ip).or_insert(0) += 1;
                     guard.live += 1;
+                    guard.activity.accepted += 1;
                 }
                 let registry = registry.clone();
                 let config = config.clone();
                 let acceptor = acceptor.clone();
                 let stop_rx = session_stop.clone();
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        serve_session(stream, peer, acceptor, config, registry.clone(), stop_rx)
-                            .await
-                    {
-                        debug!(error = %e, "relay session ended");
-                    }
+                    let result =
+                        serve_session(stream, acceptor, config, registry.clone(), stop_rx).await;
                     let mut guard = registry.lock().expect("registry");
+                    if result.is_err() {
+                        guard.activity.session_errors += 1;
+                    }
                     guard.live -= 1;
                     if let Some(count) = guard.by_source.get_mut(&source_ip) {
                         *count -= 1;
@@ -252,8 +337,8 @@ pub async fn start(config: RelayConfig) -> anyhow::Result<RelayHandle> {
                 };
                 let (len, from) = match received {
                     Ok(pair) => pair,
-                    Err(e) => {
-                        warn!(error = %e, "reflector recv failed");
+                    Err(_) => {
+                        registry.lock().expect("registry").activity.reflector_errors += 1;
                         continue;
                     }
                 };
@@ -272,7 +357,7 @@ pub async fn start(config: RelayConfig) -> anyhow::Result<RelayHandle> {
         });
     }
 
-    info!(%ws_addr, %udp_addr, "relay listening");
+    info!(target: LOG_TARGET, %ws_addr, %udp_addr, "relay listening");
     Ok(RelayHandle {
         ws_addr,
         udp_addr,
@@ -281,11 +366,11 @@ pub async fn start(config: RelayConfig) -> anyhow::Result<RelayHandle> {
     })
 }
 
-fn build_acceptor(material: &TlsMaterial) -> anyhow::Result<tokio_rustls::TlsAcceptor> {
+fn build_acceptor(material: TlsMaterial) -> anyhow::Result<tokio_rustls::TlsAcceptor> {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-    let cert = CertificateDer::from(material.cert_der.clone());
-    let key = PrivateKeyDer::try_from(material.key_der.clone())
-        .map_err(|e| anyhow::anyhow!("relay key: {e}"))?;
+    let cert = CertificateDer::from(material.cert_der);
+    let key =
+        PrivateKeyDer::try_from(material.key_der).map_err(|e| anyhow::anyhow!("relay key: {e}"))?;
     let config = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -385,7 +470,6 @@ const TAG_ENDS: usize = 2;
 
 async fn serve_session(
     stream: TcpStream,
-    peer: SocketAddr,
     acceptor: Option<tokio_rustls::TlsAcceptor>,
     config: Arc<RelayConfig>,
     registry: Shared,
@@ -451,22 +535,13 @@ async fn serve_session(
 
     let mut token = [0u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut token);
-    let token_hex = hex_lower(&token);
-    let mut frames_in = 0u64;
-    let mut frames_out = 0u64;
-    let mut bytes_in = 0u64;
-    let mut dropped = 0u64;
+    let mut traffic = TrafficCounts::default();
 
     // The session is registered from here on.  Every exit, an I/O error's `?`
     // included, leaves this block and reaches the cleanup below, so a socket
     // reset cannot leave a ghost registration behind (issue #58).
     let result: anyhow::Result<()> = async {
         ws.send(binary(Frame::Welcome(token))).await?;
-        // Tokens and counters only in the journal, spec 3.1: no node ID, no tag,
-        // and no source address at info, so an operator running at info holds no
-        // address ledger.  The source stays visible at debug for local diagnosis.
-        info!(token = %token_hex, "relay session up");
-        debug!(token = %token_hex, source = %peer.ip(), "relay session source");
 
         let mut last_ping = Instant::now();
         let mut idle_check = tokio::time::interval(Duration::from_secs(5));
@@ -480,22 +555,23 @@ async fn serve_session(
                     break Ok(());
                 }
                 _ = idle_check.tick() => {
+                    traffic.flush(&registry);
                     if last_ping.elapsed() > Duration::from_secs(IDLE_CLOSE_SECONDS) {
                         let _ = ws.send(binary(Frame::Close(0))).await;
-                        break Err(anyhow::anyhow!("idle"));
+                        break Ok(());
                     }
                 }
                 outbound = rx.recv() => {
                     match outbound {
                         Some(frame) => {
-                            frames_out += 1;
                             let closing = matches!(frame, Frame::Close(_));
                             ws.send(binary(frame)).await?;
+                            traffic.frames_out += 1;
                             if closing {
                                 // A queued Close means a newer registration
                                 // superseded this session; the frame said why and
                                 // there is nothing left to route.
-                                break Err(anyhow::anyhow!("superseded"));
+                                break Ok(());
                             }
                         }
                         None => break Ok(()),
@@ -519,7 +595,7 @@ async fn serve_session(
                         let _ = ws.send(binary(Frame::Close(CLOSE_REASON_MALFORMED))).await;
                         break Err(anyhow::anyhow!("oversize or malformed frame"));
                     };
-                    frames_in += 1;
+                    traffic.frames_in += 1;
                     match frame {
                         Frame::Send { destination, datagram } => {
                             let Mode::Identity(node_id) = &mode else {
@@ -527,9 +603,9 @@ async fn serve_session(
                                 break Err(anyhow::anyhow!("identity frame on a tag session"));
                             };
                             let source = *node_id;
-                            bytes_in += datagram.len() as u64;
+                            traffic.bytes_in += datagram.len() as u64;
                             if !budget.allow(datagram.len() as u64) {
-                                dropped += 1;
+                                traffic.dropped += 1;
                                 continue;
                             }
                             let target = registry
@@ -546,10 +622,10 @@ async fn serve_session(
                                         .try_send(Frame::Recv { source, datagram })
                                         .is_err()
                                     {
-                                        dropped += 1;
+                                        traffic.dropped += 1;
                                     }
                                 }
-                                None => dropped += 1,
+                                None => traffic.dropped += 1,
                             }
                         }
                         Frame::SendTag { tag, datagram } => {
@@ -557,9 +633,9 @@ async fn serve_session(
                                 let _ = ws.send(binary(Frame::Close(CLOSE_REASON_MALFORMED))).await;
                                 break Err(anyhow::anyhow!("tag frame on an identity session"));
                             }
-                            bytes_in += datagram.len() as u64;
+                            traffic.bytes_in += datagram.len() as u64;
                             if !budget.allow(datagram.len() as u64) {
-                                dropped += 1;
+                                traffic.dropped += 1;
                                 continue;
                             }
                             // Deliver to every other session registered with this
@@ -579,14 +655,14 @@ async fn serve_session(
                                 })
                                 .unwrap_or_default();
                             if targets.is_empty() {
-                                dropped += 1;
+                                traffic.dropped += 1;
                             } else {
                                 for target in targets {
                                     if target
                                         .try_send(Frame::RecvTag { tag, datagram: datagram.clone() })
                                         .is_err()
                                     {
-                                        dropped += 1;
+                                        traffic.dropped += 1;
                                     }
                                 }
                             }
@@ -631,14 +707,7 @@ async fn serve_session(
             register_tags(&registry, session_id, &tx, current, &[]);
         }
     }
-    info!(
-        token = %token_hex,
-        frames_in,
-        frames_out,
-        bytes_in,
-        dropped,
-        "relay session down"
-    );
+    traffic.flush(&registry);
     result
 }
 
