@@ -14,27 +14,42 @@ use std::sync::{Arc, Mutex, Weak};
 
 use link_core::id::NodeId;
 use link_core::rendezvous::{
-    PAIRED_ROUTE_SECRET_BYTES, PAIRING_SECRET_BYTES, Tag, TagCase, derive_paired_route_tag,
-    derive_pairing_tag, derive_tag, epoch_index,
+    PAIRED_ROUTE_SECRET_BYTES, PAIRING_SECRET_BYTES, TAG_BYTES, Tag, TagCase,
+    derive_paired_route_tag, derive_pairing_tag, derive_tag, epoch_index,
 };
 use rand::RngCore;
 use tokio::sync::watch;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 /// One pair's rendezvous material, as computed by the shell from the current
 /// cards.  `eph_x` is 32 zero bytes for `TagCase::None`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct RendezvousPeer {
     pub case: TagCase,
     pub static_x: [u8; 32],
     pub eph_x: [u8; 32],
 }
 
+impl fmt::Debug for RendezvousPeer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RendezvousPeer")
+            .field("case", &self.case)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Zeroize for RendezvousPeer {
+    fn zeroize(&mut self) {
+        self.static_x.zeroize();
+        self.eph_x.zeroize();
+    }
+}
+
 /// The registration window: previous, current and next epoch.
 const EPOCH_WINDOW: [i64; 3] = [-1, 0, 1];
 
 pub struct TagBook {
-    peers: Mutex<HashMap<NodeId, RendezvousPeer>>,
+    peers: Mutex<HashMap<NodeId, Zeroizing<RendezvousPeer>>>,
     /// Short-lived first-contact routes.  Their random local route IDs are
     /// never sent on the relay wire and are not authenticated identities.
     pairing: Mutex<HashMap<NodeId, PairingRoute>>,
@@ -132,7 +147,7 @@ impl Drop for PairingRegistration {
 #[derive(Default)]
 struct SendCache {
     host: String,
-    tags: HashMap<(NodeId, u64), Tag>,
+    tags: HashMap<(NodeId, u64), Zeroizing<[u8; TAG_BYTES]>>,
 }
 
 /// Bound on cached send tags: a roster of pairs times a few epochs.  Past it
@@ -150,7 +165,12 @@ impl TagBook {
     ) -> Self {
         let (changes, _) = watch::channel(0);
         TagBook {
-            peers: Mutex::new(peers),
+            peers: Mutex::new(
+                peers
+                    .into_iter()
+                    .map(|(peer, material)| (peer, Zeroizing::new(material)))
+                    .collect(),
+            ),
             pairing: Mutex::new(HashMap::new()),
             paired: Mutex::new(paired),
             version: AtomicU64::new(0),
@@ -169,7 +189,10 @@ impl TagBook {
     /// registration follows within a minute; the three-epoch window covers the
     /// seam.
     pub fn upsert(&self, peer: NodeId, material: RendezvousPeer) {
-        self.peers.lock().expect("book").insert(peer, material);
+        self.peers
+            .lock()
+            .expect("book")
+            .insert(peer, Zeroizing::new(material));
         self.bump();
     }
 
@@ -453,7 +476,7 @@ impl TagBook {
             cache.tags.clear();
         }
         if let Some(tag) = cache.tags.get(&(peer, epoch)) {
-            return Some(*tag);
+            return Some(Tag(**tag));
         }
         let tag = if let Some(tag) = {
             let pairing = self.pairing.lock().expect("pairing book");
@@ -500,7 +523,7 @@ impl TagBook {
         if cache.tags.len() >= SEND_CACHE_CAP {
             cache.tags.clear();
         }
-        cache.tags.insert((peer, epoch), tag);
+        cache.tags.insert((peer, epoch), Zeroizing::new(tag.0));
         Some(tag)
     }
 
@@ -567,6 +590,14 @@ mod tests {
 
     fn node(byte: u8) -> NodeId {
         NodeId([byte; 32])
+    }
+
+    #[test]
+    fn debug_output_omits_shared_secrets() {
+        assert_eq!(
+            format!("{:?}", material(10)),
+            "RendezvousPeer { case: Both, .. }"
+        );
     }
 
     #[test]

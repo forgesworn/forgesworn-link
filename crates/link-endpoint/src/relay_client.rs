@@ -777,7 +777,7 @@ async fn connect(
     // First contact: identity auth (spec 3.1) or tag registration (spec 9).
     let challenge = match next_frame(&mut ws).await? {
         Some(Frame::Challenge(challenge)) => challenge,
-        other => anyhow::bail!("expected a challenge, got {other:?}"),
+        _ => anyhow::bail!("expected a relay challenge"),
     };
     match book {
         None => {
@@ -804,7 +804,7 @@ async fn connect(
     }
     match next_frame(&mut ws).await? {
         Some(Frame::Welcome(_token)) => Ok(ws),
-        other => anyhow::bail!("expected a welcome, got {other:?}"),
+        _ => anyhow::bail!("expected a relay welcome"),
     }
 }
 
