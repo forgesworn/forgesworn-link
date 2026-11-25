@@ -7,10 +7,16 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use link_core::TransportKey;
 use link_core::rendezvous::Tag;
-use link_core::wire::{CLOSE_REASON_SUPERSEDED, Frame, sign_relay_auth};
+use link_core::wire::{
+    CLOSE_REASON_MALFORMED, CLOSE_REASON_SUPERSEDED, Frame, MAX_TAGS_PER_REGISTER, sign_relay_auth,
+};
 use link_relay::{RelayConfig, RelayHandle};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::frame::{
+    Frame as WebSocketFrame,
+    coding::{Data, OpCode},
+};
 
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
 
@@ -99,6 +105,87 @@ async fn open_identity(url: &str, key: &TransportKey) -> Ws {
         Some(Frame::Welcome(_)) => ws,
         other => panic!("expected a welcome, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn a_full_registration_can_be_fragmented_around_a_websocket_ping() {
+    let relay = start_relay().await;
+    let url = relay.url("127.0.0.1");
+    let mut tags: Vec<Tag> = (0..MAX_TAGS_PER_REGISTER)
+        .map(|n| {
+            let mut value = [0; 16];
+            value[..2].copy_from_slice(&(n as u16).to_be_bytes());
+            Tag(value)
+        })
+        .collect();
+    let mut a = open_tags(&url, tags.clone()).await;
+    let shared = tag(42);
+    tags[0] = shared;
+    let mut b = open_tags(&url, vec![shared]).await;
+
+    let mut first = Frame::Register { tags }.encode();
+    let second = first.split_off(first.len() / 2);
+    a.send(Message::Frame(WebSocketFrame::message(
+        first,
+        OpCode::Data(Data::Binary),
+        false,
+    )))
+    .await
+    .unwrap();
+    let ping = b"test ping".to_vec();
+    a.send(Message::Ping(ping.clone())).await.unwrap();
+    a.send(Message::Frame(WebSocketFrame::message(
+        second,
+        OpCode::Data(Data::Continue),
+        true,
+    )))
+    .await
+    .unwrap();
+    let pong = tokio::time::timeout(Duration::from_secs(2), a.next())
+        .await
+        .expect("WebSocket pong arrived");
+    assert!(matches!(pong, Some(Ok(Message::Pong(payload))) if payload == ping));
+    // A Link pong confirms the reassembled registration has been processed.
+    a.send(Message::Binary(Frame::Ping([1; 8]).encode()))
+        .await
+        .unwrap();
+    assert_eq!(next_frame(&mut a).await, Some(Frame::Pong([1; 8])));
+
+    let datagram = b"fixture".to_vec();
+    b.send(Message::Binary(
+        Frame::SendTag {
+            tag: shared,
+            datagram: datagram.clone(),
+        }
+        .encode(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        next_frame(&mut a).await,
+        Some(Frame::RecvTag {
+            tag: shared,
+            datagram
+        })
+    );
+    relay.shutdown();
+}
+
+#[tokio::test]
+async fn an_oversize_websocket_message_receives_the_link_malformed_reason() {
+    let relay = start_relay().await;
+    let mut ws = open_tags(&relay.url("127.0.0.1"), vec![tag(7)]).await;
+    let mut frame = Frame::Register {
+        tags: vec![tag(7); MAX_TAGS_PER_REGISTER],
+    }
+    .encode();
+    frame.push(0);
+    ws.send(Message::Binary(frame)).await.unwrap();
+    assert_eq!(
+        next_frame(&mut ws).await,
+        Some(Frame::Close(CLOSE_REASON_MALFORMED))
+    );
+    relay.shutdown();
 }
 
 #[tokio::test]

@@ -18,26 +18,34 @@ use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use link_core::id::NodeId;
-use link_core::rendezvous::Tag;
+use link_core::rendezvous::{TAG_BYTES, Tag};
 use link_core::wire::{
     CLOSE_REASON_MALFORMED, CLOSE_REASON_SUPERSEDED, Frame, IDLE_CLOSE_SECONDS, MAX_QUEUED_FRAMES,
-    REFLECT_REQUEST_BYTES, parse_reflect_request, reflect_reply, verify_relay_auth,
+    MAX_TAGS_PER_REGISTER, REFLECT_REQUEST_BYTES, parse_reflect_request, reflect_reply,
+    verify_relay_auth,
 };
 use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch};
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message, protocol::WebSocketConfig};
 use tracing::{info, warn};
 
 /// The relay's process-level diagnostics. Embedding applications can enable
 /// this target without enabling the WebSocket dependency's frame logging.
 pub const LOG_TARGET: &str = "link_relay::summary";
 const ACTIVITY_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const UPGRADE_TIMEOUT: Duration = Duration::from_secs(10);
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+// Full Register: one frame type byte, a 16-bit count and the largest roster.
+const MAX_MESSAGE_BYTES: usize = 1 + 2 + MAX_TAGS_PER_REGISTER * TAG_BYTES;
 
 /// Anything the relay can speak WebSocket over: plain TCP or TLS.
 pub trait Duplex: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Duplex for T {}
+
+type RelayWebSocket = WebSocketStream<Box<dyn Duplex>>;
 
 #[derive(Clone, Debug)]
 pub struct RelayConfig {
@@ -280,6 +288,7 @@ pub async fn start(mut config: RelayConfig) -> anyhow::Result<RelayHandle> {
                         continue;
                     }
                 };
+                let upgrade_deadline = tokio::time::Instant::now() + UPGRADE_TIMEOUT;
                 let source_ip = peer.ip();
                 {
                     let mut guard = registry.lock().expect("registry");
@@ -305,8 +314,15 @@ pub async fn start(mut config: RelayConfig) -> anyhow::Result<RelayHandle> {
                 let acceptor = acceptor.clone();
                 let stop_rx = session_stop.clone();
                 tokio::spawn(async move {
-                    let result =
-                        serve_session(stream, acceptor, config, registry.clone(), stop_rx).await;
+                    let result = serve_session(
+                        stream,
+                        acceptor,
+                        config,
+                        registry.clone(),
+                        stop_rx,
+                        upgrade_deadline,
+                    )
+                    .await;
                     let mut guard = registry.lock().expect("registry");
                     if result.is_err() {
                         guard.activity.session_errors += 1;
@@ -468,32 +484,69 @@ fn register_tags(
 /// A rendezvous tag names one pair, so at most two sessions hold it.
 const TAG_ENDS: usize = 2;
 
+async fn open_websocket(
+    stream: TcpStream,
+    acceptor: Option<tokio_rustls::TlsAcceptor>,
+) -> anyhow::Result<RelayWebSocket> {
+    stream.set_nodelay(true).ok();
+    let transport: Box<dyn Duplex> = match acceptor {
+        Some(acceptor) => Box::new(acceptor.accept(stream).await?),
+        None => Box::new(stream),
+    };
+    let config = WebSocketConfig {
+        max_frame_size: Some(MAX_MESSAGE_BYTES),
+        max_message_size: Some(MAX_MESSAGE_BYTES),
+        ..WebSocketConfig::default()
+    };
+    Ok(tokio_tungstenite::accept_async_with_config(transport, Some(config)).await?)
+}
+
+async fn close_on_capacity_error(ws: &mut RelayWebSocket, error: &WebSocketError) {
+    if matches!(error, WebSocketError::Capacity(_)) {
+        // Offer the Link malformed-frame reason without waiting for a peer
+        // that stopped reading. The receive side has already failed.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(1),
+            ws.send(binary(Frame::Close(CLOSE_REASON_MALFORMED))),
+        )
+        .await;
+    }
+}
+
 async fn serve_session(
     stream: TcpStream,
     acceptor: Option<tokio_rustls::TlsAcceptor>,
     config: Arc<RelayConfig>,
     registry: Shared,
     mut stop_rx: watch::Receiver<bool>,
+    upgrade_deadline: tokio::time::Instant,
 ) -> anyhow::Result<()> {
-    stream.set_nodelay(true).ok();
-    let transport: Box<dyn Duplex> = match acceptor {
-        Some(acceptor) => Box::new(acceptor.accept(stream).await?),
-        None => Box::new(stream),
+    let handshake = async {
+        let mut ws =
+            tokio::time::timeout_at(upgrade_deadline, open_websocket(stream, acceptor)).await??;
+        // An identity session signs this challenge. A tag session registers
+        // its tags instead, so no identity reaches the tag path.
+        let mut challenge = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut challenge);
+        let first = tokio::time::timeout(FIRST_FRAME_TIMEOUT, async {
+            ws.send(binary(Frame::Challenge(challenge))).await?;
+            match ws.next().await {
+                Some(Ok(message)) => Ok(message),
+                Some(Err(error)) => {
+                    close_on_capacity_error(&mut ws, &error).await;
+                    Err(error.into())
+                }
+                None => Err(anyhow::anyhow!("closed before the first frame")),
+            }
+        })
+        .await??;
+        Ok::<_, anyhow::Error>((ws, challenge, first))
     };
-    let mut ws = tokio_tungstenite::accept_async(transport).await?;
-
-    // First contact.  The relay always issues a challenge; an identity session
-    // answers it with a signature (spec 3.1), a tag session ignores it and
-    // registers its tags instead (spec 9), so no identity ever reaches the tag
-    // path.
-    let mut challenge = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut challenge);
-    ws.send(binary(Frame::Challenge(challenge))).await?;
-
-    let first = tokio::time::timeout(Duration::from_secs(10), ws.next())
-        .await
-        .map_err(|_| anyhow::anyhow!("first frame timed out"))?
-        .ok_or_else(|| anyhow::anyhow!("closed before the first frame"))??;
+    let (mut ws, challenge, first) = tokio::select! {
+        biased;
+        _ = stop_rx.changed() => return Ok(()),
+        result = handshake => result?,
+    };
 
     let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
     // Bounded outbound queue, spec 3.1: at most 64 queued frames per session.
@@ -579,7 +632,13 @@ async fn serve_session(
                 }
                 incoming = ws.next() => {
                     let Some(message) = incoming else { break Ok(()) };
-                    let message = message?;
+                    let message = match message {
+                        Ok(message) => message,
+                        Err(error) => {
+                            close_on_capacity_error(&mut ws, &error).await;
+                            break Err(error.into());
+                        }
+                    };
                     match message {
                         Message::Binary(_) => {}
                         Message::Ping(p) => { ws.send(Message::Pong(p)).await?; continue }
