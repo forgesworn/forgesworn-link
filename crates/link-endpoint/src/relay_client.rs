@@ -13,7 +13,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::relay_socket::{RelayRoute, RelaySocket, SocketShutdown, WsMessage, send_retry};
-use crate::rendezvous_book::TagBook;
+use crate::rendezvous_book::{TagBook, TagResolver};
 use crate::rt;
 
 #[cfg(not(wasm_browser))]
@@ -872,6 +872,7 @@ async fn pump(
     activity: &RelayActivity,
 ) -> PumpEnd {
     let mut ping = rt::interval(PING_INTERVAL);
+    let mut resolver = book.map(|book| TagResolver::new(book, host));
     // Tag mode re-registers when the epoch turns or the book changes (a card
     // rotation upsert), so the relay always holds the previous, current and
     // next epoch's tags for the current pair set.
@@ -892,6 +893,9 @@ async fn pump(
                 let current = link_core::rendezvous::epoch_index(rt::unix_now());
                 let version = book.version();
                 if current != last_epoch || version != last_version {
+                    if let Some(resolver) = resolver.as_mut() {
+                        resolver.clear();
+                    }
                     last_epoch = current;
                     last_version = version;
                     let tags = book.registration(host, rt::unix_now());
@@ -906,6 +910,9 @@ async fn pump(
                     return PumpEnd::Lost;
                 }
                 let Some(book) = book else { continue };
+                if let Some(resolver) = resolver.as_mut() {
+                    resolver.clear();
+                }
                 last_epoch = link_core::rendezvous::epoch_index(rt::unix_now());
                 last_version = book.version();
                 let tags = book.registration(host, rt::unix_now());
@@ -948,12 +955,12 @@ async fn pump(
                             });
                         }
                         Some(Frame::RecvTag { tag, datagram }) => {
-                            let Some(book) = book else { return PumpEnd::Lost };
+                            let Some(resolver) = resolver.as_mut() else { return PumpEnd::Lost };
                             activity.tag_datagrams_received.fetch_add(1, Ordering::Relaxed);
                             // Attribute by this endpoint's own book; a tag it
                             // cannot resolve (a stale epoch, a removed pair) is
                             // dropped, which QUIC treats as loss.
-                            if let Some(peer) = book.resolve(&tag, host, rt::unix_now()) {
+                            if let Some(peer) = resolver.resolve(&tag, rt::unix_now()) {
                                 activity.tag_datagrams_resolved.fetch_add(1, Ordering::Relaxed);
                                 let _ = inbound.try_send(RelayInbound {
                                     source: peer,
