@@ -42,6 +42,12 @@ previously relied on signed card hints must pass the user's approved relay
 settings before adopting this build. Its retained cards and route secrets
 can be loaded with those settings.
 
+Native Rust callers can require a SOCKS5 or Tor proxy with
+`EndpointConfig::proxy_required`. The proxy resolves relay hostnames, and
+each connection keeps the configured relay's TLS verification. A proxy
+failure leaves Link retrying through the required proxy.
+[Native proxy routing](docs/native-proxy-routing.md)
+
 For the original Phase 0 identity relay protocol, select
 `EndpointConfig::legacy_identity`. This exposes the transport node ID to the
 relay. The Rust configuration also supports explicit
@@ -59,6 +65,10 @@ mid-transfer and recovered on the second relay in 258 ms (27 Aug) and 239 ms
 with no stall, flat memory across a four-times-larger transfer, and zero
 plaintext in two captures of a deliberately unencrypted relay hop.  What is still not proven
 is listed under [What this does NOT prove](#what-this-does-not-prove).
+
+The [November native transport record](acceptance/2026-11-25-native-transport.md)
+covers relay throughput with a paired roster, shaped direct UDP, path
+recovery and proxy-required verification.
 
 ## Crates
 

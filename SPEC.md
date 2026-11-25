@@ -208,7 +208,13 @@ At the limit the endpoint uses its configured home driver.
   sessions per source address, both counted from accept so an unauthenticated
   handshake cannot slip under them; a tag session (section 9) presents no
   identity, so the per-source cap is what stops one address holding every
-  slot.  Oversize or malformed frames close the session with reason `1`.
+  slot. TLS and the WebSocket upgrade have a ten-second limit from accept.
+  The challenge and first Link message have a further ten seconds. The relay
+  bounds each WebSocket frame and reassembled message to 4,099 bytes, the
+  size of a full tag registration. Oversize or malformed frames close the
+  session with reason `1` when the socket can carry it. After registration,
+  blocked writes have ten seconds to complete and terminal close messages
+  have one second.
 - **Superseded sessions.**  A node ID is registered by at most one identity
   session and a tag by at most two tag sessions (the two ends of one pair).
   A newer registration wins: the relay sends the oldest holder `close` with
@@ -222,8 +228,10 @@ At the limit the endpoint uses its configured home driver.
   legitimate two ends converge.
 - **What the relay learns.**  Node IDs of registered endpoints and who they
   talk to, source IP addresses of WSS sessions, timing and byte counts.  It
-  must log only routing tokens and counters, and must not persist node IDs past
-  the session.  It cannot learn anything inside a datagram: those are QUIC
+  may report instance-wide aggregates at fixed intervals. Its activity logs
+  must omit routing tokens, node IDs, source addresses, tags, frames and
+  per-session counters. It must not persist node IDs past the session.
+  It cannot learn anything inside a datagram: those are QUIC
   packets protected by the TLS 1.3 keys of the two endpoints.
 - **What it never learns.**  Nostr keys or events, blob plaintext or envelope
   keys, retention tier, content hashes unless an application puts them on the
