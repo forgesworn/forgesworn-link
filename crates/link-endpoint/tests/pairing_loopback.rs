@@ -4,7 +4,6 @@
 
 mod harness;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,12 +13,9 @@ use link_endpoint::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-async fn pairing_endpoint(relay: Option<&str>) -> Endpoint {
+async fn pairing_endpoint(relay: &str) -> Endpoint {
     let mut config = EndpointConfig::new(TransportKey::generate());
-    config.relays = relay.into_iter().map(RelaySpec::plain).collect();
-    config.allow_direct = false;
-    config.bind = "127.0.0.1:0".parse().unwrap();
-    config.rendezvous = Some(HashMap::new());
+    config.relays = vec![RelaySpec::plain(relay)];
     Endpoint::open(config).await.expect("endpoint opens")
 }
 
@@ -31,14 +27,12 @@ async fn accept_pairing(endpoint: Arc<Endpoint>) -> PairingSession {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn two_nodes_meet_from_the_pairing_secret_alone() {
+async fn two_nodes_pair_with_a_secret_over_the_approved_relay() {
     init_tracing();
     let relay = start_relay().await;
     let url = relay.url("127.0.0.1");
-    let box_endpoint = Arc::new(pairing_endpoint(Some(&url)).await);
-    // Match the Android bridge: it has no configured home relay and starts a
-    // driver from the Bothy card's relay hint only when pairing begins.
-    let keeper_endpoint = pairing_endpoint(None).await;
+    let box_endpoint = Arc::new(pairing_endpoint(&url).await);
+    let keeper_endpoint = pairing_endpoint(&url).await;
     let box_card = exchange_card(&box_endpoint);
     let secret = [0x5a; 16];
 
@@ -193,9 +187,7 @@ async fn two_nodes_meet_from_the_pairing_secret_alone() {
 
 #[tokio::test]
 async fn pairing_registration_requires_tag_mode_and_a_bounded_lifetime() {
-    let mut config = EndpointConfig::new(TransportKey::generate());
-    config.allow_direct = false;
-    config.bind = "127.0.0.1:0".parse().unwrap();
+    let config = EndpointConfig::legacy_identity(TransportKey::generate());
     let endpoint = Endpoint::open(config).await.expect("endpoint opens");
     assert!(
         endpoint
@@ -204,10 +196,7 @@ async fn pairing_registration_requires_tag_mode_and_a_bounded_lifetime() {
     );
     endpoint.close().await;
 
-    let mut config = EndpointConfig::new(TransportKey::generate());
-    config.allow_direct = false;
-    config.bind = "127.0.0.1:0".parse().unwrap();
-    config.rendezvous = Some(HashMap::new());
+    let config = EndpointConfig::new(TransportKey::generate());
     let endpoint = Endpoint::open(config).await.expect("tag endpoint opens");
     assert!(
         endpoint

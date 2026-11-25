@@ -740,7 +740,6 @@ pub async fn build(
 
 /// Build a relay-only path socket, which has no UDP socket, and start its
 /// relay receive task.  This is the only path socket a browser has.
-#[cfg(any(wasm_browser, test))]
 pub fn build_relay_only(
     key: TransportKey,
     relays: Vec<crate::relay_client::RelaySpec>,

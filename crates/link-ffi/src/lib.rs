@@ -20,6 +20,7 @@ uniffi::setup_scaffolding!();
 #[derive(uniffi::Record, Clone, Debug)]
 pub struct LinkConfig {
     pub transport_seed: Vec<u8>,
+    /// The relay destinations selected by the owner.
     pub relay_urls: Vec<String>,
     pub allow_direct: bool,
     pub routes: Vec<LinkRoute>,
@@ -624,7 +625,7 @@ mod tests {
         let engine = tokio::task::spawn_blocking(move || {
             LinkEngine::start(LinkConfig {
                 transport_seed: client_seed.to_vec(),
-                relay_urls: Vec::new(),
+                relay_urls: vec![relay_url],
                 allow_direct: false,
                 routes: vec![LinkRoute {
                     route_id: "circle-main".into(),
@@ -1083,7 +1084,7 @@ mod tests {
             move || {
                 LinkEngine::start(LinkConfig {
                     transport_seed: vec![0x35; 32],
-                    relay_urls: Vec::new(),
+                    relay_urls: vec![relay_url],
                     allow_direct: false,
                     routes: Vec::new(),
                 })

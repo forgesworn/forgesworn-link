@@ -192,7 +192,7 @@ async fn cancelling_endpoint_close_still_stops_its_relays() {
     let relay = start_relay().await;
     let mut endpoints = Vec::new();
     for _ in 0..2 {
-        let mut config = EndpointConfig::new(TransportKey::generate());
+        let mut config = EndpointConfig::legacy_identity(TransportKey::generate());
         config.relays = vec![RelaySpec::plain(relay.url("127.0.0.1"))];
         config.bind = "127.0.0.1:0".parse().unwrap();
         config.allow_direct = false;

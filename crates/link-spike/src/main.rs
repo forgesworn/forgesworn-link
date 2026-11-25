@@ -119,20 +119,55 @@ struct CardArgs {
 }
 
 #[derive(Args, Debug)]
-struct ServeArgs {
-    #[command(flatten)]
-    key: KeyArgs,
-    #[command(flatten)]
-    relay: RelayArgs,
-    /// Owner declines direct paths: stay on the relay whatever the peer offers.
+struct PathArgs {
+    /// Use Phase 0 identity routing, which shows the relay your node ID.
+    #[arg(long)]
+    legacy_identity: bool,
+    /// Let signed peer cards select additional relay destinations.
+    #[arg(long)]
+    allow_unconfigured_relays: bool,
+    /// Consent to direct paths and advertising UDP candidates.
+    #[arg(long, conflicts_with = "no_direct")]
+    allow_direct: bool,
+    /// Use only the relay (the default).
     #[arg(long)]
     no_direct: bool,
-    /// UDP reflector, usually the relay host with the reflector port.
+    /// UDP reflector for direct paths, usually the relay host and reflector port.
     #[arg(long)]
     reflector: Option<SocketAddr>,
     /// Local UDP bind for direct paths and probes.
     #[arg(long, default_value = "0.0.0.0:0")]
     bind: SocketAddr,
+}
+
+impl PathArgs {
+    fn endpoint_config(
+        &self,
+        key: TransportKey,
+        relays: Vec<RelaySpec>,
+    ) -> anyhow::Result<EndpointConfig> {
+        anyhow::ensure!(
+            self.legacy_identity,
+            "the Phase 0 spike requires explicit --legacy-identity for serve and send"
+        );
+        let mut config = EndpointConfig::legacy_identity(key);
+        config.relays = relays;
+        config.allow_unconfigured_relays = self.allow_unconfigured_relays;
+        config.allow_direct = self.allow_direct && !self.no_direct;
+        config.reflector = self.reflector;
+        config.bind = self.bind;
+        Ok(config)
+    }
+}
+
+#[derive(Args, Debug)]
+struct ServeArgs {
+    #[command(flatten)]
+    key: KeyArgs,
+    #[command(flatten)]
+    relay: RelayArgs,
+    #[command(flatten)]
+    path: PathArgs,
     /// Echo the payload back instead of only returning its digest.
     #[arg(long)]
     echo: bool,
@@ -147,18 +182,14 @@ struct SendArgs {
     key: KeyArgs,
     #[command(flatten)]
     relay: RelayArgs,
+    #[command(flatten)]
+    path: PathArgs,
     /// The peer's card, base64 or hex.
     #[arg(long)]
     card: String,
     /// Mebibytes to stream over one QUIC stream.
     #[arg(long, default_value_t = 8)]
     mib: usize,
-    #[arg(long)]
-    no_direct: bool,
-    #[arg(long)]
-    reflector: Option<SocketAddr>,
-    #[arg(long, default_value = "0.0.0.0:0")]
-    bind: SocketAddr,
     /// Settle on the relay for this many seconds before probing for a direct path.
     #[arg(long, default_value_t = 0)]
     settle: u64,
@@ -254,11 +285,7 @@ fn parse_card(text: &str) -> anyhow::Result<Card> {
 
 async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let key = args.key.load()?;
-    let mut config = EndpointConfig::new(key);
-    config.relays = args.relay.specs();
-    config.allow_direct = !args.no_direct;
-    config.reflector = args.reflector;
-    config.bind = args.bind;
+    let config = args.path.endpoint_config(key, args.relay.specs())?;
     let endpoint = Arc::new(Endpoint::open(config).await?);
 
     println!("node_id_base32 {}", endpoint.node_id().to_base32());
@@ -337,11 +364,7 @@ async fn serve_stream(session: &Session, echo: bool) -> anyhow::Result<usize> {
 async fn send(args: SendArgs) -> anyhow::Result<()> {
     let key = args.key.load()?;
     let card = parse_card(&args.card)?;
-    let mut config = EndpointConfig::new(key);
-    config.relays = args.relay.specs();
-    config.allow_direct = !args.no_direct;
-    config.reflector = args.reflector;
-    config.bind = args.bind;
+    let mut config = args.path.endpoint_config(key, args.relay.specs())?;
     config.probe_delay = Duration::from_secs(args.settle);
     let endpoint = Endpoint::open(config).await?;
 

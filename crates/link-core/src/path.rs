@@ -12,8 +12,8 @@ use serde::Serialize;
 #[serde(rename_all = "lowercase")]
 pub enum FailReason {
     Relay,
-    /// Tag mode has no rendezvous material for the requested peer.  This is
-    /// local routing state, not a relay outage or an identity failure.
+    /// Local policy has no rendezvous material or permitted advertised relay
+    /// for the requested peer.
     Rendezvous,
     Identity,
     Timeout,

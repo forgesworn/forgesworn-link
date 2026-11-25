@@ -53,7 +53,7 @@ async fn start_relay() -> RelayHandle {
 }
 
 async fn start_endpoint(relay_url: &str) -> Endpoint {
-    let mut config = EndpointConfig::new(TransportKey::generate());
+    let mut config = EndpointConfig::legacy_identity(TransportKey::generate());
     config.relays = vec![RelaySpec::plain(relay_url.to_string())];
     config.allow_direct = true;
     config.probe_delay = NEVER;

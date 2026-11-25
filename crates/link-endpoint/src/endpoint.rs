@@ -188,13 +188,17 @@ pub struct EndpointConfig {
     /// persists it for the lifetime of the key and updates it after every
     /// card.  `None` is suitable only for a newly minted key.
     pub serial_seed: Option<u64>,
+    /// Owner-configured relay destinations, in failover order.
     pub relays: Vec<RelaySpec>,
+    /// Explicitly permit signed cards to name other relay destinations.
+    /// Disabled by default. Leave it off to confine dials to `relays`.
+    pub allow_unconfigured_relays: bool,
     /// Owner consent for direct paths.  Relay-only is a first-class configuration.
     pub allow_direct: bool,
     /// Real UDP bind for direct paths and probes.
     pub bind: SocketAddr,
-    /// Optional reflector for the reflexive candidate, spec 3.2.  Asked at
-    /// open and again after every interface change.
+    /// Optional reflector for the reflexive candidate, spec 3.2. With direct
+    /// paths enabled it is asked at open and after interface changes.
     pub reflector: Option<SocketAddr>,
     /// How often the interface set is polled for a change, spec 4.2.  On a
     /// change every session re-queries the reflector, re-announces its
@@ -209,11 +213,10 @@ pub struct EndpointConfig {
     /// Maximum time `connect` waits for a relay welcome.  This bounds DNS,
     /// TCP, TLS, WebSocket and registration stalls before QUIC starts.
     pub rendezvous_timeout: Duration,
-    /// Tag-mode rendezvous material per peer, spec 9.  `Some` switches every
-    /// relay session to tag registration, so no node ID, Nostr key or
-    /// signature ever reaches a relay; `None` keeps the deployed identity
-    /// mode.  The shell computes the material from the pair's cards and Nostr
-    /// keys; the transport never touches Nostr.
+    /// Tag-mode rendezvous material per peer, spec 9. Either route map set
+    /// to `Some` selects tag registration without sending an identity to
+    /// the relay. The shell derives the material from the pair's cards and
+    /// Nostr keys.
     pub rendezvous: Option<HashMap<NodeId, RendezvousPeer>>,
     /// Product-authorised durable reachability routes derived from an accepted
     /// provisional pairing, keyed by the peer's current Link node ID.  Either
@@ -223,12 +226,15 @@ pub struct EndpointConfig {
 }
 
 impl EndpointConfig {
+    /// Start in tag mode with an empty book, relay-only and confined to
+    /// owner-configured relays. Install pairing material before dialling.
     pub fn new(key: TransportKey) -> Self {
         EndpointConfig {
             key,
             serial_seed: None,
             relays: Vec::new(),
-            allow_direct: cfg!(not(wasm_browser)),
+            allow_unconfigured_relays: false,
+            allow_direct: false,
             bind: "0.0.0.0:0".parse().expect("literal"),
             reflector: None,
             net_poll: if cfg!(wasm_browser) {
@@ -238,9 +244,52 @@ impl EndpointConfig {
             },
             probe_delay: Duration::ZERO,
             rendezvous_timeout: Duration::from_secs(30),
-            rendezvous: None,
+            rendezvous: Some(HashMap::new()),
             paired_routes: None,
         }
+    }
+
+    /// Select identity routing for peers using the original relay wire
+    /// contract. The relay learns the node ID. Direct paths and additional
+    /// relay destinations still require separate opt-in.
+    pub fn legacy_identity(key: TransportKey) -> Self {
+        Self {
+            rendezvous: None,
+            ..Self::new(key)
+        }
+    }
+
+    /// Select the card's destinations from the owner's configured relay specs,
+    /// retaining their failover order and TLS settings. An empty card relay
+    /// list uses the home driver.
+    fn peer_relays(&self, card: &Card) -> Result<Vec<RelaySpec>, FailReason> {
+        let hints = card.relay_urls();
+        if hints.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut advertised: Vec<_> = hints
+            .into_iter()
+            .map(RelaySpec::plain)
+            .filter_map(|hint| hint.parts().ok().map(|destination| (destination, hint)))
+            .collect();
+        let mut permitted = Vec::new();
+        for relay in &self.relays {
+            if let Ok(destination) = relay.parts()
+                && advertised.iter().any(|(hint, _)| hint == &destination)
+            {
+                permitted.push(relay.clone());
+                advertised.retain(|(hint, _)| hint != &destination);
+            }
+        }
+        if self.allow_unconfigured_relays {
+            permitted.extend(advertised.into_iter().map(|(_, relay)| relay));
+        }
+        if permitted.is_empty() {
+            warn!("connect refused: no peer relay matches the configured destinations");
+            return Err(FailReason::Rendezvous);
+        }
+        Ok(permitted)
     }
 }
 
@@ -268,22 +317,28 @@ impl Endpoint {
                 config.paired_routes.take().unwrap_or_default(),
             ))
         });
+        #[cfg(wasm_browser)]
+        browser_config_check(&config)?;
         #[cfg(not(wasm_browser))]
-        let (socket, paths) = {
+        let direct = if config.allow_direct {
             let net = NetMonitor::spawn(config.net_poll, crate::netmon::interface_snapshot);
-            crate::path_socket::build(
-                config.key.clone(),
-                config.bind,
-                config.relays.clone(),
-                book.clone(),
-                config.reflector,
-                net,
+            Some(
+                crate::path_socket::build(
+                    config.key.clone(),
+                    config.bind,
+                    config.relays.clone(),
+                    book.clone(),
+                    config.reflector,
+                    net,
+                )
+                .await?,
             )
-            .await?
+        } else {
+            None
         };
         #[cfg(wasm_browser)]
-        let (socket, paths) = {
-            browser_config_check(&config)?;
+        let direct = None;
+        let (socket, paths) = direct.unwrap_or_else(|| {
             let net = NetMonitor::spawn(Duration::ZERO, Vec::new);
             crate::path_socket::build_relay_only(
                 config.key.clone(),
@@ -291,7 +346,7 @@ impl Endpoint {
                 book.clone(),
                 net,
             )
-        };
+        });
 
         let mut endpoint_config = quinn::EndpointConfig::default();
         endpoint_config.max_udp_payload_size(MAX_MTU)?;
@@ -326,7 +381,9 @@ impl Endpoint {
             identity,
         };
 
-        if let Some(reflector) = endpoint.config.reflector {
+        if endpoint.config.allow_direct
+            && let Some(reflector) = endpoint.config.reflector
+        {
             endpoint.paths.query_reflector(reflector);
             // Give the reflector a moment before the first card or candidate list.
             rt::sleep(Duration::from_millis(200)).await;
@@ -406,11 +463,12 @@ impl Endpoint {
                 hints.push(Hint::udp(addr));
             }
         }
-        // The caller's extra hints are never dropped: the endpoint truncates
-        // its OWN relay and UDP hints into the space that remains, so an
-        // ephemeral rendezvous hint (0x04) survives any hint pressure instead
-        // of silently costing the pair its forward secrecy.
         let mut extra = extra;
+        if !self.config.allow_direct {
+            extra.retain(|hint| hint.kind != link_core::card::HINT_UDP);
+        }
+        // The caller's permitted hints take priority so an ephemeral
+        // rendezvous hint (0x04) survives pressure from endpoint hints.
         extra.truncate(link_core::card::MAX_HINTS);
         hints.truncate(link_core::card::MAX_HINTS - extra.len());
         hints.extend(extra);
@@ -489,7 +547,7 @@ impl Endpoint {
         Ok(config)
     }
 
-    /// Verify nothing here: `Card` can only exist verified or freshly signed.
+    /// Dial a verified or freshly signed card.
     pub async fn connect(&self, card: &Card) -> Result<Session, FailReason> {
         let peer = card.node_id;
         if peer == self.node_id() {
@@ -499,21 +557,14 @@ impl Endpoint {
             warn!("connect refused: no rendezvous material for the peer");
             return Err(FailReason::Rendezvous);
         }
+        let relays = self.config.peer_relays(card)?;
         self.paths.register_peer(peer);
         // Spec 4.3: one QUIC connection per peer, newest wins.  Take the slot
         // before the handshake: an earlier session with this peer is
         // superseded and its proof cleared, so the handshake goes over the
         // relay rather than to a socket the old session pointed at.
         let (session_id, superseded) = self.paths.begin_session(peer);
-        // Spec 3.1: dial the peer on the relays its card names, so two nodes
-        // need no shared configuration to meet.  A card with no relay hint
-        // means this endpoint's own relay.
-        let hints: Vec<RelaySpec> = card
-            .relay_urls()
-            .into_iter()
-            .map(RelaySpec::plain)
-            .collect();
-        let driver = self.paths.set_peer_relays(peer, &hints);
+        let driver = self.paths.set_peer_relays(peer, &relays);
         let relay = match Self::rendezvous(&driver, self.config.rendezvous_timeout).await {
             Ok(relay) => relay,
             Err(reason) => {
@@ -575,15 +626,11 @@ impl Endpoint {
             return Err(FailReason::Rendezvous);
         }
 
+        let relays = self.config.peer_relays(card)?;
         self.paths.register_peer(route);
         self.paths.register_peer(peer);
         let (session_id, superseded) = self.paths.begin_session(peer);
-        let hints: Vec<RelaySpec> = card
-            .relay_urls()
-            .into_iter()
-            .map(RelaySpec::plain)
-            .collect();
-        let driver = self.paths.set_peer_relays(route, &hints);
+        let driver = self.paths.set_peer_relays(route, &relays);
         self.paths.copy_relay_route(route, peer);
         let relay = match Self::rendezvous(&driver, self.config.rendezvous_timeout).await {
             Ok(relay) => relay,
@@ -875,6 +922,57 @@ fn transport_config_with(max_bidi_streams: u32, idle_timeout: Duration) -> quinn
 #[cfg(all(test, not(wasm_browser)))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_relay_selection_preserves_the_owners_order_and_tls_settings() {
+        let mut config = EndpointConfig::new(TransportKey::generate());
+        config.relays = vec![
+            RelaySpec::pinned("wss://first.example/link", "ab".repeat(32)),
+            RelaySpec::plain("wss://second.example/link"),
+        ];
+        let peer = TransportKey::generate();
+        let card = Card::sign(
+            &peer,
+            1,
+            60,
+            1,
+            vec![
+                Hint::relay("wss://SECOND.example:443/link"),
+                Hint::relay("wss://unconfigured.example/link"),
+                Hint::relay("wss://FIRST.example:443/link"),
+            ],
+        );
+        let selected = config.peer_relays(&card).expect("configured relays");
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].url, config.relays[0].url);
+        assert_eq!(selected[0].cert_sha256, config.relays[0].cert_sha256);
+        assert_eq!(selected[1].url, config.relays[1].url);
+
+        config.allow_unconfigured_relays = true;
+        let selected = config.peer_relays(&card).expect("explicit extra relay");
+        assert_eq!(selected.len(), 3);
+        assert_eq!(selected[0].cert_sha256, config.relays[0].cert_sha256);
+        assert_eq!(selected[2].url, "wss://unconfigured.example/link");
+    }
+
+    #[test]
+    fn relay_approval_is_bound_to_scheme_host_port_and_path() {
+        let mut config = EndpointConfig::new(TransportKey::generate());
+        config.relays = vec![RelaySpec::plain("wss://owner.example/link")];
+        let peer = TransportKey::generate();
+        for hint in [
+            "ws://owner.example:443/link",
+            "wss://unconfigured.example/link",
+            "wss://owner.example:9443/link",
+            "wss://owner.example/another",
+        ] {
+            let card = Card::sign(&peer, 1, 60, 1, vec![Hint::relay(hint)]);
+            assert!(matches!(
+                config.peer_relays(&card),
+                Err(FailReason::Rendezvous)
+            ));
+        }
+    }
 
     /// A browser endpoint is relay-only: an explicit request for a direct
     /// path or a reflector is refused rather than ignored, and so is any

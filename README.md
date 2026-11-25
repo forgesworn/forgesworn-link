@@ -1,11 +1,10 @@
 # ForgeSworn Link
 
-A wide-area transport lane for ForgeSworn storage: two nodes find a
-route, attempt a direct QUIC path, and fall back to an opaque relay, on
-upstream `quinn` and `rustls`, with no third-party endpoint IDs, discovery
-service or relay estate inside the contract and a relay that, in tag mode,
-learns no identity at all.  It is the native lane a Bothy box uses to mirror
-and repair between machines, and the planned lane for a Tor-less Wildbloom
+A wide-area transport lane for ForgeSworn storage. Two nodes find a route
+using an owner-selected relay and can attempt direct QUIC with consent.
+The transport uses upstream `quinn` and `rustls`. Relays in tag mode route
+by pair-scoped tags and receive no node ID. Bothy uses Link to mirror and
+repair between machines. Link is the planned lane for a Tor-less Wildbloom
 node, which today mirrors over Tor or HTTPS.
 
 We own the small contract that matters -- how a node identifies itself, how two
@@ -22,6 +21,32 @@ and session-keyed probes, the single TLS identity rule, and the narrow `Endpoint
 protocol over that surface and an optional `shelter-kit` `BlobFetcher` adapter,
 so a storage node mirrors and repairs over the lane through the same interface
 it uses for Tor and HTTPS.
+
+## Endpoint configuration
+
+`EndpointConfig::new` starts with an empty tag book and a relay-only path.
+Supply owner-approved `RelaySpec` entries in `relays`. The endpoint can idle
+until the application adds a paired route or a first-contact registration.
+Enable `allow_direct` with consent to advertise UDP candidates and attempt
+direct connections. In relay-only mode the native endpoint binds no UDP socket
+and leaves any configured reflector unused.
+
+When a card advertises relays, at least one destination must match the
+configured scheme, host, effective port and path. Link uses the matching
+owner-supplied relay specs, including their TLS settings and failover order.
+A card without relay hints uses the configured home relays.
+
+The Android and browser engines receive these approved destinations through
+`LinkConfig.relay_urls` and `relayUrls` respectively. An integration that
+previously relied on signed card hints must pass the user's approved relay
+settings before adopting this build. Its retained cards and route secrets
+can be loaded with those settings.
+
+For the original Phase 0 identity relay protocol, select
+`EndpointConfig::legacy_identity`. This exposes the transport node ID to the
+relay. The Rust configuration also supports explicit
+`allow_unconfigured_relays` for operators who trust peer cards to select
+additional destinations.
 
 ## Status
 
@@ -70,20 +95,23 @@ permissions and are ignored by git:
 ./target/release/link-spike keygen --out b.key
 ```
 
-Serve on one key.  It prints its own card, which is what the other side needs:
+Serve on one key. The spike uses Phase 0 identity routing and prints the
+signed card for the sending peer.
 
 ```sh
 ./target/release/link-spike serve \
+  --legacy-identity --allow-direct \
   --key-file b.key \
   --relay ws://127.0.0.1:9701/link \
   --reflector 127.0.0.1:9702 \
   --bind 127.0.0.1:0 --sessions 1
 ```
 
-Send from the other key, pasting the `card_b64` value the server printed:
+Send from the other key with the `card_b64` value the server printed.
 
 ```sh
 ./target/release/link-spike send \
+  --legacy-identity --allow-direct \
   --key-file a.key \
   --relay ws://127.0.0.1:9701/link \
   --reflector 127.0.0.1:9702 \
@@ -94,9 +122,8 @@ Send from the other key, pasting the `card_b64` value the server printed:
 Both sides print a `PathReport` as JSON on every transition and a final report
 with the SHA-256 of the payload.  `--settle N` holds the session on the relay
 for N seconds before the first probing round, which is how you watch a transfer
-run over the relay and then upgrade.  `--no-direct` on either side declines
-direct paths entirely: the session stays `Relayed` and the transfer still
-succeeds.
+run over the relay and then upgrade. Omit `--allow-direct` on either side
+for relay-only transfer.
 
 To watch relay failover, start a second relay and pass `--relay` twice in the
 same order on both sides, then kill the first relay mid-transfer.
@@ -167,10 +194,11 @@ acceptance record of spec section 7, a person has to do the following by hand.
 4. **Run the matrix, one row at a time,** recording each outcome separately and
    never inferring one from another: home NAT to home NAT, home NAT to carrier
    CGNAT, VPN egress, a network with UDP blocked outbound, and a LAN pair.  For
-   each, run `serve` on one side and `send --mib 256` on the other, and keep
-   both sides' JSON output.  The `status` field is the outcome; do not read
-   success as evidence of a direct path.
-5. **Force the relay-only row** with `--no-direct` on one side.  It must still
+   each, run `serve` on one side and `send --mib 256` on the other with
+   `--legacy-identity`. Pass `--allow-direct` on both sides for the direct
+   trials. Save both sides' JSON output and read the actual path from the
+   `status` field.
+5. **Force the relay-only row** by omitting `--allow-direct` on one side. It must
    succeed, and both reports must say `relayed`.
 6. **Force the failover row** by configuring two relays in the same order on
    both sides and killing the first mid-transfer.
@@ -309,14 +337,11 @@ convenience alone.
     drains below half.  When no relay session is up, the datagram is dropped as
     loss, so a reconnect can never deadlock the QUIC driver.
 
-12. **The dialer follows the card's relay hints.**  `connect` starts a relay
-    session on the relays the peer's card names (hint `0x01`) and the accepting
-    side answers on the relay the dialer's datagrams arrived on, so two nodes
-    with different relay configurations meet without agreeing a list.  The
-    endpoint's own configured list stays its home relay for accepting and for
-    peers whose card names no relay.  Per-peer sessions are bounded at sixteen.
-    A hint is a URL only, so a hinted `wss://` relay is verified against the
-    WebPKI roots; a relay that needs a pin is reachable only from configuration.
+12. **The dialler applies the owner's relay policy.** The dialler selects
+    configured destinations matching the peer's card hints (`0x01`) by default.
+    The owner can explicitly allow unconfigured hints for Phase 0 interoperability.
+    The accepting side answers on the relay the dialler used. The home relay
+    serves peers advertising no relay. Per-peer drivers are bounded at sixteen.
 13. **Raw public keys, not certificates.**  The spike presented a self-signed
     X.509 leaf whose SPKI was the node key and ignored everything else in it.
     The endpoint now presents the SPKI itself (RFC 7250, 44 bytes), which is

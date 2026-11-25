@@ -38,18 +38,15 @@ working exploit or a step-by-step extraction path.
   tier, or content hashes the application did not deliberately expose. Relay
   frames are bounded, authenticated and opaque; the payload is QUIC, encrypted
   end to end between the two endpoints.
-- **Identity at the relay is mode-dependent.** In tag mode (spec section 9,
-  [`docs/RENDEZVOUS.md`](docs/RENDEZVOUS.md), implemented end to end) a relay
-  session carries no node ID, Nostr key or signature at all: the relay matches
-  pair-scoped, per-epoch rendezvous tags it cannot link across relays or hours,
-  and never logs them. In identity mode -- the original spec 3.1 behaviour,
-  still the default -- the relay routes by the persistent node ID, so while a
-  session is live that relay sees which node IDs talk to each other. This is
-  metadata only (the payload stays opaque, TLS identity is unaffected), and the
-  design history is in
-  [`docs/relay-identity-privacy.md`](docs/relay-identity-privacy.md). The mode
-  is a per-deployment choice (`EndpointConfig.rendezvous`); a deployment that
-  wants the relay blind runs tag mode.
+- **Relay identity.** The default tag mode sends pair-scoped, per-epoch
+  [rendezvous tags](docs/RENDEZVOUS.md) to the relay and keeps node IDs and Nostr
+  keys off that wire. A relay can associate tags registered on the same
+  connection and observe IPs, timing and traffic volume. The original
+  identity mode is an explicit configuration and routes by persistent node ID.
+- **Network destinations.** The default accepts only owner-configured relays.
+  A signed card selects among permitted destinations. Native relay-only mode
+  binds no UDP socket, including when a reflector is configured. Enable
+  direct paths with consent to disclose network addresses to the peer.
 - The lane moves an authorised byte stream. It never promotes a storage claim,
   and relay success is never proof of durable custody.
 

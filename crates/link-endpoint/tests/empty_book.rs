@@ -30,12 +30,9 @@ async fn an_empty_book_idles_then_registers_on_the_first_upsert() {
         eph_x: [0x32; 32],
     };
 
-    // A opens tag mode with NO pairs at all.
+    // A opens with the default empty tag book.
     let mut config_a = EndpointConfig::new(key_a);
     config_a.relays = vec![RelaySpec::plain(url.clone())];
-    config_a.allow_direct = false;
-    config_a.bind = "127.0.0.1:0".parse().unwrap();
-    config_a.rendezvous = Some(HashMap::new());
     let a = Endpoint::open(config_a).await.expect("a opens peerless");
 
     // B knows A from the start.
@@ -54,6 +51,7 @@ async fn an_empty_book_idles_then_registers_on_the_first_upsert() {
         RelayStatus::Failed,
         "a peerless tag node must idle, not die"
     );
+    assert_eq!(a.paths().relay().home().activity().registrations_sent, 0);
 
     // The shell learns the pair (the Nostr claim arrives) and upserts it.
     a.rendezvous_book()
@@ -66,6 +64,7 @@ async fn an_empty_book_idles_then_registers_on_the_first_upsert() {
     let (session_a, session_b) = tokio::join!(a.connect(&card_b), b.accept());
     let session_a = session_a.expect("connect after the first upsert");
     let session_b = Arc::new(session_b.expect("accept"));
+    assert!(a.paths().relay().home().activity().registrations_sent > 0);
 
     let sink = spawn_sink(session_b.clone(), 1);
     send_and_verify(&session_a, 11, MIB)
