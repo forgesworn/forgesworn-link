@@ -25,14 +25,15 @@ working exploit or a step-by-step extraction path.
   the session. A captured probe opens under no other session; a replay into
   the same session earns at most one pong a second and a candidate that
   lapses in ten seconds.
-- **Authentication is not authorisation.** In identity mode any node with a
-  relay session can start a handshake with any node ID it knows, and the
-  transport pins the handshake to that ID; whether that node may talk to this
-  one is the application's decision, made on `Session::peer()` against its own
-  pairing set, exactly as with any other key-addressed transport. In tag mode
-  the relay path is authorised by construction: only a paired peer can derive
-  the rendezvous tag, so nobody else can reach the endpoint through the relay
-  at all.
+- **Relay admission.** In identity mode the relay verifies the connecting
+  node's signature. In tag mode a nonempty registration opens a routing
+  session within the relay's global and per-source limits. A private relay
+  needs an operator-controlled ingress boundary.
+- **Pairing.** Rendezvous tags grant reachability and are visible to the
+  relay. Pinned TLS authenticates the transport peer. A provisional pairing
+  session authenticates the listener's pinned key and verifies the dialler's
+  connection key. The application must validate its pairing secret inside
+  that session before granting authority. [Pairing contract](docs/PAIRING-RENDEZVOUS-DRAFT.md)
 - A relay may learn routing tokens, source addresses, timing and byte counts. It
   must not learn Nostr keys, application authorisation, blob plaintext, retention
   tier, or content hashes the application did not deliberately expose. Relay
@@ -47,12 +48,23 @@ working exploit or a step-by-step extraction path.
   A signed card selects among permitted destinations. Native relay-only mode
   binds no UDP socket, including when a reflector is configured. Enable
   direct paths with consent to disclose network addresses to the peer.
+- **Required proxy.** Native Rust callers can require that every relay
+  connection use a configured SOCKS5 or Tor proxy. Relay DNS resolution
+  happens at the proxy. Destination checks and relay TLS verification still
+  apply during reconnect and failover. [Native proxy routing](docs/native-proxy-routing.md)
+- **Relay logs.** The relay binary reports listener addresses at startup and
+  five-minute aggregate activity across the relay instance. Precise session
+  times, source addresses, routing tokens, tags and frames stay out of those
+  logs. Low-traffic intervals can still reveal the presence of activity.
+  Hosts embedding the library control dependency logging and can enable
+  `link_relay::summary` alone.
 - The lane moves an authorised byte stream. It never promotes a storage claim,
   and relay success is never proof of durable custody.
 
 ## Scope and status
 
-The Phase 0 contract is exercised on loopback and on the open internet (see
-`acceptance/`). There has been no third-party security audit and no adversarial
-TLS test that drives a full handshake with a mismatched key. Do not rely on this
-for a hostile-network deployment until that gate is met.
+The Phase 0 contract is exercised on loopback and on the open internet.
+Full TLS 1.3 tests verify wrong-key rejection on both sides and require a
+valid signature from the provisional dialler. Third-party security review
+remains an acceptance gate for hostile-network deployment.
+[Network acceptance](acceptance/) · [TLS tests](crates/link-core/tests/tls_handshake.rs)

@@ -1,14 +1,13 @@
 # Design: closing the relay identity leak
 
-**Status:** Design, not implemented. This raises a decision for the owners and
-does not change any wire format.
+This records the original Phase 0 identity-routing review. The current
+default uses rendezvous tags. [Current security model](../SECURITY.md)
 
 ## The problem
 
-`SECURITY.md` and the joint contract (T5) promise the relay learns only routing
-tokens, source addresses, timing and byte counts, and specifically **not** "the
-long-term identity behind a transport token." The implementation does not meet
-that promise.
+`SECURITY.md` and the joint contract (T5) originally promised that the relay
+learned only routing tokens, source addresses, timing and byte counts. Identity
+routing exposed the long-term identity behind each token.
 
 The relay routes by the persistent node ID:
 
@@ -17,8 +16,8 @@ The relay routes by the persistent node ID:
   (`crates/link-relay/src/lib.rs`).
 - A `Send` frame carries `destination: NodeId`, and the relay routes it with
   `sessions.get(&destination)`.
-- The 16-byte `Welcome` token exists, is sent to the client and logged, but is
-  **never used for routing.**
+- The 16-byte `Welcome` token is sent to the client and unused in routing.
+  Earlier relays logged it. Current activity logs report instance aggregates.
 
 So at runtime the relay holds, for every pair it carries, both endpoints'
 persistent transport identities and the fact that `NodeId A` is talking to

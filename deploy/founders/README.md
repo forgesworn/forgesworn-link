@@ -76,9 +76,10 @@ roots and no leaf pin. The selected source must include the logging and
 WebPKI fixes in PR #13 and the session limits in PR #16.
 
 Run at `RUST_LOG=info` and discard the Caddy access log using the supplied
-snippet. The TLS terminator sees client IPs while connections are active.
-Do not enable debug logging, log frames or record pairing material. Check
-the actual host's global logging configuration as well as this vhost.
+snippet. The relay binary logs listener addresses and five-minute instance
+aggregates. The TLS terminator sees client IPs while connections are active.
+Check the host's global logging configuration and Caddy's error logging
+separately from the vhost access log.
 
 ## Operator setup
 

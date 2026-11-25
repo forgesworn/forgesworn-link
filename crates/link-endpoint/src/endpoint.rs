@@ -20,6 +20,9 @@ use tracing::{info, warn};
 use crate::netmon::NetMonitor;
 use crate::path_socket::Paths;
 use crate::relay_client::{RelayActivitySnapshot, RelayDriver, RelaySpec, RelayStatus};
+#[cfg(not(wasm_browser))]
+use crate::relay_socket::RelayProxy;
+use crate::relay_socket::RelayRoute;
 use crate::rendezvous_book::{PairingRegistration, RendezvousPeer, TagBook};
 use crate::rt;
 use crate::session::{Session, Stream};
@@ -193,6 +196,11 @@ pub struct EndpointConfig {
     /// Explicitly permit signed cards to name other relay destinations.
     /// Disabled by default. Leave it off to confine dials to `relays`.
     pub allow_unconfigured_relays: bool,
+    /// Require every relay socket to use this SOCKS5 proxy. This native-only
+    /// mode requires verified WSS relays and rejects `allow_direct`,
+    /// `reflector` and `allow_unconfigured_relays`.
+    #[cfg(not(wasm_browser))]
+    pub proxy_required: Option<RelayProxy>,
     /// Owner consent for direct paths.  Relay-only is a first-class configuration.
     pub allow_direct: bool,
     /// Real UDP bind for direct paths and probes.
@@ -234,6 +242,8 @@ impl EndpointConfig {
             serial_seed: None,
             relays: Vec::new(),
             allow_unconfigured_relays: false,
+            #[cfg(not(wasm_browser))]
+            proxy_required: None,
             allow_direct: false,
             bind: "0.0.0.0:0".parse().expect("literal"),
             reflector: None,
@@ -257,6 +267,45 @@ impl EndpointConfig {
             rendezvous: None,
             ..Self::new(key)
         }
+    }
+
+    #[cfg(not(wasm_browser))]
+    fn relay_route(&self) -> anyhow::Result<RelayRoute> {
+        let Some(proxy) = self.proxy_required else {
+            return Ok(RelayRoute::Tcp);
+        };
+        anyhow::ensure!(
+            !self.allow_direct && self.reflector.is_none(),
+            "proxy-required endpoints cannot use direct UDP or a reflector"
+        );
+        anyhow::ensure!(
+            !self.allow_unconfigured_relays,
+            "proxy-required endpoints need owner-approved relay destinations"
+        );
+        let address = proxy.address();
+        anyhow::ensure!(
+            !address.ip().is_unspecified() && address.port() != 0,
+            "the proxy must have a specific IP address and port"
+        );
+        for relay in &self.relays {
+            let (tls, host, _, _) = relay.parts()?;
+            anyhow::ensure!(
+                tls && !relay.insecure_tls,
+                "proxy-required endpoints need certificate-verified wss:// relays"
+            );
+            if let Some(pin) = &relay.cert_sha256 {
+                anyhow::ensure!(
+                    pin.len() == 64 && pin.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                    "a relay pin must be a 64-character SHA-256 fingerprint"
+                );
+            } else {
+                anyhow::ensure!(
+                    !host.ends_with(".onion"),
+                    "a proxied .onion relay needs an owner-approved certificate pin"
+                );
+            }
+        }
+        Ok(RelayRoute::ProxyRequired(proxy))
     }
 
     /// Select the card's destinations from the owner's configured relay specs,
@@ -311,14 +360,19 @@ impl Endpoint {
             config.serial_seed != Some(u64::MAX),
             "card serial seed is exhausted"
         );
+        #[cfg(not(wasm_browser))]
+        let relay_route = config.relay_route()?;
+        #[cfg(wasm_browser)]
+        let relay_route = {
+            browser_config_check(&config)?;
+            RelayRoute::Tcp
+        };
         let book = (config.rendezvous.is_some() || config.paired_routes.is_some()).then(|| {
             Arc::new(TagBook::with_paired(
                 config.rendezvous.take().unwrap_or_default(),
                 config.paired_routes.take().unwrap_or_default(),
             ))
         });
-        #[cfg(wasm_browser)]
-        browser_config_check(&config)?;
         #[cfg(not(wasm_browser))]
         let direct = if config.allow_direct {
             let net = NetMonitor::spawn(config.net_poll, crate::netmon::interface_snapshot);
@@ -340,11 +394,12 @@ impl Endpoint {
         let direct = None;
         let (socket, paths) = direct.unwrap_or_else(|| {
             let net = NetMonitor::spawn(Duration::ZERO, Vec::new);
-            crate::path_socket::build_relay_only(
+            crate::path_socket::build_relay_only_with_route(
                 config.key.clone(),
                 config.relays.clone(),
                 book.clone(),
                 net,
+                relay_route,
             )
         });
 

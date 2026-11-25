@@ -1,13 +1,11 @@
-//! The native relay socket: TCP, TLS by `relay_tls`, then tungstenite.
-
-use std::time::Duration;
+//! The native relay socket: TCP or SOCKS5, TLS by `relay_tls`, then tungstenite.
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 
-use super::WsMessage;
+use super::{RelayRoute, WsMessage};
 use crate::relay_client::RelaySpec;
 
 pub trait Duplex: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -24,18 +22,25 @@ impl RelaySocket {
     pub async fn open(
         spec: &RelaySpec,
         _shutdown: &super::SocketShutdown,
+        route: RelayRoute,
     ) -> anyhow::Result<RelaySocket> {
         let (tls, host, port, path) = spec.parts()?;
-        let stream = crate::rt::timeout(
-            Duration::from_secs(10),
-            TcpStream::connect((host.as_str(), port)),
-        )
-        .await??;
-        stream.set_nodelay(true).ok();
+        let bare_host = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(&host);
+        let stream = match route {
+            RelayRoute::Tcp => {
+                let stream = TcpStream::connect((bare_host, port)).await?;
+                stream.set_nodelay(true).ok();
+                stream
+            }
+            RelayRoute::ProxyRequired(proxy) => proxy.connect(bare_host, port).await?,
+        };
 
         let transport: Box<dyn Duplex> = if tls {
             let connector = crate::relay_tls::connector(spec)?;
-            let server_name = rustls::pki_types::ServerName::try_from(host.clone())?;
+            let server_name = rustls::pki_types::ServerName::try_from(bare_host.to_owned())?;
             Box::new(connector.connect(server_name, stream).await?)
         } else {
             Box::new(stream)

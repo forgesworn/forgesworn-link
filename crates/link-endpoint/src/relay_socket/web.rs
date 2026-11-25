@@ -67,6 +67,7 @@ impl RelaySocket {
     pub async fn open(
         spec: &RelaySpec,
         shutdown: &super::SocketShutdown,
+        _route: super::RelayRoute,
     ) -> anyhow::Result<RelaySocket> {
         let url = spec.browser_url()?;
         let ws = WebSocket::new(&url)
@@ -258,18 +259,23 @@ mod tests {
         let spec = RelaySpec::plain("wss://relay.example/link");
         // Cancel an open while CONNECTING. No driver owns the socket now,
         // but its asynchronous close must still hold the barrier.
-        assert!(RelaySocket::open(&spec, &shutdown).now_or_never().is_none());
+        let route = super::super::RelayRoute::Tcp;
+        assert!(
+            RelaySocket::open(&spec, &shutdown, route)
+                .now_or_never()
+                .is_none()
+        );
         assert!(shutdown.wait().now_or_never().is_none());
         closeSocket(0);
         shutdown.wait().await;
 
         // A failed/replaced socket can remain CLOSING while its successor
         // connects and then closes. Waiting only for the latest is unsafe.
-        let mut first = Box::pin(RelaySocket::open(&spec, &shutdown));
+        let mut first = Box::pin(RelaySocket::open(&spec, &shutdown, route));
         assert!(first.as_mut().now_or_never().is_none());
         openLast();
         drop(first.await.unwrap());
-        let mut second = Box::pin(RelaySocket::open(&spec, &shutdown));
+        let mut second = Box::pin(RelaySocket::open(&spec, &shutdown, route));
         assert!(second.as_mut().now_or_never().is_none());
         openLast();
         drop(second.await.unwrap());

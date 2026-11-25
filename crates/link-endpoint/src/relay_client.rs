@@ -12,8 +12,8 @@ use rand::RngCore;
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, info, warn};
 
-use crate::relay_socket::{RelaySocket, SocketShutdown, WsMessage, send_retry};
-use crate::rendezvous_book::TagBook;
+use crate::relay_socket::{RelayRoute, RelaySocket, SocketShutdown, WsMessage, send_retry};
+use crate::rendezvous_book::{TagBook, TagResolver};
 use crate::rt;
 
 #[cfg(not(wasm_browser))]
@@ -314,6 +314,11 @@ pub struct RelayClient {
     key: TransportKey,
     book: Option<Arc<TagBook>>,
     inbound: mpsc::Sender<RelayInbound>,
+    route: RelayRoute,
+    /// The immutable owner list (including TLS settings) in proxy-required
+    /// mode. This also constrains callers of the lower-level driver API.
+    #[cfg(not(wasm_browser))]
+    proxy_relays: Option<Arc<Vec<RelaySpec>>>,
     /// One write-readiness set for the whole pool: a drain on any driver
     /// wakes quinn, which retries and is told again if its driver is full.
     readiness: Arc<WriteReadiness>,
@@ -372,6 +377,19 @@ impl RelayClient {
     /// to the home list is the home driver; an empty list is the home driver;
     /// past the fan-out bound it is the home driver too.
     pub fn driver_for(&self, relays: &[RelaySpec]) -> RelayDriver {
+        #[cfg(not(wasm_browser))]
+        let approved;
+        #[cfg(not(wasm_browser))]
+        let relays = if let Some(configured) = &self.proxy_relays {
+            approved = configured
+                .iter()
+                .filter(|spec| relays.iter().any(|requested| requested.url == spec.url))
+                .cloned()
+                .collect::<Vec<_>>();
+            &approved
+        } else {
+            relays
+        };
         let urls: Vec<String> = relays.iter().map(|spec| spec.url.clone()).collect();
         if urls.is_empty() || urls == *self.home.urls {
             return self.home.clone();
@@ -398,6 +416,7 @@ impl RelayClient {
             self.inbound.clone(),
             self.book.clone(),
             self.readiness.clone(),
+            self.route,
         );
         extra.insert(urls, driver.clone());
         self.by_id
@@ -530,6 +549,19 @@ pub fn spawn(
     inbound: mpsc::Sender<RelayInbound>,
     book: Option<Arc<TagBook>>,
 ) -> RelayClient {
+    spawn_with_route(key, relays, inbound, book, RelayRoute::Tcp)
+}
+
+pub(crate) fn spawn_with_route(
+    key: TransportKey,
+    relays: Vec<RelaySpec>,
+    inbound: mpsc::Sender<RelayInbound>,
+    book: Option<Arc<TagBook>>,
+    route: RelayRoute,
+) -> RelayClient {
+    #[cfg(not(wasm_browser))]
+    let proxy_relays =
+        matches!(route, RelayRoute::ProxyRequired(_)).then(|| Arc::new(relays.clone()));
     let readiness = Arc::new(WriteReadiness::default());
     let home = spawn_driver(
         0,
@@ -538,12 +570,16 @@ pub fn spawn(
         inbound.clone(),
         book.clone(),
         readiness.clone(),
+        route,
     );
     let by_id = HashMap::from([(0, home.clone())]);
     RelayClient {
         key,
         book,
         inbound,
+        route,
+        #[cfg(not(wasm_browser))]
+        proxy_relays,
         readiness,
         home,
         next_id: Arc::new(AtomicU64::new(1)),
@@ -560,6 +596,7 @@ fn spawn_driver(
     inbound: mpsc::Sender<RelayInbound>,
     book: Option<Arc<TagBook>>,
     readiness: Arc<WriteReadiness>,
+    route: RelayRoute,
 ) -> RelayDriver {
     let (outbound_tx, outbound_rx) = mpsc::channel::<Frame>(MAX_QUEUED_FRAMES);
     let (status_tx, status_rx) = watch::channel(RelayStatus::Connecting);
@@ -581,6 +618,7 @@ fn spawn_driver(
         book.clone(),
         activity.clone(),
         sockets.clone(),
+        route,
     );
     let stopped_events = events_tx.clone();
     let stopped_readiness = readiness.clone();
@@ -641,6 +679,7 @@ async fn driver(
     book: Option<Arc<TagBook>>,
     activity: Arc<RelayActivity>,
     sockets: SocketShutdown,
+    route: RelayRoute,
 ) {
     if relays.is_empty() {
         set_status(&status, &events, RelayStatus::Failed);
@@ -673,7 +712,7 @@ async fn driver(
         let book_changes = book.as_deref().map(TagBook::subscribe).unwrap_or(idle_rx);
         let attempt = rt::timeout(
             CONNECT_TIMEOUT,
-            connect(&key, &spec, book.as_deref(), &activity, &sockets),
+            connect(&key, &spec, book.as_deref(), &activity, &sockets, route),
         )
         .await
         .map_err(anyhow::Error::from)
@@ -770,14 +809,15 @@ async fn connect(
     book: Option<&TagBook>,
     activity: &RelayActivity,
     sockets: &SocketShutdown,
+    route: RelayRoute,
 ) -> anyhow::Result<RelaySocket> {
     let host = spec.host()?;
-    let mut ws = RelaySocket::open(spec, sockets).await?;
+    let mut ws = RelaySocket::open(spec, sockets, route).await?;
 
     // First contact: identity auth (spec 3.1) or tag registration (spec 9).
     let challenge = match next_frame(&mut ws).await? {
         Some(Frame::Challenge(challenge)) => challenge,
-        other => anyhow::bail!("expected a challenge, got {other:?}"),
+        _ => anyhow::bail!("expected a relay challenge"),
     };
     match book {
         None => {
@@ -804,7 +844,7 @@ async fn connect(
     }
     match next_frame(&mut ws).await? {
         Some(Frame::Welcome(_token)) => Ok(ws),
-        other => anyhow::bail!("expected a welcome, got {other:?}"),
+        _ => anyhow::bail!("expected a relay welcome"),
     }
 }
 
@@ -832,6 +872,7 @@ async fn pump(
     activity: &RelayActivity,
 ) -> PumpEnd {
     let mut ping = rt::interval(PING_INTERVAL);
+    let mut resolver = book.map(|book| TagResolver::new(book, host));
     // Tag mode re-registers when the epoch turns or the book changes (a card
     // rotation upsert), so the relay always holds the previous, current and
     // next epoch's tags for the current pair set.
@@ -852,6 +893,9 @@ async fn pump(
                 let current = link_core::rendezvous::epoch_index(rt::unix_now());
                 let version = book.version();
                 if current != last_epoch || version != last_version {
+                    if let Some(resolver) = resolver.as_mut() {
+                        resolver.clear();
+                    }
                     last_epoch = current;
                     last_version = version;
                     let tags = book.registration(host, rt::unix_now());
@@ -866,6 +910,9 @@ async fn pump(
                     return PumpEnd::Lost;
                 }
                 let Some(book) = book else { continue };
+                if let Some(resolver) = resolver.as_mut() {
+                    resolver.clear();
+                }
                 last_epoch = link_core::rendezvous::epoch_index(rt::unix_now());
                 last_version = book.version();
                 let tags = book.registration(host, rt::unix_now());
@@ -908,12 +955,12 @@ async fn pump(
                             });
                         }
                         Some(Frame::RecvTag { tag, datagram }) => {
-                            let Some(book) = book else { return PumpEnd::Lost };
+                            let Some(resolver) = resolver.as_mut() else { return PumpEnd::Lost };
                             activity.tag_datagrams_received.fetch_add(1, Ordering::Relaxed);
                             // Attribute by this endpoint's own book; a tag it
                             // cannot resolve (a stale epoch, a removed pair) is
                             // dropped, which QUIC treats as loss.
-                            if let Some(peer) = book.resolve(&tag, host, rt::unix_now()) {
+                            if let Some(peer) = resolver.resolve(&tag, rt::unix_now()) {
                                 activity.tag_datagrams_resolved.fetch_add(1, Ordering::Relaxed);
                                 let _ = inbound.try_send(RelayInbound {
                                     source: peer,

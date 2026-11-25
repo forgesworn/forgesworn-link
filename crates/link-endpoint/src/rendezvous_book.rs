@@ -7,34 +7,52 @@
 //! direction cannot drop a pair at an epoch boundary), the tag to send with,
 //! and the peer an inbound tag belongs to.
 
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::fmt;
+use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use link_core::id::NodeId;
 use link_core::rendezvous::{
-    PAIRED_ROUTE_SECRET_BYTES, PAIRING_SECRET_BYTES, Tag, TagCase, derive_paired_route_tag,
-    derive_pairing_tag, derive_tag, epoch_index,
+    PAIRED_ROUTE_SECRET_BYTES, PAIRING_SECRET_BYTES, TAG_BYTES, Tag, TagCase,
+    derive_paired_route_tag, derive_pairing_tag, derive_tag, epoch_index,
 };
+use link_core::wire::MAX_TAGS_PER_REGISTER;
 use rand::RngCore;
 use tokio::sync::watch;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 /// One pair's rendezvous material, as computed by the shell from the current
 /// cards.  `eph_x` is 32 zero bytes for `TagCase::None`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct RendezvousPeer {
     pub case: TagCase,
     pub static_x: [u8; 32],
     pub eph_x: [u8; 32],
 }
 
+impl fmt::Debug for RendezvousPeer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RendezvousPeer")
+            .field("case", &self.case)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Zeroize for RendezvousPeer {
+    fn zeroize(&mut self) {
+        self.static_x.zeroize();
+        self.eph_x.zeroize();
+    }
+}
+
 /// The registration window: previous, current and next epoch.
 const EPOCH_WINDOW: [i64; 3] = [-1, 0, 1];
 
 pub struct TagBook {
-    peers: Mutex<HashMap<NodeId, RendezvousPeer>>,
+    peers: Mutex<HashMap<NodeId, Zeroizing<RendezvousPeer>>>,
     /// Short-lived first-contact routes.  Their random local route IDs are
     /// never sent on the relay wire and are not authenticated identities.
     pairing: Mutex<HashMap<NodeId, PairingRoute>>,
@@ -132,7 +150,7 @@ impl Drop for PairingRegistration {
 #[derive(Default)]
 struct SendCache {
     host: String,
-    tags: HashMap<(NodeId, u64), Tag>,
+    tags: HashMap<(NodeId, u64), Zeroizing<[u8; TAG_BYTES]>>,
 }
 
 /// Bound on cached send tags: a roster of pairs times a few epochs.  Past it
@@ -150,7 +168,12 @@ impl TagBook {
     ) -> Self {
         let (changes, _) = watch::channel(0);
         TagBook {
-            peers: Mutex::new(peers),
+            peers: Mutex::new(
+                peers
+                    .into_iter()
+                    .map(|(peer, material)| (peer, Zeroizing::new(material)))
+                    .collect(),
+            ),
             pairing: Mutex::new(HashMap::new()),
             paired: Mutex::new(paired),
             version: AtomicU64::new(0),
@@ -160,7 +183,7 @@ impl TagBook {
     }
 
     fn bump(&self) {
-        let version = self.version.fetch_add(1, Ordering::Relaxed) + 1;
+        let version = self.version.fetch_add(1, Ordering::Release) + 1;
         self.changes.send_replace(version);
         self.send_cache.lock().expect("send cache").tags.clear();
     }
@@ -169,7 +192,10 @@ impl TagBook {
     /// registration follows within a minute; the three-epoch window covers the
     /// seam.
     pub fn upsert(&self, peer: NodeId, material: RendezvousPeer) {
-        self.peers.lock().expect("book").insert(peer, material);
+        self.peers
+            .lock()
+            .expect("book")
+            .insert(peer, Zeroizing::new(material));
         self.bump();
     }
 
@@ -365,7 +391,7 @@ impl TagBook {
 
     /// Monotone change counter; the relay pump re-registers when it moves.
     pub fn version(&self) -> u64 {
-        self.version.load(Ordering::Relaxed)
+        self.version.load(Ordering::Acquire)
     }
 
     pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
@@ -453,7 +479,7 @@ impl TagBook {
             cache.tags.clear();
         }
         if let Some(tag) = cache.tags.get(&(peer, epoch)) {
-            return Some(*tag);
+            return Some(Tag(**tag));
         }
         let tag = if let Some(tag) = {
             let pairing = self.pairing.lock().expect("pairing book");
@@ -500,7 +526,7 @@ impl TagBook {
         if cache.tags.len() >= SEND_CACHE_CAP {
             cache.tags.clear();
         }
-        cache.tags.insert((peer, epoch), tag);
+        cache.tags.insert((peer, epoch), Zeroizing::new(tag.0));
         Some(tag)
     }
 
@@ -509,6 +535,24 @@ impl TagBook {
     /// registered, which the caller drops.
     pub fn resolve(&self, tag: &Tag, relay_host: &str, now_unix: u64) -> Option<NodeId> {
         self.prune_expired(now_unix);
+        self.visit_tags(relay_host, now_unix, |peer, candidate, _| {
+            if candidate == *tag {
+                ControlFlow::Break(peer)
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .break_value()
+    }
+
+    /// Enumerate in the same order as one-off resolution, including the
+    /// admission expiry for an index that can outlive this call.
+    fn visit_tags<B>(
+        &self,
+        relay_host: &str,
+        now_unix: u64,
+        mut visit: impl FnMut(NodeId, Tag, Option<u64>) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
         let peers = self.peers.lock().expect("book");
         let epochs = self.window(now_unix);
         for (peer, material) in peers.iter() {
@@ -520,23 +564,20 @@ impl TagBook {
                     relay_host,
                     *epoch,
                 );
-                if candidate == *tag {
-                    return Some(*peer);
-                }
+                visit(*peer, candidate, None)?;
             }
         }
         drop(peers);
         let pairing = self.pairing.lock().expect("pairing book");
         for (route_id, route) in pairing.iter() {
             for epoch in &epochs {
-                let admission_matches = route.admission.as_ref().is_some_and(|admission| {
-                    derive_pairing_tag(&admission.secret, relay_host, *epoch) == *tag
-                });
-                let live_matches = route.live.as_ref().is_some_and(|live| {
-                    derive_pairing_tag(&live.secret, relay_host, *epoch) == *tag
-                });
-                if admission_matches || live_matches {
-                    return Some(*route_id);
+                if let Some(admission) = &route.admission {
+                    let candidate = derive_pairing_tag(&admission.secret, relay_host, *epoch);
+                    visit(*route_id, candidate, Some(admission.expires_at))?;
+                }
+                if let Some(live) = &route.live {
+                    let candidate = derive_pairing_tag(&live.secret, relay_host, *epoch);
+                    visit(*route_id, candidate, None)?;
                 }
             }
         }
@@ -544,12 +585,104 @@ impl TagBook {
         let paired = self.paired.lock().expect("paired book");
         for (peer, secret) in paired.iter() {
             for epoch in &epochs {
-                if derive_paired_route_tag(secret, relay_host, *epoch) == *tag {
-                    return Some(*peer);
-                }
+                let candidate = derive_paired_route_tag(secret, relay_host, *epoch);
+                visit(*peer, candidate, None)?;
             }
         }
-        None
+        ControlFlow::Continue(())
+    }
+}
+
+/// The receive index is owned by one live relay pump and scoped to its host.
+/// Scope changes are checked before every lookup, including cache misses.
+pub(crate) struct TagResolver<'a> {
+    book: &'a TagBook,
+    host: &'a str,
+    index: Option<TagIndex>,
+}
+
+struct TagIndex {
+    version: u64,
+    epoch: u64,
+    expires_at: Option<u64>,
+    /// A book larger than one relay registration uses one-off resolution.
+    by_tag: Option<HashMap<IndexedTag, NodeId>>,
+}
+
+#[derive(PartialEq, Eq, Hash)]
+struct IndexedTag(Tag);
+
+impl Borrow<Tag> for IndexedTag {
+    fn borrow(&self) -> &Tag {
+        &self.0
+    }
+}
+
+impl Drop for IndexedTag {
+    fn drop(&mut self) {
+        let Tag(bytes) = &mut self.0;
+        bytes.zeroize();
+    }
+}
+
+impl<'a> TagResolver<'a> {
+    pub(crate) fn new(book: &'a TagBook, host: &'a str) -> Self {
+        Self {
+            book,
+            host,
+            index: None,
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.index = None;
+    }
+
+    pub(crate) fn resolve(&mut self, tag: &Tag, now_unix: u64) -> Option<NodeId> {
+        let epoch = epoch_index(now_unix);
+        let version = self.book.version();
+        if self.index.as_ref().is_none_or(|index| {
+            index.version != version
+                || index.epoch != epoch
+                || index.expires_at.is_some_and(|expiry| now_unix >= expiry)
+        }) {
+            self.index = self.build_index(epoch, now_unix);
+        }
+        match self.index.as_ref().and_then(|index| index.by_tag.as_ref()) {
+            Some(index) => index.get(tag).copied(),
+            None => self.book.resolve(tag, self.host, now_unix),
+        }
+    }
+
+    fn build_index(&self, epoch: u64, now_unix: u64) -> Option<TagIndex> {
+        // Retire expired admission secrets before taking the snapshot.
+        self.book.prune_expired(now_unix);
+        let version = self.book.version();
+        let mut by_tag = HashMap::with_capacity(MAX_TAGS_PER_REGISTER);
+        let mut expires_at = None::<u64>;
+        let mut visited = 0;
+        let visit = self
+            .book
+            .visit_tags(self.host, now_unix, |peer, tag, expiry| {
+                if visited == MAX_TAGS_PER_REGISTER {
+                    return ControlFlow::Break(());
+                }
+                visited += 1;
+                // First match wins, just as in TagBook::resolve.
+                by_tag.entry(IndexedTag(tag)).or_insert(peer);
+                if let Some(expiry) = expiry {
+                    expires_at = Some(expires_at.map_or(expiry, |current| current.min(expiry)));
+                }
+                ControlFlow::Continue(())
+            });
+        // If an update landed while building, resolve against the live book
+        // for this packet and rebuild on the following receive.
+        (version == self.book.version()).then_some(TagIndex {
+            version,
+            epoch,
+            expires_at,
+            by_tag: visit.is_continue().then_some(by_tag),
+        })
     }
 }
 
@@ -567,6 +700,14 @@ mod tests {
 
     fn node(byte: u8) -> NodeId {
         NodeId([byte; 32])
+    }
+
+    #[test]
+    fn debug_output_omits_shared_secrets() {
+        assert_eq!(
+            format!("{:?}", material(10)),
+            "RendezvousPeer { case: Both, .. }"
+        );
     }
 
     #[test]
@@ -741,5 +882,72 @@ mod tests {
         assert!(registration.is_active(now));
         assert!(!registration.is_active(now + 1));
         assert_eq!(book.pairing_count(now + 1), 0);
+    }
+
+    #[test]
+    fn receive_index_observes_book_epoch_and_host_changes() {
+        let now = 1_793_588_888;
+        let host = "relay.example.org";
+        let peer = node(7);
+        let book = TagBook::new(HashMap::new());
+        book.upsert_paired(peer, [0x23; PAIRED_ROUTE_SECRET_BYTES]);
+        let mut resolver = TagResolver::new(&book, host);
+        let original = book.tag_for_send(peer, host, now).unwrap();
+        assert_eq!(resolver.resolve(&original, now), Some(peer));
+        assert_eq!(resolver.resolve(&original, now + 3600), Some(peer));
+        assert_eq!(resolver.resolve(&original, now + 7200), None);
+        assert_eq!(
+            TagResolver::new(&book, "other.example.org").resolve(&original, now),
+            None
+        );
+
+        assert_eq!(resolver.resolve(&original, now), Some(peer));
+        book.upsert_paired(peer, [0x24; PAIRED_ROUTE_SECRET_BYTES]);
+        let rotated = book.tag_for_send(peer, host, now).unwrap();
+        assert_eq!(resolver.resolve(&original, now), None);
+        assert_eq!(resolver.resolve(&rotated, now), Some(peer));
+        book.remove_paired(peer);
+        assert_eq!(resolver.resolve(&rotated, now), None);
+    }
+
+    #[test]
+    fn receive_index_expires_admission_without_disrupting_live_drain() {
+        let now = 1_793_588_888;
+        let host = "relay.example.org";
+        let book = Arc::new(TagBook::new(HashMap::new()));
+        let registration = book.register_pairing([0x23; PAIRING_SECRET_BYTES], now + 1);
+        let route = registration.route();
+        let admission = book.tag_for_send(route, host, now).unwrap();
+        let live_secret = [0x24; PAIRING_SECRET_BYTES];
+        assert!(book.promote_pairing(route, live_secret, 9, now));
+        let live = derive_pairing_tag(&live_secret, host, epoch_index(now));
+
+        let mut resolver = TagResolver::new(&book, host);
+        assert_eq!(resolver.resolve(&admission, now), Some(route));
+        assert_eq!(resolver.resolve(&live, now), Some(route));
+        assert_eq!(resolver.resolve(&admission, now + 1), None);
+        assert_eq!(resolver.resolve(&live, now + 1), Some(route));
+        assert!(book.remove_live_pairing(route, 9));
+        assert_eq!(resolver.resolve(&live, now + 1), None);
+    }
+
+    #[test]
+    fn receive_index_preserves_resolution_precedence_and_is_bounded() {
+        let now = 1_793_588_888;
+        let host = "relay.example.org";
+        let book = TagBook::new(HashMap::from([
+            (node(7), material(23)),
+            (node(8), material(23)),
+        ]));
+        let tag = book.tag_for_send(node(7), host, now).unwrap();
+        let mut resolver = TagResolver::new(&book, host);
+        assert_eq!(resolver.resolve(&tag, now), book.resolve(&tag, host, now));
+        assert!(resolver.index.as_ref().unwrap().by_tag.is_some());
+
+        for value in 9..100 {
+            book.upsert(node(value), material(value));
+        }
+        assert_eq!(resolver.resolve(&tag, now), book.resolve(&tag, host, now));
+        assert!(resolver.index.as_ref().unwrap().by_tag.is_none());
     }
 }
