@@ -119,6 +119,8 @@ through a relay you choose. Run the receiver, share its one-use invite and
 send a file. Both endpoints report the verified SHA-256, and the guide
 includes a local check of what the relay can see.
 
+How these crates relate to Bothy Node, KithMoot, Shelter Kit, Wildbloom Node and Link relays: [`docs/ECOSYSTEM.md`](docs/ECOSYSTEM.md).
+
 ## Running the loopback demo
 
 This Phase 0 example uses legacy identity routing. Use the paired

@@ -57,6 +57,7 @@ SPEC.md                 the Phase 0 protocol specification
 | `crates/link-endpoint/src/endpoint.rs` | `Endpoint`, `EndpointConfig`, pairing |
 | `crates/link-endpoint/src/path_socket.rs` | The `AsyncUdpSocket` implementation that moves between relay and direct |
 | `SPEC.md` | Protocol specification |
+| `docs/ECOSYSTEM.md` | Direct neighbours of Link and the interface to each |
 | `vectors/` | Frozen card and wire-format test vectors |
 
 ## Common Pitfalls
