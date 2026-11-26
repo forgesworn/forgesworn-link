@@ -1686,15 +1686,23 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "clap",
+ "futures-util",
  "hex",
  "link-core",
  "link-endpoint",
+ "link-relay",
+ "rand 0.8.8",
  "rustls",
  "serde_json",
  "sha2 0.10.9",
+ "subtle",
+ "tempfile",
  "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
