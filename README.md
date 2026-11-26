@@ -22,6 +22,7 @@ The starter runs both peers and the WSS relay on loopback and prints
 `Verified echo: hello, Link! (path=relayed)` once the reply matches.
 
 - [Embed Link in a Rust app](examples/paired-echo/README.md) with a copyable starter and a pinned Cargo dependency.
+- [Use a saved pairing across restarts](examples/paired-files/README.md) with a copyable two-machine Rust file-transfer app.
 - [Send a file between machines](docs/paired-quickstart.md) over your own relay.
 - [Build the browser package](scripts/build-link-web.sh) or [use the Android bridge](docs/ANDROID-BRIDGE.md) for browser or Kotlin clients.
 - [Find other ForgeSworn libraries and tools](https://forgesworn.dev/llms.txt) by task and runtime.

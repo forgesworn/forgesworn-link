@@ -10,6 +10,10 @@ publish.workspace = true
 name = "link-spike"
 path = "src/main.rs"
 
+[[example]]
+name = "paired-files"
+path = "../../examples/paired-files/src/main.rs"
+
 [dependencies]
 link-core = { path = "../link-core" }
 link-endpoint = { path = "../link-endpoint" }
@@ -19,6 +23,7 @@ clap.workspace = true
 hex.workspace = true
 rand.workspace = true
 rustls.workspace = true
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
 subtle = "2.6"

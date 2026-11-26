@@ -1,0 +1,25 @@
+[package]
+name = "link-paired-files"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.1"
+license = "MIT"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+link-core = { git = "https://github.com/forgesworn/forgesworn-link.git", rev = "2a7db35b0718438dbba9d0f2ff06c323d07b96e0" }
+link-endpoint = { git = "https://github.com/forgesworn/forgesworn-link.git", rev = "2a7db35b0718438dbba9d0f2ff06c323d07b96e0" }
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2.6"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "fs", "time"] }
+zeroize = "1"
