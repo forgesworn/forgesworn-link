@@ -104,11 +104,10 @@ async fn relay_reports_activity_in_aggregate_while_connections_are_live() {
 
     tokio::time::pause();
     // Flush the live sessions' counters before the relay's reporting tick.
-    tokio::time::advance(Duration::from_secs(10)).await;
-    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
     assert_eq!(read_log().lines().count(), 1, "no early activity event");
-    tokio::time::advance(Duration::from_secs(290)).await;
-    tokio::task::yield_now().await;
+    // Wake one second after the deadline so Tokio polls the report timer first.
+    tokio::time::sleep(Duration::from_secs(291)).await;
 
     let output = read_log();
     let mut lines = output.lines();
@@ -130,8 +129,7 @@ async fn relay_reports_activity_in_aggregate_while_connections_are_live() {
     for field in ["token=", "source=127.", "tag=", "node_id=", "fixture"] {
         assert!(!output.contains(field), "unexpected log field {field}");
     }
-    tokio::time::advance(Duration::from_secs(300)).await;
-    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_secs(300)).await;
     let output = read_log();
     assert_eq!(output.lines().count(), 3);
     let next_report = output.lines().last().unwrap();
