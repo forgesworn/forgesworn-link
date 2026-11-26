@@ -109,6 +109,8 @@ The [native Link and Iroh comparison](acceptance/2026-11-26-iroh-native.md)
 measures fresh relay connections, direct and relayed goodput, and CPU per GiB.
 The [direct UDP profile and Pi 5 results](acceptance/2026-11-26-direct-udp.md)
 measure Linux receive-buffer drops and direct performance on physical hardware.
+The [batched UDP comparison](acceptance/2026-11-26-batched-udp.md)
+records send and receive batching, peer proofs and relay recovery on the Pi 5.
 The [private relay LAN trial](acceptance/2026-11-26-private-relay-lan.md)
 covers saved pairing, live revocation and relay shutdown between a Mac and
 a Raspberry Pi.

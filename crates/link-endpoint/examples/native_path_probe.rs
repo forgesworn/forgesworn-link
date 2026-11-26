@@ -266,13 +266,14 @@ async fn throughput(mode: &str, samples: usize) -> Result<()> {
     Ok(())
 }
 
-async fn recover(handover: bool) -> Result<(Duration, Duration)> {
+async fn recover(handover: bool, response_bytes: usize) -> Result<(Duration, Duration)> {
     let pair = Pair::start(true, true, 0).await?;
     let original = pair.gateway().await?;
     pair.advertise(&original);
     pair.wait_path(PathStatus::Direct, Some(original.addrs))
         .await?;
     let digest = expected(SMALL);
+    let response_digest = expected(response_bytes);
     let exercise = async {
         timeout(
             Duration::from_secs(5),
@@ -296,7 +297,7 @@ async fn recover(handover: bool) -> Result<(Duration, Duration)> {
             async {
                 timeout(
                     Duration::from_secs(45),
-                    transfer(&pair.sending, SMALL, digest),
+                    transfer(&pair.sending, response_bytes, response_digest),
                 )
                 .await??;
                 Ok::<_, anyhow::Error>(start.elapsed())
@@ -337,7 +338,7 @@ async fn main() -> Result<()> {
             for offset in (0..samples).step_by(4) {
                 let mut batch = JoinSet::new();
                 for _ in offset..samples.min(offset + 4) {
-                    batch.spawn(recover(handover));
+                    batch.spawn(recover(handover, SMALL));
                 }
                 while let Some(sample) = batch.join_next().await {
                     let (response, selected_path) = sample??;
@@ -361,12 +362,19 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_stalled_request_recovers_on_the_same_session() -> Result<()> {
-        let (response, selected_path) = recover(false).await?;
+        let (response, selected_path) = recover(false, SMALL).await?;
         // Leave room for a loaded CI host while catching the 15 s expiry path.
         ensure!(
             response.max(selected_path) < Duration::from_secs(6),
             "direct loss did not recover promptly: {response:?}, {selected_path:?}"
         );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_bulk_response_can_use_the_relay_after_losing_direct_udp() -> Result<()> {
+        recover(false, BULK).await?;
         Ok(())
     }
 
