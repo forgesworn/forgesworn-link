@@ -19,6 +19,7 @@ fetch with optional `shelter-kit` integration.
 ## Getting Started
 
 - [Native Rust starter](examples/paired-echo/README.md): Run `cargo run --locked` from `examples/paired-echo` to test a paired echo over loopback WSS. Copy the directory into a new app or add `link-endpoint` at the pinned git revision shown in the guide.
+- [Saved pairing in a Rust app](examples/paired-files/README.md): Copy the standalone project to enrol two devices through an approved relay, verify a file transfer, and send another file after both devices load their saved pairing.
 - [Paired file quickstart](docs/paired-quickstart.md): Run a sender and receiver on separate machines with a one-use invite and your chosen relay.
 - [Endpoint configuration](README.md#endpoint-configuration): Configure owner-approved relay URLs, tag-mode routing and direct-path opt-in.
 

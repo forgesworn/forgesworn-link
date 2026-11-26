@@ -5,6 +5,9 @@ authenticate first contact, then sends the file on a separate paired Link
 session. The demo generates fresh transport keys for the transfer. Keep
 the five-minute invite private and share it over a trusted channel.
 
+For a copyable Rust app that reuses the pairing on a later run, see
+[Paired file transfers in Rust](../examples/paired-files/README.md).
+
 Build on both machines from the repository root.
 
 ```sh
