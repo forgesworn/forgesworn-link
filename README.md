@@ -53,6 +53,13 @@ Enable `allow_direct` with consent to advertise UDP candidates and attempt
 direct connections. In relay-only mode the native endpoint binds no UDP socket
 and leaves any configured reflector unused.
 
+With direct UDP enabled, Link leaves detected VPN and overlay interface
+addresses out of automatically generated card hints and session candidates.
+Ordinary LAN addresses, including IPv6 unique local addresses, remain
+eligible. Set `EndpointConfig::allow_overlay_candidates` for intentional
+peering over an overlay. The diagnostic CLI exposes the same opt-in as
+`--allow-overlay-candidates` alongside `--allow-direct`.
+
 When a card advertises relays, at least one destination must match the
 configured scheme, host, effective port and path. Link uses the matching
 owner-supplied relay specs, including their TLS settings and failover order.

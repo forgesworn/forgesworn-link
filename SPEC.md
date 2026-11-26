@@ -287,14 +287,20 @@ finding:* "first stream" is a rule the implementation must enforce, not hope
 for.  A session is handed to the application only after its control stream
 has been opened; otherwise an application stream can win the lower stream ID
 under load, be mistaken for the control stream and reset mid-transfer.  A
-control stream that goes quiet is held open, never dropped.  Each side sends
-its candidate list: every interface address of the socket's family that is
-neither loopback nor link-local, the default route's address first and at
-most eight, then loopback, then the reflector result.  *Spike finding:* a
-list holding only the default route's address made a LAN pair fall back to
-the relay whenever a VPN held the default route, because the LAN address was
-never offered.  Each side then sends session-keyed probes over UDP to every
-candidate of the other side.
+control stream that goes quiet is held open, never dropped.  For a wildcard
+UDP bind, each side offers eligible interface addresses of the socket's
+family, excluding unspecified and link-local addresses.  The eligible
+default-route address comes first and the loopback address comes last, with
+up to eight local addresses in total.  An explicit bind contributes its own
+address if eligible.  The optional reflector result follows the local
+addresses.  Local addresses on detected tunnel or overlay
+interfaces are eligible only with separate owner consent.  This applies to
+automatic UDP hints in signed cards as well as session candidate messages.
+This policy uses interface metadata so ordinary IPv6 unique local addresses
+remain eligible.  *Spike finding:* a list holding only the default route's
+address made a LAN pair fall back to the relay whenever a VPN held the
+default route, because the LAN address was never offered.  Each side then
+sends session-keyed probes over UDP to every candidate of the other side.
 
 Probes are bound to the session, not to the node keys (probe version 2).
 After the QUIC handshake each side exports 40 bytes of keying material

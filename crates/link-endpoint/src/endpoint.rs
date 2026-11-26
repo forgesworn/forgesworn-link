@@ -203,6 +203,10 @@ pub struct EndpointConfig {
     pub proxy_required: Option<RelayProxy>,
     /// Owner consent for direct paths.  Relay-only is a first-class configuration.
     pub allow_direct: bool,
+    /// With direct paths enabled, advertise addresses on detected tunnels and
+    /// overlays. Defaults to false. This controls automatic candidates only.
+    #[cfg(not(wasm_browser))]
+    pub allow_overlay_candidates: bool,
     /// Real UDP bind for direct paths and probes.
     pub bind: SocketAddr,
     /// Optional reflector for the reflexive candidate, spec 3.2. With direct
@@ -245,6 +249,8 @@ impl EndpointConfig {
             #[cfg(not(wasm_browser))]
             proxy_required: None,
             allow_direct: false,
+            #[cfg(not(wasm_browser))]
+            allow_overlay_candidates: false,
             bind: "0.0.0.0:0".parse().expect("literal"),
             reflector: None,
             net_poll: if cfg!(wasm_browser) {
@@ -396,6 +402,7 @@ impl Endpoint {
                     book.clone(),
                     config.reflector,
                     net,
+                    config.allow_overlay_candidates,
                 )
                 .await?,
             )

@@ -51,6 +51,13 @@ working exploit or a step-by-step extraction path.
   A signed card selects among permitted destinations. Native relay-only mode
   binds no UDP socket, including when a reflector is configured. Enable
   direct paths with consent to disclose network addresses to the peer.
+- **Direct candidates.** By default, native candidate gathering skips local
+  addresses on interfaces detected by point-to-point flags and common tunnel
+  names. With interface enumeration unavailable, automatic advertisements
+  are limited to same-host loopback. `allow_overlay_candidates` opts in to
+  disclosing those overlay addresses. Callers control extra hints they supply
+  to signed cards. With direct UDP enabled, a peer may see the actual packet
+  source, and a configured reflector may report a VPN's public egress address.
 - **Required proxy.** Native Rust callers can require that every relay
   connection use a configured SOCKS5 or Tor proxy. Relay DNS resolution
   happens at the proxy. Destination checks and relay TLS verification still

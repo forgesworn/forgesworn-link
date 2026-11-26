@@ -135,6 +135,9 @@ struct PathArgs {
     /// Consent to direct paths and advertising UDP candidates.
     #[arg(long, conflicts_with = "no_direct")]
     allow_direct: bool,
+    /// Advertise addresses on detected VPN and overlay interfaces.
+    #[arg(long, requires = "allow_direct")]
+    allow_overlay_candidates: bool,
     /// Use only the relay (the default).
     #[arg(long)]
     no_direct: bool,
@@ -160,6 +163,7 @@ impl PathArgs {
         config.relays = relays;
         config.allow_unconfigured_relays = self.allow_unconfigured_relays;
         config.allow_direct = self.allow_direct && !self.no_direct;
+        config.allow_overlay_candidates = self.allow_overlay_candidates;
         config.reflector = self.reflector;
         config.bind = self.bind;
         Ok(config)
