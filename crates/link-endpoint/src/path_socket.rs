@@ -153,6 +153,8 @@ pub struct Paths {
     local_synthetic: SocketAddr,
     /// The UDP socket's address; unspecified with port zero when relay-only.
     udp_local: SocketAddr,
+    #[cfg(not(wasm_browser))]
+    allow_overlay_candidates: bool,
 }
 
 impl std::fmt::Debug for Paths {
@@ -549,24 +551,33 @@ impl Paths {
     /// Local interface candidates plus the reflector result, spec 4.2.
     /// Relay-only has none.
     pub fn local_candidates(&self) -> Vec<SocketAddr> {
-        let mut out = Vec::new();
         if self.is_relay_only() {
-            return out;
+            return Vec::new();
         }
         #[cfg(not(wasm_browser))]
-        if self.udp_local.ip().is_unspecified() {
-            for ip in local_addresses(self.udp_local.is_ipv4()) {
-                out.push(SocketAddr::new(ip, self.udp_local.port()));
-            }
-        } else {
-            out.push(self.udp_local);
-        }
-        if let Some(reflexive) = self.reflexive()
-            && !out.contains(&reflexive)
         {
-            out.push(reflexive);
+            let routed = if self.udp_local.ip().is_unspecified() {
+                default_route_address(self.udp_local.is_ipv4())
+            } else {
+                None
+            };
+            let reflexive = self.reflexive();
+            let needs_interfaces = self.udp_local.ip().is_unspecified()
+                || (!self.allow_overlay_candidates
+                    && (!self.udp_local.ip().to_canonical().is_loopback() || reflexive.is_some()));
+            let interfaces = needs_interfaces
+                .then(if_addrs::get_if_addrs)
+                .and_then(Result::ok);
+            select_local_candidates(
+                self.udp_local,
+                routed,
+                interfaces.as_deref(),
+                reflexive,
+                self.allow_overlay_candidates,
+            )
         }
-        out
+        #[cfg(wasm_browser)]
+        Vec::new()
     }
 
     /// The session a probe's key id belongs to, with its key, spec 4.2.
@@ -707,40 +718,95 @@ fn is_link_local(ip: IpAddr) -> bool {
     }
 }
 
-/// Every address a peer might reach this host on, spec 4.2: the address the
-/// default route would use first, then every other interface of the same
-/// family, loopback last so a same-host peer still works.  A default-route
-/// only list was the recorded cause of a LAN pair falling back to the relay
-/// whenever a VPN held the default route (acceptance record, 27 August 2026):
-/// the tunnel address was the only candidate, and the LAN address that would
-/// have worked was never offered.
+/// Detect point-to-point interfaces and common tunnel names, including
+/// adapters presented as Ethernet. An address alone cannot identify an overlay.
 #[cfg(not(wasm_browser))]
-pub fn local_addresses(v4: bool) -> Vec<IpAddr> {
-    let mut out: Vec<IpAddr> = Vec::new();
-    let offer = |ip: IpAddr, out: &mut Vec<IpAddr>| {
-        if ip.is_ipv4() == v4 && !out.contains(&ip) {
-            out.push(ip);
+fn is_tunnel_address(interfaces: &[if_addrs::Interface], address: IpAddr) -> bool {
+    let address = address.to_canonical();
+    interfaces.iter().any(|interface| {
+        if interface.ip().to_canonical() != address {
+            return false;
         }
+        interface.is_p2p()
+            || [
+                "tailscale",
+                "wireguard",
+                "wintun",
+                "zerotier",
+                "openvpn",
+                "utun",
+                "tun",
+                "tap",
+                "wg",
+                "zt",
+            ]
+            .iter()
+            .any(|prefix| {
+                interface
+                    .name
+                    .get(..prefix.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+            })
+    })
+}
+
+#[cfg(not(wasm_browser))]
+fn select_local_candidates(
+    bind: SocketAddr,
+    routed: Option<IpAddr>,
+    interfaces: Option<&[if_addrs::Interface]>,
+    reflexive: Option<SocketAddr>,
+    allow_overlay_candidates: bool,
+) -> Vec<SocketAddr> {
+    let snapshot = interfaces.unwrap_or_default();
+    let permitted = |ip| allow_overlay_candidates || !is_tunnel_address(snapshot, ip);
+    let known_local = |ip: IpAddr| {
+        let ip = ip.to_canonical();
+        allow_overlay_candidates
+            || ip.is_loopback()
+            || snapshot
+                .iter()
+                .any(|interface| interface.ip().to_canonical() == ip)
     };
-    if let Some(routed) = default_route_address(v4) {
-        offer(routed, &mut out);
-    }
-    if let Ok(interfaces) = if_addrs::get_if_addrs() {
-        for interface in interfaces {
-            let ip = interface.ip();
-            if ip.is_loopback() || ip.is_unspecified() || is_link_local(ip) {
-                continue;
+    let mut out = Vec::new();
+    if bind.ip().is_unspecified() {
+        let mut offer = |ip: IpAddr| {
+            let addr = SocketAddr::new(ip, bind.port());
+            if out.len() < MAX_LOCAL_CANDIDATES - 1
+                && ip.is_ipv4() == bind.is_ipv4()
+                && !ip.is_loopback()
+                && !ip.is_unspecified()
+                && !is_link_local(ip)
+                && !out.contains(&addr)
+                && permitted(ip)
+            {
+                out.push(addr);
             }
-            offer(ip, &mut out);
+        };
+        // A VPN can own the default route. Give its source address priority
+        // only after checking it against the same interface policy.
+        if let Some(routed) = routed.filter(|ip| known_local(*ip)) {
+            offer(routed);
         }
+        for interface in snapshot {
+            offer(interface.ip());
+        }
+        let loopback = if bind.is_ipv4() {
+            IpAddr::from([127, 0, 0, 1])
+        } else {
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        };
+        out.push(SocketAddr::new(loopback, bind.port()));
+    } else if known_local(bind.ip()) && permitted(bind.ip()) {
+        out.push(bind);
     }
-    out.truncate(MAX_LOCAL_CANDIDATES - 1);
-    let loopback = if v4 {
-        IpAddr::from([127, 0, 0, 1])
-    } else {
-        IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
-    };
-    offer(loopback, &mut out);
+    if let Some(reflexive) = reflexive
+        && (allow_overlay_candidates || interfaces.is_some())
+        && permitted(reflexive.ip())
+        && !out.contains(&reflexive)
+    {
+        out.push(reflexive);
+    }
     out
 }
 
@@ -768,6 +834,7 @@ pub async fn build(
     book: Option<Arc<crate::rendezvous_book::TagBook>>,
     reflector: Option<SocketAddr>,
     net: watch::Receiver<u64>,
+    allow_overlay_candidates: bool,
 ) -> io::Result<(Arc<PathSocket>, Arc<Paths>)> {
     let udp = Arc::new(DirectSocket::bind(bind).await?);
     let udp_local = udp.local_addr()?;
@@ -780,6 +847,7 @@ pub async fn build(
         reflector,
         net,
         RelayRoute::Tcp,
+        allow_overlay_candidates,
     );
     spawn_direct_inbound(paths.clone(), udp);
     Ok((socket, paths))
@@ -804,7 +872,18 @@ pub(crate) fn build_relay_only_with_route(
     route: RelayRoute,
 ) -> (Arc<PathSocket>, Arc<Paths>) {
     let unbound = SocketAddr::from(([0, 0, 0, 0], 0));
-    assemble(key, None, unbound, relays, book, None, net, route)
+    assemble(
+        key,
+        None,
+        unbound,
+        relays,
+        book,
+        None,
+        net,
+        route,
+        #[cfg(not(wasm_browser))]
+        false,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -817,6 +896,7 @@ fn assemble(
     reflector: Option<SocketAddr>,
     net: watch::Receiver<u64>,
     route: RelayRoute,
+    #[cfg(not(wasm_browser))] allow_overlay_candidates: bool,
 ) -> (Arc<PathSocket>, Arc<Paths>) {
     let (inbound_tx, inbound_rx) = mpsc::channel::<Inbound>(INBOUND_CAPACITY);
     let (relay_inbound_tx, mut relay_inbound_rx) = mpsc::channel::<RelayInbound>(INBOUND_CAPACITY);
@@ -836,6 +916,8 @@ fn assemble(
         net,
         local_synthetic,
         udp_local,
+        #[cfg(not(wasm_browser))]
+        allow_overlay_candidates,
     });
 
     // Relay inbound: attribute by the relay's source node ID, spec 4.1.
@@ -900,7 +982,12 @@ fn spawn_direct_inbound(paths: Arc<Paths>, udp: Arc<DirectSocket>) {
                         .take_if(|expected| *expected == nonce)
                         .is_some();
                     if matched {
-                        *paths.reflexive.lock().expect("reflexive") = Some(unmap_ipv6(observed));
+                        let observed = unmap_ipv6(observed);
+                        let permitted = paths.allow_overlay_candidates
+                            || if_addrs::get_if_addrs().is_ok_and(|interfaces| {
+                                !is_tunnel_address(&interfaces, observed.ip())
+                            });
+                        *paths.reflexive.lock().expect("reflexive") = permitted.then_some(observed);
                     }
                 }
                 continue;
@@ -1088,44 +1175,114 @@ impl AsyncUdpSocket for PathSocket {
 #[cfg(all(test, not(wasm_browser)))]
 mod candidates {
     use super::*;
+    use if_addrs::{IfAddr, IfOperStatus, Ifv4Addr, Ifv6Addr, Interface};
 
-    /// Every routable interface address is offered, not only the one the
-    /// default route would use.  A default-route-only list was the recorded
-    /// cause of a LAN pair falling back to the relay whenever a VPN held the
-    /// default route (acceptance record, 27 August 2026).
-    #[test]
-    fn every_routable_interface_address_is_offered() {
-        let offered = local_addresses(true);
-        let expected: Vec<IpAddr> = if_addrs::get_if_addrs()
-            .expect("interfaces")
-            .into_iter()
-            .map(|interface| interface.ip())
-            .filter(|ip| ip.is_ipv4() && !ip.is_loopback() && !is_link_local(*ip))
-            .collect();
-        for ip in &expected {
-            assert!(offered.contains(ip), "{ip} is missing from {offered:?}");
+    fn interface(name: &str, ip: &str, is_p2p: bool) -> Interface {
+        let addr = match ip.parse().unwrap() {
+            IpAddr::V4(ip) => IfAddr::V4(Ifv4Addr {
+                ip,
+                netmask: "255.255.255.0".parse().unwrap(),
+                prefixlen: 24,
+                broadcast: None,
+            }),
+            IpAddr::V6(ip) => IfAddr::V6(Ifv6Addr {
+                ip,
+                netmask: "ffff:ffff:ffff:ffff::".parse().unwrap(),
+                prefixlen: 64,
+                broadcast: None,
+            }),
+        };
+        Interface {
+            name: name.to_owned(),
+            addr,
+            index: None,
+            oper_status: IfOperStatus::Up,
+            is_p2p,
+            #[cfg(windows)]
+            adapter_name: name.to_owned(),
         }
+    }
+
+    #[test]
+    fn default_route_on_a_tunnel_keeps_lan_addresses() {
+        let interfaces = [
+            interface("Tailscale", "100.64.0.1", false),
+            interface("ethernet", "100.64.0.2", false),
+            interface("utun4", "fd00::1", false),
+            interface("ethernet", "fd00::2", false),
+            interface("uplink", "fd00::3", true),
+            interface("ethernet", "fd00::3", false),
+            interface("ethernet", "fe80::2", false),
+        ];
+        let offered = |bind: &str, routed: &str, allow_overlay_candidates| {
+            select_local_candidates(
+                bind.parse().unwrap(),
+                Some(routed.parse().unwrap()),
+                Some(&interfaces),
+                None,
+                allow_overlay_candidates,
+            )
+        };
         assert_eq!(
-            offered.last().copied(),
-            Some(IpAddr::from([127, 0, 0, 1])),
-            "loopback is offered last so a same-host peer still works"
+            offered("0.0.0.0:9000", "100.64.0.1", false),
+            [
+                "100.64.0.2:9000".parse().unwrap(),
+                "127.0.0.1:9000".parse().unwrap()
+            ]
         );
-        assert!(offered.len() <= MAX_LOCAL_CANDIDATES);
-        assert!(
-            offered.iter().all(|ip| ip.is_ipv4()),
-            "one family per socket"
+        assert_eq!(
+            offered("[::]:9000", "fd00::1", false),
+            [
+                "[fd00::2]:9000".parse().unwrap(),
+                "[::1]:9000".parse().unwrap()
+            ]
+        );
+        assert_eq!(
+            offered("0.0.0.0:9000", "100.64.0.1", true),
+            [
+                "100.64.0.1:9000".parse().unwrap(),
+                "100.64.0.2:9000".parse().unwrap(),
+                "127.0.0.1:9000".parse().unwrap()
+            ]
         );
     }
 
     #[test]
-    fn link_local_and_the_wrong_family_are_never_offered() {
-        for ip in local_addresses(false) {
-            assert!(ip.is_ipv6(), "{ip} is not IPv6");
-            assert!(!is_link_local(ip), "{ip} is link-local");
-        }
-        assert!(is_link_local("169.254.1.1".parse::<IpAddr>().unwrap()));
-        assert!(is_link_local("fe80::1".parse::<IpAddr>().unwrap()));
-        assert!(!is_link_local("fd00::1".parse::<IpAddr>().unwrap()));
+    fn binding_or_reflecting_a_tunnel_address_does_not_advertise_it() {
+        let tunnel = interface("wg0", "100.64.0.1", true);
+        let bind = "[::ffff:100.64.0.1]:9000".parse().unwrap();
+        let reflexive = "100.64.0.1:9001".parse().unwrap();
+        let interfaces = [tunnel, interface("ethernet", "192.168.0.2", false)];
+        assert!(
+            select_local_candidates(bind, None, Some(&interfaces), Some(reflexive), false)
+                .is_empty()
+        );
+        assert_eq!(
+            select_local_candidates(bind, None, Some(&interfaces), Some(reflexive), true),
+            [bind, reflexive]
+        );
+    }
+
+    #[test]
+    fn missing_interface_metadata_leaves_only_same_host_candidates() {
+        let bind = "0.0.0.0:9000".parse().unwrap();
+        let routed = "100.64.0.1".parse().unwrap();
+        let reflexive = "100.64.0.1:9001".parse().unwrap();
+        let loopback = "127.0.0.1:9000".parse().unwrap();
+        assert_eq!(
+            select_local_candidates(bind, Some(routed), None, Some(reflexive), false),
+            [loopback]
+        );
+        let bound = SocketAddr::new(routed, 9000);
+        assert!(select_local_candidates(bound, None, None, Some(reflexive), false).is_empty());
+        assert_eq!(
+            select_local_candidates(loopback, None, None, None, false),
+            [loopback]
+        );
+        assert_eq!(
+            select_local_candidates(bind, Some(routed), None, Some(reflexive), true),
+            [bound, loopback, reflexive]
+        );
     }
 }
 
@@ -1145,6 +1302,7 @@ mod probes {
             None,
             None,
             net,
+            false,
         )
         .await
         .expect("path socket binds");
