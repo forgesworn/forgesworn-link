@@ -123,6 +123,12 @@ async fn reload_keys(path: &Path, policy: &RelayAdmission) -> Result<()> {
         metadata.is_file(),
         "the admission allowlist must be a regular file"
     );
+    let file = tokio::fs::File::open(path).await?;
+    let metadata = file.metadata().await?;
+    ensure!(
+        metadata.is_file(),
+        "the opened allowlist must be a regular file"
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -132,11 +138,7 @@ async fn reload_keys(path: &Path, policy: &RelayAdmission) -> Result<()> {
         );
     }
     let mut bytes = Zeroizing::new(Vec::new());
-    tokio::fs::File::open(path)
-        .await?
-        .take(MAX_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .await?;
+    file.take(MAX_BYTES + 1).read_to_end(&mut bytes).await?;
     ensure!(
         bytes.len() as u64 <= MAX_BYTES,
         "the admission allowlist is too large"

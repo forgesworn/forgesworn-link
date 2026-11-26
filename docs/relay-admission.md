@@ -55,6 +55,12 @@ keys for different relays.
 
 ## Configure a Rust client
 
+For the [paired files starter](../examples/paired-files/README.md), add
+`--relay-admission-key-file /path/to/my.key` to each initial pairing command.
+Each peer saves the file's path with its pairing and reads the key on every
+new process. A saved command accepts the same option to use a different key
+file for that run, including when enabling admission on an existing relay.
+
 Attach the issued `RelayAdmissionKey` to the approved relay with
 `RelaySpec::with_admission_key`. Load the key from protected local storage.
 The client requires `wss://` with normal certificate verification or an

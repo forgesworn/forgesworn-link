@@ -13,8 +13,8 @@ anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"
-link-core = { git = "https://github.com/forgesworn/forgesworn-link.git", rev = "2a7db35b0718438dbba9d0f2ff06c323d07b96e0" }
-link-endpoint = { git = "https://github.com/forgesworn/forgesworn-link.git", rev = "2a7db35b0718438dbba9d0f2ff06c323d07b96e0" }
+link-core = { git = "https://github.com/forgesworn/forgesworn-link.git", rev = "09fa9ae7e80840e5713da9b2d7b6e66d6a0f0165" }
+link-endpoint = { git = "https://github.com/forgesworn/forgesworn-link.git", rev = "09fa9ae7e80840e5713da9b2d7b6e66d6a0f0165" }
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

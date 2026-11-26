@@ -25,6 +25,9 @@ the printed `relay_url` and `tls_sha256` to both clients through a trusted
 channel. Keep this relay process running for the trial. Its self-signed
 certificate is generated at startup, and the saved pair pins that certificate.
 For a relay with a normally trusted certificate, omit `--relay-cert-sha256`.
+For an [admission-controlled relay](https://github.com/forgesworn/forgesworn-link/blob/main/docs/relay-admission.md), each peer
+adds `--relay-admission-key-file /path/to/my.key` to its first pairing command.
+Use the individual file supplied by the operator and keep it private.
 
 ## Pair and send the first file
 
@@ -78,6 +81,9 @@ cargo run --locked -- saved-send --state "$state_dir/sender.pair" next.txt
 Each record belongs to one role in one pair. Use fresh state paths when
 pairing again, including after changing a pinned relay certificate. If the
 first transfer fails after both sides saved state, retry with the saved commands.
+If you paired through a private relay, the saved pairing holds the path of
+your grant file. To use a different grant file for one run, pass
+`--relay-admission-key-file` to the saved command.
 
 [`src/paired.rs`](src/paired.rs) shows the authenticated invite and verified
 stream. [`src/state.rs`](src/state.rs) shows how to restore a pair and keep the
