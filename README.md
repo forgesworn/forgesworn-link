@@ -98,6 +98,9 @@ covers relay throughput with a paired roster, shaped direct UDP, path
 recovery and proxy-required verification.
 The [Iroh recovery comparison](acceptance/iroh-recovery/README.md) runs the
 same shaped direct-path outage against Link and Iroh.
+The [private relay LAN trial](acceptance/2026-11-26-private-relay-lan.md)
+covers saved pairing, live revocation and relay shutdown between a Mac and
+a Raspberry Pi.
 
 ## Crates
 
