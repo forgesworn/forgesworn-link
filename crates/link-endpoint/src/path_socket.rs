@@ -109,6 +109,8 @@ struct Peer {
     /// The session's probe key and its id, from the TLS exporter, spec 4.2.
     probe_key: Option<(ProbeKeyId, ProbeKey)>,
     direct: Option<Proven>,
+    /// Latest probe RTT for the current address.
+    direct_rtt: Duration,
     /// The relay driver this peer is reached on: the one its card named
     /// when this side dialed, or the one its datagrams last arrived on.
     driver: Option<u64>,
@@ -231,6 +233,10 @@ impl Paths {
 
     /// The current direct proof, if any, regardless of freshness.
     pub fn proven_direct(&self, peer: NodeId) -> Option<Proven> {
+        self.direct_proof(peer).map(|(proof, _)| proof)
+    }
+
+    pub(crate) fn direct_proof(&self, peer: NodeId) -> Option<(Proven, Duration)> {
         if self.is_relay_only() {
             return None;
         }
@@ -239,7 +245,7 @@ impl Paths {
             .expect("paths")
             .peers
             .get(&peer)
-            .and_then(|p| p.direct)
+            .and_then(|p| p.direct.map(|proof| (proof, p.direct_rtt)))
     }
 
     /// Forget the direct path, which puts the peer back on the relay.  Only
@@ -259,6 +265,43 @@ impl Paths {
         {
             inner.by_direct.remove(&proven.addr);
         }
+    }
+
+    /// Abandon the stalled address only while it is still the current route.
+    /// A fresh proof for another address may have won while QUIC was stalled.
+    pub(crate) fn fall_back_from_direct(
+        &self,
+        peer: NodeId,
+        session: u64,
+        stalled_addr: SocketAddr,
+    ) -> bool {
+        let mut inner = self.inner.lock().expect("paths");
+        if inner
+            .sessions
+            .get(&peer)
+            .is_none_or(|slot| slot.id != session)
+        {
+            return false;
+        }
+        let Some(entry) = inner.peers.get_mut(&peer) else {
+            return false;
+        };
+        if entry
+            .direct
+            .take_if(|proof| proof.addr == stalled_addr)
+            .is_none()
+        {
+            return false;
+        }
+        // Earlier pongs must not put the old path back in use. Keep pending
+        // challenges to other addresses so an announced handover can finish.
+        entry.pending.retain(|_, (addr, _)| *addr != stalled_addr);
+        // Give the peer time to switch before an in-flight ping starts a round.
+        entry.last_ping.insert(stalled_addr, Instant::now());
+        if inner.by_direct.get(&stalled_addr) == Some(&peer) {
+            inner.by_direct.remove(&stalled_addr);
+        }
+        true
     }
 
     /// Register a new session with `peer` as the one live session, spec 4.3.
@@ -594,14 +637,16 @@ impl Paths {
                     return;
                 };
                 // Proved only for a nonce this side issued, spec 4.2.
-                if entry.pending.remove(&probe.nonce).is_none() {
+                let Some((_, sent_at)) = entry.pending.remove(&probe.nonce) else {
                     return;
-                }
+                };
                 let previous = entry.direct.map(|p| p.addr);
+                let now = Instant::now();
                 entry.direct = Some(Proven {
                     addr: from,
-                    proved_at: Instant::now(),
+                    proved_at: now,
                 });
+                entry.direct_rtt = now.duration_since(sent_at);
                 entry.learned.remove(&from);
                 if previous != Some(from) {
                     debug!(peer = %short(&peer), addr = %from, "direct path proved");

@@ -69,6 +69,8 @@ is listed under [What this does NOT prove](#what-this-does-not-prove).
 The [November native transport record](acceptance/2026-11-25-native-transport.md)
 covers relay throughput with a paired roster, shaped direct UDP, path
 recovery and proxy-required verification.
+The [Iroh recovery comparison](acceptance/iroh-recovery/README.md) runs the
+same shaped direct-path outage against Link and Iroh.
 
 ## Crates
 
@@ -366,6 +368,18 @@ convenience alone.
     the handshake: the old session fails once with `superseded` and is closed,
     and the new session starts with clean path state.  `FailReason` gains
     `Superseded`.
+
+15. **An active direct transfer can fall back before its address proof
+    expires.** In addition to the two messages in spec 4.2, an endpoint with
+    direct paths enabled sends control kind `0x03` with body `0x00` to
+    advertise early fallback. Once both ends support it, a pause in QUIC
+    acknowledgements after transmitting stream data prompts up to two small,
+    encrypted QUIC datagrams on the current direct path. If no authenticated
+    ACK arrives within the RTT-scaled budget and the approved relay is up,
+    the sender switches to the relay and sends `0x03` with body `0x01`
+    on the same authenticated control stream. The receiver can move to the
+    relay without waiting on its own idle proof. Older peers ignore the
+    control extension and use the spec 4.3 proof expiry.
 
 ## Defects the spike found in itself
 

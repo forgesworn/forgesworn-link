@@ -6,6 +6,10 @@ authors.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[[example]]
+name = "native_path_probe"
+test = true
+
 [dependencies]
 link-core = { path = "../link-core" }
 anyhow.workspace = true

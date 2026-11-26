@@ -2,7 +2,7 @@
 
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -11,7 +11,7 @@ use link_core::card::{Hint, to_ipv6};
 use link_core::id::NodeId;
 use link_core::path::{FailReason, PathReport, PathStatus};
 use link_core::wire::{PROBE_EXPORT_BYTES, PROBE_EXPORT_LABEL, PROBE_ID_BYTES, PROBE_KEY_BYTES};
-use quinn::VarInt;
+use quinn::{ConnectionStats, VarInt};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Notify, broadcast, mpsc};
 use tracing::{info, warn};
@@ -28,6 +28,11 @@ const PROBE_COOLDOWN: Duration = Duration::from_secs(30);
 const REPROVE_INTERVAL: Duration = Duration::from_secs(5);
 /// State machine tick.
 const TICK: Duration = Duration::from_millis(100);
+/// Floor on the time an active path may go without an ACK. Slow paths get
+/// six smoothed RTTs before the relay takes over.
+const MIN_DIRECT_STALL: Duration = Duration::from_millis(250);
+// An ack-eliciting encrypted QUIC datagram for the active path check.
+const PROGRESS_PROBE: &[u8] = &[0];
 /// Bounded queue of inbound application streams.
 const STREAM_QUEUE: usize = 16;
 /// Bounded transition history, so a test or an operator can read what happened
@@ -98,6 +103,10 @@ pub(crate) struct SessionInner {
     control_tx: mpsc::Sender<ControlSend>,
     /// How many `punch-now` messages the peer has sent this session.
     punch_requests: AtomicU32,
+    /// Early fallback requires both endpoints to understand the relay notice.
+    peer_can_fall_back: AtomicBool,
+    /// The authenticated peer has requested the relay path.
+    prefer_relay: Notify,
     /// The probe key id this session registered, to forget when it ends.
     probe_key_id: Option<[u8; PROBE_ID_BYTES]>,
     /// This session's id in the path socket's per-peer slot, spec 4.3.
@@ -216,6 +225,8 @@ impl Session {
             probe_now: AtomicU8::new(PROBE_IDLE),
             control_tx,
             punch_requests: AtomicU32::new(0),
+            peer_can_fall_back: AtomicBool::new(false),
+            prefer_relay: Notify::new(),
             probe_key_id,
             session_id,
             superseded,
@@ -341,12 +352,16 @@ async fn accept_loop(inner: Arc<SessionInner>, tx: mpsc::Sender<Stream>) {
 const CONTROL_CANDIDATES: u8 = 0x01;
 /// No body: start a probing round now, so both ends punch together.
 const CONTROL_PUNCH_NOW: u8 = 0x02;
+/// Optional control extension. Body 0 advertises support, 1 prefers relay.
+const CONTROL_RELAY_FALLBACK: u8 = 0x03;
 const CONTROL_MAX_BYTES: usize = 4096;
 
 /// A decoded control message.
 enum Control {
     Candidates(Vec<SocketAddr>),
     PunchNow,
+    RelayFallbackSupported,
+    PreferRelay,
     /// A kind this version does not know; ignored, never fatal.
     Unknown,
 }
@@ -356,10 +371,15 @@ enum Control {
 pub(crate) enum ControlSend {
     Candidates,
     PunchNow,
+    PreferRelay,
 }
 
 fn punch_now_message() -> Vec<u8> {
     vec![0, 0, 0, 1, CONTROL_PUNCH_NOW]
+}
+
+fn relay_fallback_message(prefer_relay: bool) -> [u8; 6] {
+    [0, 0, 0, 2, CONTROL_RELAY_FALLBACK, u8::from(prefer_relay)]
 }
 
 fn candidates_message(candidates: &[SocketAddr]) -> Vec<u8> {
@@ -381,6 +401,11 @@ fn parse_control(body: &[u8]) -> Option<Control> {
     match kind {
         CONTROL_CANDIDATES => parse_candidates(rest).map(Control::Candidates),
         CONTROL_PUNCH_NOW => Some(Control::PunchNow),
+        CONTROL_RELAY_FALLBACK => Some(match rest {
+            [0] => Control::RelayFallbackSupported,
+            [1] => Control::PreferRelay,
+            _ => Control::Unknown,
+        }),
         _ => Some(Control::Unknown),
     }
 }
@@ -409,6 +434,9 @@ async fn control_initiator(
     recv: quinn::RecvStream,
     mut requests: mpsc::Receiver<ControlSend>,
 ) {
+    if inner.allow_direct {
+        let _ = send.set_priority(1);
+    }
     // With direct paths declined the peer is told so by an empty candidate list.
     let candidates = |inner: &SessionInner| {
         if inner.allow_direct {
@@ -427,6 +455,14 @@ async fn control_initiator(
     if send.write_all(&candidates_message(&first)).await.is_err() {
         return;
     }
+    if inner.allow_direct
+        && send
+            .write_all(&relay_fallback_message(false))
+            .await
+            .is_err()
+    {
+        return;
+    }
     let _ = send.flush().await;
     // Stay on the stream for the life of the session: a re-announcement or a
     // punch-now can be asked for at any time, and holding both halves means
@@ -440,6 +476,7 @@ async fn control_initiator(
                     candidates_message(&fresh)
                 }
                 Some(ControlSend::PunchNow) => punch_now_message(),
+                Some(ControlSend::PreferRelay) => relay_fallback_message(true).to_vec(),
                 None => break,
             },
             _ = inner.conn.closed() => break,
@@ -486,6 +523,14 @@ async fn control_acceptor(
                 inner.punch_requests.fetch_add(1, Ordering::SeqCst);
                 inner.probe_now.store(PROBE_PEER, Ordering::SeqCst);
             }
+            Some(Control::RelayFallbackSupported) => {
+                inner.peer_can_fall_back.store(true, Ordering::Relaxed);
+            }
+            Some(Control::PreferRelay) => {
+                if inner.peer_can_fall_back.load(Ordering::Relaxed) {
+                    inner.prefer_relay.notify_one();
+                }
+            }
             Some(Control::Unknown) => {}
             None => break,
         }
@@ -509,12 +554,89 @@ fn reprove_due() -> Instant {
     now.checked_sub(REPROVE_INTERVAL).unwrap_or(now)
 }
 
+enum ProgressCheck {
+    Waiting(Instant),
+    Probing { since: Instant, retried: bool },
+}
+
+struct DirectProgress {
+    addr: SocketAddr,
+    stream_frames_sent: u64,
+    acks_received: u64,
+    check: Option<ProgressCheck>,
+}
+
+impl DirectProgress {
+    fn new(addr: SocketAddr, stats: &ConnectionStats) -> Self {
+        Self {
+            addr,
+            stream_frames_sent: stats.frame_tx.stream,
+            acks_received: stats.frame_rx.acks,
+            check: None,
+        }
+    }
+
+    fn stalled(
+        &mut self,
+        conn: &quinn::Connection,
+        stats: &ConnectionStats,
+        direct_probe_rtt: Duration,
+        now: Instant,
+    ) -> bool {
+        let sent = stats.frame_tx.stream != self.stream_frames_sent;
+        let acknowledged = stats.frame_rx.acks != self.acks_received;
+        self.stream_frames_sent = stats.frame_tx.stream;
+        self.acks_received = stats.frame_rx.acks;
+
+        // The ACKs come from QUIC's authenticated receive path. Raw UDP
+        // traffic and probe replies are no substitute for transfer progress.
+        if acknowledged {
+            self.check = None;
+        }
+
+        // QUIC may still be using RTT samples from the relay or a previous
+        // direct path. Use the authenticated probe's sample as a floor.
+        let rtt = stats.path.rtt.max(direct_probe_rtt);
+        match &mut self.check {
+            None if sent => {
+                // An ACK and a send observed in the same sample may refer
+                // to different packets. Arm a fresh check for that case too.
+                self.check = Some(ProgressCheck::Waiting(now));
+            }
+            Some(ProgressCheck::Waiting(since))
+                if now.duration_since(*since) >= TICK.max(rtt.saturating_mul(2)) =>
+            {
+                self.check = conn.send_datagram(PROGRESS_PROBE.into()).ok().map(|()| {
+                    ProgressCheck::Probing {
+                        since: now,
+                        retried: false,
+                    }
+                });
+            }
+            Some(ProgressCheck::Probing { since, retried }) => {
+                let budget = MIN_DIRECT_STALL.max(rtt.saturating_mul(6));
+                let elapsed = now.duration_since(*since);
+                if elapsed >= budget {
+                    return true;
+                }
+                if !*retried && elapsed >= budget / 2 {
+                    let _ = conn.send_datagram(PROGRESS_PROBE.into());
+                    *retried = true;
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+}
+
 async fn drive(inner: Arc<SessionInner>, probe_delay: Duration) {
     let mut previous_before_reconnect = PathStatus::Relayed;
     let mut reconnect_since: Option<Instant> = None;
     let mut probe_round_ends: Option<Instant> = None;
     let mut next_probe_attempt = Instant::now() + probe_delay;
     let mut last_probe_sent = reprove_due();
+    let mut direct_progress: Option<DirectProgress> = None;
     let mut candidates_announced = false;
     // Why the next probing round starts, for the transition record.
     let mut round_cause = "settle delay elapsed";
@@ -540,6 +662,7 @@ async fn drive(inner: Arc<SessionInner>, probe_delay: Duration) {
 
     loop {
         let mut relay_event = None;
+        let mut peer_prefers_relay = false;
         tokio::select! {
             _ = inner.superseded.notified() => {
                 // A newer session from the same node took the slot, spec 4.3.
@@ -580,6 +703,11 @@ async fn drive(inner: Arc<SessionInner>, probe_delay: Duration) {
                 return;
             }
             event = events.recv() => relay_event = Some(event),
+            _ = inner.prefer_relay.notified() => peer_prefers_relay = true,
+            // QUIC has already acknowledged these checks. Discard their
+            // payloads so the receive queue stays free during long sessions.
+            _ = inner.conn.read_datagram(),
+                if inner.allow_direct && inner.peer_can_fall_back.load(Ordering::Relaxed) => {},
             changed = net.changed(), if net_alive => match changed {
                 Ok(()) => {
                     info!(session = inner.session_id, "interface change: re-querying the reflector");
@@ -675,7 +803,42 @@ async fn drive(inner: Arc<SessionInner>, probe_delay: Duration) {
         }
 
         let peer_candidates = inner.paths.peer_candidates(inner.peer);
-        let proven = inner.paths.proven_direct(inner.peer);
+        let direct = inner.paths.direct_proof(inner.peer);
+        let proven = direct.map(|(proof, _)| proof);
+        if status != PathStatus::Direct {
+            direct_progress = None;
+        }
+        if let Some((proof, direct_probe_rtt)) = direct
+            && inner.peer_can_fall_back.load(Ordering::Relaxed)
+        {
+            let should_fall_back = peer_prefers_relay || {
+                let stats = inner.conn.stats();
+                if direct_progress
+                    .as_ref()
+                    .is_some_and(|progress| progress.addr != proof.addr)
+                {
+                    direct_progress = None;
+                }
+                direct_progress
+                    .get_or_insert_with(|| DirectProgress::new(proof.addr, &stats))
+                    .stalled(&inner.conn, &stats, direct_probe_rtt, Instant::now())
+            };
+            if should_fall_back
+                && inner
+                    .paths
+                    .fall_back_from_direct(inner.peer, inner.session_id, proof.addr)
+            {
+                next_probe_attempt = Instant::now() + PROBE_COOLDOWN;
+                let cause = if peer_prefers_relay {
+                    "direct_lost: peer requested relay"
+                } else {
+                    let _ = inner.control_tx.try_send(ControlSend::PreferRelay);
+                    "direct_lost: QUIC stream acknowledgement stalled"
+                };
+                inner.transition(PathStatus::Relayed, cause);
+                continue;
+            }
+        }
         let asked = inner.probe_now.swap(PROBE_IDLE, Ordering::SeqCst);
         if asked != PROBE_IDLE {
             next_probe_attempt = Instant::now();

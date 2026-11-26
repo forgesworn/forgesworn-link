@@ -1,9 +1,8 @@
 //! Native loopback, shaped UDP and path recovery measurements.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
@@ -12,10 +11,13 @@ use link_endpoint::{
 };
 use link_relay::{RelayConfig, RelayHandle, TlsMaterial};
 use sha2::{Digest, Sha256};
-use tokio::net::UdpSocket;
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 use zeroize::Zeroizing;
+
+#[path = "support/gateway.rs"]
+mod gateway;
+use gateway::{Gateway, IPV4, IPV6};
 
 const MIB: usize = 1024 * 1024;
 const BULK: usize = 64 * MIB;
@@ -23,8 +25,6 @@ const SMALL_BULK: usize = 8 * MIB;
 const SHAPED_BULK: usize = 4 * MIB;
 const SMALL: usize = 1024;
 static CHUNK: [u8; 64 * 1024] = [0xa5; 64 * 1024];
-const IPV4: &str = "127.0.0.1:0";
-const IPV6: &str = "[::1]:0";
 
 async fn serve(session: &Session, count: usize) -> Result<()> {
     for _ in 0..count {
@@ -77,108 +77,6 @@ fn expected(size: usize) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-async fn forward(
-    receive: Arc<UdpSocket>,
-    from: SocketAddr,
-    send: Arc<UdpSocket>,
-    target: SocketAddr,
-    active: Arc<AtomicBool>,
-) -> Result<()> {
-    let mut queue = VecDeque::<(tokio::time::Instant, Vec<u8>)>::new();
-    let mut buf = [0; 2048];
-    let mut seen = 0u64;
-    loop {
-        let deadline = queue.front().map(|p| p.0);
-        tokio::select! {
-            biased;
-            _ = async {
-                match deadline {
-                    Some(deadline) => tokio::time::sleep_until(deadline).await,
-                    None => std::future::pending::<()>().await,
-                }
-            } => {
-                let (_, packet) = queue.pop_front().context("queued packet")?;
-                if active.load(Ordering::Relaxed) {
-                    send.send_to(&packet, target).await?;
-                }
-            }
-            packet = receive.recv_from(&mut buf) => {
-                let (size, source) = packet?;
-                ensure!(source == from, "unexpected UDP peer {source}, want {from}");
-                seen += 1;
-                if active.load(Ordering::Relaxed) && !seen.is_multiple_of(200) {
-                    ensure!(queue.len() < 8192, "UDP shaper queue filled");
-                    queue.push_back((
-                        tokio::time::Instant::now() + Duration::from_millis(20),
-                        buf[..size].to_vec(),
-                    ));
-                }
-            }
-        }
-    }
-}
-
-struct Gateway {
-    addrs: (SocketAddr, SocketAddr),
-    active: Arc<AtomicBool>,
-    tasks: [JoinHandle<Result<()>>; 2],
-}
-
-impl Gateway {
-    async fn start(pair: &Pair) -> Result<Self> {
-        let front_a = Arc::new(UdpSocket::bind(IPV4).await?);
-        let front_b = Arc::new(UdpSocket::bind(IPV6).await?);
-        let addrs = (front_a.local_addr()?, front_b.local_addr()?);
-        let active = Arc::new(AtomicBool::new(true));
-        let a_to_b = tokio::spawn(forward(
-            front_a.clone(),
-            pair.a.paths().udp_local(),
-            front_b.clone(),
-            pair.b.paths().udp_local(),
-            active.clone(),
-        ));
-        let b_to_a = tokio::spawn(forward(
-            front_b,
-            pair.b.paths().udp_local(),
-            front_a,
-            pair.a.paths().udp_local(),
-            active.clone(),
-        ));
-        Ok(Self {
-            addrs,
-            active,
-            tasks: [a_to_b, b_to_a],
-        })
-    }
-
-    fn advertise(&self, pair: &Pair) {
-        pair.a
-            .paths()
-            .set_peer_candidates(pair.b.node_id(), vec![self.addrs.0]);
-        pair.b
-            .paths()
-            .set_peer_candidates(pair.a.node_id(), vec![self.addrs.1]);
-        pair.sending.request_direct();
-        pair.receiving.request_direct();
-    }
-
-    fn check(&self) -> Result<()> {
-        ensure!(
-            self.tasks.iter().all(|task| !task.is_finished()),
-            "shaper stopped"
-        );
-        Ok(())
-    }
-}
-
-impl Drop for Gateway {
-    fn drop(&mut self) {
-        for task in &self.tasks {
-            task.abort();
-        }
-    }
-}
-
 struct Pair {
     a: Endpoint,
     b: Endpoint,
@@ -188,6 +86,21 @@ struct Pair {
 }
 
 impl Pair {
+    async fn gateway(&self) -> Result<Gateway> {
+        Gateway::start(self.a.paths().udp_local(), self.b.paths().udp_local()).await
+    }
+
+    fn advertise(&self, gateway: &Gateway) {
+        self.a
+            .paths()
+            .set_peer_candidates(self.b.node_id(), vec![gateway.addrs.0]);
+        self.b
+            .paths()
+            .set_peer_candidates(self.a.node_id(), vec![gateway.addrs.1]);
+        self.sending.request_direct();
+        self.receiving.request_direct();
+    }
+
     async fn start(direct: bool, shaped: bool, idle_routes: u8) -> Result<Self> {
         let tls = TlsMaterial::self_signed(&["127.0.0.1".into()])?;
         let pin = tls.fingerprint();
@@ -297,8 +210,8 @@ async fn throughput(mode: &str, samples: usize) -> Result<()> {
     };
     let pair = Pair::start(direct, shaped, if roster { 32 } else { 0 }).await?;
     let gateway = if shaped {
-        let gateway = Gateway::start(&pair).await?;
-        gateway.advertise(&pair);
+        let gateway = pair.gateway().await?;
+        pair.advertise(&gateway);
         Some(gateway)
     } else {
         None
@@ -353,10 +266,10 @@ async fn throughput(mode: &str, samples: usize) -> Result<()> {
     Ok(())
 }
 
-async fn recover(handover: bool) -> Result<Duration> {
+async fn recover(handover: bool) -> Result<(Duration, Duration)> {
     let pair = Pair::start(true, true, 0).await?;
-    let original = Gateway::start(&pair).await?;
-    original.advertise(&pair);
+    let original = pair.gateway().await?;
+    pair.advertise(&original);
     pair.wait_path(PathStatus::Direct, Some(original.addrs))
         .await?;
     let digest = expected(SMALL);
@@ -367,35 +280,37 @@ async fn recover(handover: bool) -> Result<Duration> {
         )
         .await??;
         let new_gateway = if handover {
-            Some(Gateway::start(&pair).await?)
+            Some(pair.gateway().await?)
         } else {
             None
         };
         let start = Instant::now();
-        original.active.store(false, Ordering::Relaxed);
+        original.blackhole();
         let (status, addrs) = if let Some(gateway) = &new_gateway {
-            gateway.advertise(&pair);
+            pair.advertise(gateway);
             (PathStatus::Direct, Some(gateway.addrs))
         } else {
             (PathStatus::Relayed, None)
         };
-        tokio::try_join!(
+        let (response, selected_path) = tokio::try_join!(
             async {
                 timeout(
                     Duration::from_secs(45),
                     transfer(&pair.sending, SMALL, digest),
                 )
                 .await??;
-                Ok::<_, anyhow::Error>(())
+                Ok::<_, anyhow::Error>(start.elapsed())
             },
-            pair.wait_path(status, addrs)
+            async {
+                pair.wait_path(status, addrs).await?;
+                Ok::<_, anyhow::Error>(start.elapsed())
+            }
         )?;
-        let elapsed = start.elapsed();
         original.check()?;
         if let Some(gateway) = &new_gateway {
             gateway.check()?;
         }
-        Ok(elapsed)
+        Ok((response, selected_path))
     };
     let ((), elapsed) = tokio::try_join!(serve(&pair.receiving, 2), exercise)?;
     tokio::join!(pair.a.close(), pair.b.close());
@@ -425,11 +340,68 @@ async fn main() -> Result<()> {
                     batch.spawn(recover(handover));
                 }
                 while let Some(sample) = batch.join_next().await {
-                    println!("recovery,{mode},{:.4}", sample??.as_secs_f64() * 1000.0);
+                    let (response, selected_path) = sample??;
+                    println!(
+                        "recovery,{mode},{:.4},{:.4},{:.4}",
+                        response.max(selected_path).as_secs_f64() * 1000.0,
+                        response.as_secs_f64() * 1000.0,
+                        selected_path.as_secs_f64() * 1000.0
+                    );
                 }
             }
         }
         _ => anyhow::bail!("use direct, shaped, relay, relay-roster, blackhole or handover"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stalled_request_recovers_on_the_same_session() -> Result<()> {
+        let (response, selected_path) = recover(false).await?;
+        // Leave room for a loaded CI host while catching the 15 s expiry path.
+        ensure!(
+            response.max(selected_path) < Duration::from_secs(6),
+            "direct loss did not recover promptly: {response:?}, {selected_path:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn acknowledged_bursts_can_leave_a_healthy_direct_path_idle() -> Result<()> {
+        let pair = Pair::start(true, true, 0).await?;
+        let gateway = pair.gateway().await?;
+        pair.advertise(&gateway);
+        pair.wait_path(PathStatus::Direct, Some(gateway.addrs))
+            .await?;
+        let digest = expected(SMALL);
+        let exercise = async {
+            for _ in 0..3 {
+                timeout(
+                    Duration::from_secs(3),
+                    transfer(&pair.sending, SMALL, digest),
+                )
+                .await??;
+                sleep(Duration::from_millis(600)).await;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        tokio::try_join!(serve(&pair.receiving, 3), exercise)?;
+        ensure!(
+            [&pair.sending, &pair.receiving].iter().all(|session| {
+                session.path().status == PathStatus::Direct
+                    && !session
+                        .history()
+                        .iter()
+                        .any(|event| event.cause.starts_with("direct_lost:"))
+            }),
+            "an acknowledged burst was mistaken for an outage"
+        );
+        gateway.check()?;
+        tokio::join!(pair.a.close(), pair.b.close());
+        Ok(())
+    }
 }
