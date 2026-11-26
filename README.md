@@ -1,11 +1,32 @@
 # ForgeSworn Link
 
-A wide-area transport lane for ForgeSworn storage. Two nodes find a route
-using an owner-selected relay and can attempt direct QUIC with consent.
+Connect paired devices across NATs with authenticated QUIC. Apps can exchange
+messages, files or replicated data over a WebSocket relay they choose. Direct
+paths are opt-in.
 The transport uses upstream `quinn` and `rustls`. Relays in tag mode route
 by pair-scoped tags and receive no node ID. Bothy uses Link to mirror and
 repair between machines. Link is the planned lane for a Tor-less Wildbloom
 node, which today mirrors over Tor or HTTPS.
+
+## Get started
+
+With the repository's Rust 1.94.1 toolchain, run a paired echo locally.
+
+```sh
+git clone https://github.com/forgesworn/forgesworn-link.git
+cd forgesworn-link/examples/paired-echo
+cargo run --locked
+```
+
+The starter runs both peers and the WSS relay on loopback and prints
+`Verified echo: hello, Link! (path=relayed)` once the reply matches.
+
+- [Embed Link in a Rust app](examples/paired-echo/README.md) with a copyable starter and a pinned Cargo dependency.
+- [Send a file between machines](docs/paired-quickstart.md) over your own relay.
+- [Build the browser package](scripts/build-link-web.sh) or [use the Android bridge](docs/ANDROID-BRIDGE.md) for browser or Kotlin clients.
+- [Find other ForgeSworn libraries and tools](https://forgesworn.dev/llms.txt) by task and runtime.
+
+## How Link works
 
 We own the small contract that matters -- how a node identifies itself, how two
 nodes discover a route, how they attempt a direct connection, how they fall back

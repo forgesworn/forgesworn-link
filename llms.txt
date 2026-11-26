@@ -1,18 +1,14 @@
 # ForgeSworn Link
 
-> ForgeSworn Link moves storage traffic between paired nodes. It uses
-> authenticated QUIC over owner-configured WebSocket relays, with optional
-> direct paths when peers consent. Tag-mode relays route by pair-scoped tags.
-> The transport uses upstream `quinn` and `rustls`.
+> ForgeSworn Link connects paired devices across NATs for messages, file
+> transfer and replication. It uses authenticated QUIC over owner-configured
+> WebSocket relays, with optional direct paths when peers consent. Tag-mode
+> relays route by pair-scoped tags. The transport uses upstream `quinn` and
+> `rustls`.
 
-It is for a Bothy box (and, once Wildbloom Node adopts it, a Tor-less
-Wildbloom node) that needs to talk to a peer across NATs without running its own discovery service or trusting a
-relay operator with its identity. The contract is narrow: how a node
-identifies itself, how two nodes discover a route, how they attempt a direct
-connection, how they fall back to a relay, and how a transport plugs into a
-Blossom store. Every cryptographic primitive, the TLS stack and the QUIC
-stack come from independently maintained crates; this project owns only the
-protocol on top of them.
+Use Link for an app that manages peer enrolment and chooses its own relays.
+Use `link-endpoint` for streams and `link-blossom` for hash-addressed blob
+fetch with optional `shelter-kit` integration.
 
 ## ForgeSworn ecosystem
 
@@ -22,20 +18,11 @@ protocol on top of them.
 
 ## Getting Started
 
-This is a Rust workspace of unpublished crates (`publish = false`); consume
-it as a path or git dependency, or run the demo binaries directly.
+- [Native Rust starter](examples/paired-echo/README.md): Run `cargo run --locked` from `examples/paired-echo` to test a paired echo over loopback WSS. Copy the directory into a new app or add `link-endpoint` at the pinned git revision shown in the guide.
+- [Paired file quickstart](docs/paired-quickstart.md): Run a sender and receiver on separate machines with a one-use invite and your chosen relay.
+- [Endpoint configuration](README.md#endpoint-configuration): Configure owner-approved relay URLs, tag-mode routing and direct-path opt-in.
 
-```sh
-cargo build
-```
-
-That builds the `link-relay` and `link-spike` binaries. See
-[Running the loopback demo](README.md#running-the-loopback-demo) for the
-full two-key walkthrough: start a relay, mint two keys, serve on one and
-send from the other.
-
-See [Endpoint configuration](README.md#endpoint-configuration) for tag-mode
-defaults, owner-approved relay URLs and the explicit direct-path opt-in.
+Link's Rust crates are currently consumed from git or a local path.
 
 ## Key Concepts
 
@@ -51,7 +38,7 @@ defaults, owner-approved relay URLs and the explicit direct-path opt-in.
 - `link-endpoint`: `Endpoint`, `EndpointConfig`, `Session`, `Stream`, `PairingSession`, `RelaySpec`, `RelayStatus`, `TagBook`, `RendezvousPeer`.
 - `link-blossom`: a hash-addressed blob-fetch protocol over a `Session` stream, plus an optional `shelter-kit` `BlobFetcher` adapter for mirror and repair.
 - `link-relay`: the `link-relay` binary, a bounded WebSocket datagram relay plus a stateless UDP reflector.
-- `link-spike`: the `link-spike` binary (`keygen`, `card`, `serve`, `send`) used for the loopback and real-network demos.
+- `link-spike`: the `link-spike` binary. Start with `pair-receive` and `pair-send` for a paired file transfer.
 
 ## Optional
 
