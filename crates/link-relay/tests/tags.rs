@@ -2,6 +2,7 @@
 //! self-exclusion, replacement on re-register, silent drops for unknown tags,
 //! coexistence with identity sessions, and mode mixing as malformed.
 
+use std::io::ErrorKind;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -12,11 +13,12 @@ use link_core::wire::{
 };
 use link_relay::{RelayConfig, RelayHandle};
 use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::protocol::frame::{
     Frame as WebSocketFrame,
     coding::{Data, OpCode},
 };
+use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
 
@@ -172,7 +174,7 @@ async fn a_full_registration_can_be_fragmented_around_a_websocket_ping() {
 }
 
 #[tokio::test]
-async fn an_oversize_websocket_message_receives_the_link_malformed_reason() {
+async fn an_oversize_websocket_message_closes_the_session() {
     let relay = start_relay().await;
     let mut ws = open_tags(&relay.url("127.0.0.1"), vec![tag(7)]).await;
     let mut frame = Frame::Register {
@@ -181,10 +183,35 @@ async fn an_oversize_websocket_message_receives_the_link_malformed_reason() {
     .encode();
     frame.push(0);
     ws.send(Message::Binary(frame)).await.unwrap();
-    assert_eq!(
-        next_frame(&mut ws).await,
-        Some(Frame::Close(CLOSE_REASON_MALFORMED))
-    );
+    // The WebSocket reader can reject an oversized frame at its header. With
+    // unread input, TCP can reset before it delivers the best-effort reason.
+    // Require prompt termination, and validate the reason whenever it arrives.
+    let terminal = tokio::time::timeout(Duration::from_secs(5), async {
+        let first = ws.next().await;
+        if let Some(Ok(Message::Binary(bytes))) = &first {
+            assert_eq!(
+                Frame::decode(bytes),
+                Some(Frame::Close(CLOSE_REASON_MALFORMED))
+            );
+            ws.next().await
+        } else {
+            first
+        }
+    })
+    .await
+    .expect("oversize message closes the socket");
+    match terminal {
+        None | Some(Ok(Message::Close(_))) => {}
+        Some(Err(WebSocketError::Protocol(ProtocolError::ResetWithoutClosingHandshake))) => {}
+        Some(Err(WebSocketError::Io(error)))
+            if matches!(
+                error.kind(),
+                ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::UnexpectedEof
+            ) => {}
+        other => panic!("expected an oversize disconnect, got {other:?}"),
+    }
     relay.shutdown();
 }
 
