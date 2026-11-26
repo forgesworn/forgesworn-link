@@ -474,31 +474,70 @@ impl RelayDriver {
             return QueueOutcome::Dropped;
         }
         let up = matches!(&*self.status.borrow(), RelayStatus::Up(_));
-        let frame = match &self.book {
-            None => Frame::Send {
-                destination,
-                datagram: datagram.to_vec(),
-            },
-            Some(book) => {
-                // Tag mode: the peer's identity never goes to the relay.  The
-                // tag depends on which relay this session is on, so nothing is
-                // sendable before the welcome names it.
-                let Some(tag) = self
-                    .with_current_host(|host| book.tag_for_send(destination, host, rt::unix_now()))
-                else {
-                    return QueueOutcome::Dropped;
-                };
-                Frame::SendTag {
-                    tag,
-                    datagram: datagram.to_vec(),
-                }
-            }
+        let Some(frame) = self
+            .send_frames(destination, std::iter::once(datagram))
+            .and_then(|mut frames| frames.next())
+        else {
+            return QueueOutcome::Dropped;
         };
         match self.outbound.try_send(frame) {
             Ok(()) => QueueOutcome::Queued,
             Err(mpsc::error::TrySendError::Full(_)) if up => QueueOutcome::WouldBlock,
             Err(_) => QueueOutcome::Dropped,
         }
+    }
+
+    pub(crate) fn try_send_segments(
+        &self,
+        destination: NodeId,
+        contents: &[u8],
+        size: usize,
+    ) -> QueueOutcome {
+        if *self.stop.borrow() {
+            return QueueOutcome::Dropped;
+        }
+        let up = matches!(&*self.status.borrow(), RelayStatus::Up(_));
+        let datagrams = contents.chunks(size);
+        let count = datagrams.len();
+        let Some(frames) = self.send_frames(destination, datagrams) else {
+            return QueueOutcome::Dropped;
+        };
+        match self.outbound.try_reserve_many(count) {
+            Ok(permits) => {
+                for (permit, frame) in permits.zip(frames) {
+                    permit.send(frame);
+                }
+                QueueOutcome::Queued
+            }
+            Err(mpsc::error::TrySendError::Full(_)) if up => QueueOutcome::WouldBlock,
+            Err(_) => QueueOutcome::Dropped,
+        }
+    }
+
+    fn send_frames<'a>(
+        &self,
+        destination: NodeId,
+        datagrams: impl Iterator<Item = &'a [u8]>,
+    ) -> Option<impl Iterator<Item = Frame>> {
+        let tag = match &self.book {
+            None => None,
+            Some(book) => {
+                // A tag belongs to the relay named by the current welcome.
+                Some(self.with_current_host(|host| {
+                    book.tag_for_send(destination, host, rt::unix_now())
+                })?)
+            }
+        };
+        Some(datagrams.map(move |datagram| match tag {
+            Some(tag) => Frame::SendTag {
+                tag,
+                datagram: datagram.to_vec(),
+            },
+            None => Frame::Send {
+                destination,
+                datagram: datagram.to_vec(),
+            },
+        }))
     }
 
     /// Run `f` with the lowercase host of the relay the session is on, or
@@ -519,7 +558,11 @@ impl RelayDriver {
     }
 
     pub fn has_capacity(&self) -> bool {
-        self.outbound.capacity() > 0
+        self.has_capacity_for(1)
+    }
+
+    pub(crate) fn has_capacity_for(&self, count: usize) -> bool {
+        self.outbound.capacity() >= count
     }
 
     pub fn readiness(&self) -> &Arc<WriteReadiness> {
@@ -1032,6 +1075,55 @@ async fn pump(
 #[cfg(all(test, not(wasm_browser)))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn segmented_fallback_queues_the_whole_transmit_or_nothing() {
+        let (outbound, mut frames) = mpsc::channel(2);
+        let (_status, status) = watch::channel(RelayStatus::Up("wss://relay.example".into()));
+        let (stop, _stop_rx) = watch::channel(false);
+        let (_finished, finished) = watch::channel(false);
+        let driver = RelayDriver {
+            id: 0,
+            urls: Arc::new(Vec::new()),
+            outbound,
+            status,
+            events: broadcast::channel(1).0,
+            readiness: Arc::new(WriteReadiness::default()),
+            book: None,
+            host_memo: Arc::new(Mutex::new(None)),
+            activity: Arc::new(RelayActivity::default()),
+            stop,
+            finished,
+        };
+        let peer = NodeId([3; 32]);
+        assert!(matches!(
+            driver.try_send(peer, b"queued"),
+            QueueOutcome::Queued
+        ));
+        assert!(matches!(
+            driver.try_send_segments(peer, b"firstend", 5),
+            QueueOutcome::WouldBlock
+        ));
+        assert!(!driver.has_capacity_for(2));
+        assert!(matches!(
+            frames.try_recv().unwrap(),
+            Frame::Send { destination, datagram } if destination == peer && datagram == b"queued"
+        ));
+        assert!(frames.try_recv().is_err());
+
+        assert!(driver.has_capacity_for(2));
+        assert!(matches!(
+            driver.try_send_segments(peer, b"firstend", 5),
+            QueueOutcome::Queued
+        ));
+        for expected in [b"first".as_slice(), b"end"] {
+            assert!(matches!(
+                frames.try_recv().unwrap(),
+                Frame::Send { destination, datagram } if destination == peer && datagram == expected
+            ));
+        }
+        assert!(frames.try_recv().is_err());
+    }
 
     /// A browser opens a relay only as a plain `wss://` spec, which it
     /// verifies against its own WebPKI roots.  A pin, an insecure flag or

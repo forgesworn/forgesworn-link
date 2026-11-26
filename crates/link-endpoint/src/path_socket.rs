@@ -76,6 +76,8 @@ const PONG_INTERVAL: Duration = Duration::from_secs(1);
 pub const LEARNED_TTL: Duration = Duration::from_secs(10);
 /// Bounded inbound queue.  Roughly 700 KiB at the 1350 byte datagram cap.
 const INBOUND_CAPACITY: usize = 512;
+/// Bound UDP segmentation and the number of relay queue slots one send needs.
+const MAX_SEND_SEGMENTS: usize = 10;
 
 type ProbeKeyId = [u8; PROBE_ID_BYTES];
 type ProbeKey = [u8; PROBE_KEY_BYTES];
@@ -813,9 +815,11 @@ fn select_local_candidates(
 /// The `AsyncUdpSocket` quinn drives.
 pub struct PathSocket {
     paths: Arc<Paths>,
+    #[cfg(target_os = "linux")]
+    udp_state: Option<Arc<quinn::udp::UdpSocketState>>,
     inbound_rx: Mutex<mpsc::Receiver<Inbound>>,
-    /// The driver whose full queue last refused a send; see `Poller`.
-    blocked_on: Arc<Mutex<Option<u64>>>,
+    /// The blocked relay driver and the number of queue slots the send needs.
+    blocked_on: Arc<Mutex<Option<(u64, usize)>>>,
 }
 
 impl std::fmt::Debug for PathSocket {
@@ -851,11 +855,13 @@ pub async fn build(
         }
     }
     #[cfg(target_os = "linux")]
-    let udp_state = quinn::udp::UdpSocketState::new(udp.as_ref().into())?;
+    let udp_state = Arc::new(quinn::udp::UdpSocketState::new(udp.as_ref().into())?);
     let udp_local = udp.local_addr()?;
     let (socket, paths) = assemble(
         key,
         Some(udp.clone()),
+        #[cfg(target_os = "linux")]
+        Some(udp_state.clone()),
         udp_local,
         relays,
         book,
@@ -895,6 +901,8 @@ pub(crate) fn build_relay_only_with_route(
     assemble(
         key,
         None,
+        #[cfg(target_os = "linux")]
+        None,
         unbound,
         relays,
         book,
@@ -910,6 +918,7 @@ pub(crate) fn build_relay_only_with_route(
 fn assemble(
     key: TransportKey,
     udp: Option<Arc<DirectSocket>>,
+    #[cfg(target_os = "linux")] udp_state: Option<Arc<quinn::udp::UdpSocketState>>,
     udp_local: SocketAddr,
     relays: Vec<crate::relay_client::RelaySpec>,
     book: Option<Arc<crate::rendezvous_book::TagBook>>,
@@ -959,6 +968,8 @@ fn assemble(
 
     let socket = Arc::new(PathSocket {
         paths: paths.clone(),
+        #[cfg(target_os = "linux")]
+        udp_state,
         inbound_rx: Mutex::new(inbound_rx),
         blocked_on: Arc::new(Mutex::new(None)),
     });
@@ -985,7 +996,7 @@ fn spawn_direct_inbound(paths: Arc<Paths>, udp: Arc<DirectSocket>) {
 fn spawn_direct_inbound(
     paths: Arc<Paths>,
     udp: Arc<DirectSocket>,
-    state: quinn::udp::UdpSocketState,
+    state: Arc<quinn::udp::UdpSocketState>,
 ) {
     use tokio::io::Interest;
 
@@ -1081,7 +1092,7 @@ struct Poller {
     /// The driver whose full queue last refused a send, shared with the
     /// socket.  Readiness is judged on it, so quinn is not told "ready" by
     /// a driver it is not sending on.
-    blocked_on: Arc<Mutex<Option<u64>>>,
+    blocked_on: Arc<Mutex<Option<(u64, usize)>>>,
 }
 
 impl std::fmt::Debug for Poller {
@@ -1106,11 +1117,11 @@ impl UdpPoller for Poller {
             }
         }
         let has_capacity = || match *self.blocked_on.lock().expect("blocked") {
-            Some(id) => self
+            Some((id, count)) => self
                 .paths
                 .relay
                 .driver(id)
-                .is_none_or(|driver| driver.has_capacity()),
+                .is_none_or(|driver| driver.has_capacity_for(count)),
             None => true,
         };
         if has_capacity() {
@@ -1126,6 +1137,17 @@ impl UdpPoller for Poller {
     }
 }
 
+fn send_direct_datagram(udp: &DirectSocket, addr: SocketAddr, data: &[u8]) -> io::Result<()> {
+    match udp.try_send_to(data, addr) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+            trace!("direct send buffer full, datagram dropped");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 impl AsyncUdpSocket for PathSocket {
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
         let id = self.paths.relay.readiness().new_id();
@@ -1137,11 +1159,20 @@ impl AsyncUdpSocket for PathSocket {
     }
 
     fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
-        if transmit.contents.len() > MAX_DATAGRAM {
-            // The transport config caps the MTU, so this should be unreachable.
+        let packet_size = transmit.segment_size.unwrap_or(transmit.contents.len());
+        if packet_size > MAX_DATAGRAM || transmit.segment_size == Some(0) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "datagram above the relay frame bound",
+                "datagram above the relay frame bound or invalid segment size",
+            ));
+        }
+        let count = transmit
+            .segment_size
+            .map_or(1, |size| transmit.contents.len().div_ceil(size));
+        if !(1..=MAX_SEND_SEGMENTS).contains(&count) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid datagram count",
             ));
         }
         let Some(peer) = self.paths.peer_for_synthetic(transmit.destination) else {
@@ -1155,28 +1186,55 @@ impl AsyncUdpSocket for PathSocket {
             .zip(self.paths.udp.as_ref());
         match direct {
             Some((proven, udp)) => {
-                match udp.try_send_to(transmit.contents, proven.addr) {
-                    Ok(_) => {}
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        trace!("direct send buffer full, datagram dropped");
+                if let Some(size) = transmit.segment_size {
+                    #[cfg(target_os = "linux")]
+                    if let Some(state) = &self.udp_state
+                        && state.max_gso_segments() >= count
+                    {
+                        let segmented = Transmit {
+                            destination: proven.addr,
+                            contents: transmit.contents,
+                            segment_size: Some(size),
+                            ecn: None,
+                            src_ip: None,
+                        };
+                        match udp.try_io(tokio::io::Interest::WRITABLE, || {
+                            state.try_send(udp.as_ref().into(), &segmented)
+                        }) {
+                            Ok(()) => return Ok(()),
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                trace!("direct send buffer full, datagrams dropped");
+                                return Ok(());
+                            }
+                            // If this path rejects GSO, send the individual UDP
+                            // datagrams to the same freshly proven address.
+                            Err(_) => {}
+                        }
                     }
-                    Err(e) => return Err(e),
+                    for datagram in transmit.contents.chunks(size) {
+                        send_direct_datagram(udp, proven.addr, datagram)?;
+                    }
+                    Ok(())
+                } else {
+                    send_direct_datagram(udp, proven.addr, transmit.contents)
                 }
-                Ok(())
             }
             None => {
                 let driver = self.paths.relay_for(peer);
-                match driver.try_send(peer, transmit.contents) {
+                let outcome = if let Some(size) = transmit.segment_size {
+                    driver.try_send_segments(peer, transmit.contents, size)
+                } else {
+                    driver.try_send(peer, transmit.contents)
+                };
+                match outcome {
                     QueueOutcome::Queued | QueueOutcome::Dropped => {
                         *self.blocked_on.lock().expect("blocked") = None;
                         Ok(())
                     }
-                    // Real backpressure while the relay is up, so nothing is
-                    // buffered above the bounded queue and nothing is
-                    // needlessly dropped.  Remember which driver refused, so
-                    // the poller judges readiness on that one.
+                    // Reserve space for the whole transmit before queueing
+                    // any part of it, so a retry cannot duplicate segments.
                     QueueOutcome::WouldBlock => {
-                        *self.blocked_on.lock().expect("blocked") = Some(driver.id());
+                        *self.blocked_on.lock().expect("blocked") = Some((driver.id(), count));
                         Err(io::ErrorKind::WouldBlock.into())
                     }
                 }
@@ -1225,6 +1283,10 @@ impl AsyncUdpSocket for PathSocket {
     }
 
     fn max_transmit_segments(&self) -> usize {
+        #[cfg(target_os = "linux")]
+        if let Some(state) = &self.udp_state {
+            return state.max_gso_segments().min(MAX_SEND_SEGMENTS);
+        }
         1
     }
 
