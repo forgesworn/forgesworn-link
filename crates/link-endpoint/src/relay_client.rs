@@ -6,8 +6,10 @@ use std::sync::{Arc, Mutex};
 use std::task::Waker;
 use std::time::Duration;
 
+use link_core::RelayAdmissionKey;
+use link_core::admission::registration_digest;
 use link_core::id::{NodeId, TransportKey};
-use link_core::wire::{CLOSE_REASON_SUPERSEDED, Frame, MAX_QUEUED_FRAMES};
+use link_core::wire::{CLOSE_REASON_ADMISSION, CLOSE_REASON_SUPERSEDED, Frame, MAX_QUEUED_FRAMES};
 use rand::RngCore;
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, info, warn};
@@ -38,6 +40,8 @@ pub struct RelaySpec {
     pub cert_sha256: Option<String>,
     /// Accept any relay leaf.  Development only, and it says so in the logs.
     pub insecure_tls: bool,
+    /// The operator-issued key for tag registration at this relay.
+    pub admission_key: Option<RelayAdmissionKey>,
 }
 
 impl RelaySpec {
@@ -46,6 +50,7 @@ impl RelaySpec {
             url: url.into(),
             cert_sha256: None,
             insecure_tls: false,
+            admission_key: None,
         }
     }
 
@@ -54,7 +59,25 @@ impl RelaySpec {
             url: url.into(),
             cert_sha256: Some(cert_sha256.into()),
             insecure_tls: false,
+            admission_key: None,
         }
+    }
+
+    /// Require proof of this operator-issued key on every connection to the relay.
+    pub fn with_admission_key(mut self, key: RelayAdmissionKey) -> Self {
+        self.admission_key = Some(key);
+        self
+    }
+
+    pub(crate) fn validate_admission(&self, tag_mode: bool) -> anyhow::Result<()> {
+        if self.admission_key.is_some() {
+            anyhow::ensure!(tag_mode, "relay admission requires tag routing");
+            anyhow::ensure!(
+                self.parts()?.0 && !self.insecure_tls,
+                "relay admission requires certificate-verified wss://"
+            );
+        }
+        Ok(())
     }
 
     pub(crate) fn parts(&self) -> anyhow::Result<(bool, String, u16, String)> {
@@ -315,10 +338,9 @@ pub struct RelayClient {
     book: Option<Arc<TagBook>>,
     inbound: mpsc::Sender<RelayInbound>,
     route: RelayRoute,
-    /// The immutable owner list (including TLS settings) in proxy-required
-    /// mode. This also constrains callers of the lower-level driver API.
-    #[cfg(not(wasm_browser))]
-    proxy_relays: Option<Arc<Vec<RelaySpec>>>,
+    /// Preserve the owner's relay settings in proxy-required or admission mode,
+    /// including for callers of the lower-level driver API.
+    owner_relays: Option<Arc<Vec<RelaySpec>>>,
     /// One write-readiness set for the whole pool: a drain on any driver
     /// wakes quinn, which retries and is told again if its driver is full.
     readiness: Arc<WriteReadiness>,
@@ -377,10 +399,8 @@ impl RelayClient {
     /// to the home list is the home driver; an empty list is the home driver;
     /// past the fan-out bound it is the home driver too.
     pub fn driver_for(&self, relays: &[RelaySpec]) -> RelayDriver {
-        #[cfg(not(wasm_browser))]
         let approved;
-        #[cfg(not(wasm_browser))]
-        let relays = if let Some(configured) = &self.proxy_relays {
+        let relays = if let Some(configured) = &self.owner_relays {
             approved = configured
                 .iter()
                 .filter(|spec| relays.iter().any(|requested| requested.url == spec.url))
@@ -559,9 +579,10 @@ pub(crate) fn spawn_with_route(
     book: Option<Arc<TagBook>>,
     route: RelayRoute,
 ) -> RelayClient {
+    let restrict_relays = relays.iter().any(|spec| spec.admission_key.is_some());
     #[cfg(not(wasm_browser))]
-    let proxy_relays =
-        matches!(route, RelayRoute::ProxyRequired(_)).then(|| Arc::new(relays.clone()));
+    let restrict_relays = restrict_relays || matches!(route, RelayRoute::ProxyRequired(_));
+    let owner_relays = restrict_relays.then(|| Arc::new(relays.clone()));
     let readiness = Arc::new(WriteReadiness::default());
     let home = spawn_driver(
         0,
@@ -578,8 +599,7 @@ pub(crate) fn spawn_with_route(
         book,
         inbound,
         route,
-        #[cfg(not(wasm_browser))]
-        proxy_relays,
+        owner_relays,
         readiness,
         home,
         next_id: Arc::new(AtomicU64::new(1)),
@@ -811,12 +831,20 @@ async fn connect(
     sockets: &SocketShutdown,
     route: RelayRoute,
 ) -> anyhow::Result<RelaySocket> {
+    spec.validate_admission(book.is_some())?;
     let host = spec.host()?;
     let mut ws = RelaySocket::open(spec, sockets, route).await?;
 
-    // First contact: identity auth (spec 3.1) or tag registration (spec 9).
-    let challenge = match next_frame(&mut ws).await? {
-        Some(Frame::Challenge(challenge)) => challenge,
+    // Choose the handshake before sending any identity, tags or proof.
+    let challenge = match (next_frame(&mut ws).await?, &spec.admission_key) {
+        (Some(Frame::Challenge(challenge)), None)
+        | (Some(Frame::AdmissionChallenge(challenge)), Some(_)) => challenge,
+        (Some(Frame::AdmissionChallenge(_)), None) => {
+            anyhow::bail!("relay requires an operator admission key");
+        }
+        (Some(Frame::Challenge(_)), Some(_)) => {
+            anyhow::bail!("configured relay does not offer operator admission");
+        }
         _ => anyhow::bail!("expected a relay challenge"),
     };
     match book {
@@ -832,18 +860,24 @@ async fn connect(
             .await?;
         }
         Some(book) => {
-            // No identity and no signature ever go to the relay on this path;
-            // the challenge is acknowledged by ignoring it.
             let tags = book.registration(&host, rt::unix_now());
             if tags.is_empty() {
                 anyhow::bail!("tag mode with no rendezvous pairs to register");
             }
-            ws.send(Frame::Register { tags }.encode()).await?;
+            let frame = match &spec.admission_key {
+                Some(key) => Frame::RegisterAdmitted {
+                    proof: key.proof(&challenge, &registration_digest(&tags)),
+                    tags,
+                },
+                None => Frame::Register { tags },
+            };
+            ws.send(frame.encode()).await?;
             activity.registrations_sent.fetch_add(1, Ordering::Relaxed);
         }
     }
     match next_frame(&mut ws).await? {
         Some(Frame::Welcome(_token)) => Ok(ws),
+        Some(Frame::Close(CLOSE_REASON_ADMISSION)) => anyhow::bail!("relay admission refused"),
         _ => anyhow::bail!("expected a relay welcome"),
     }
 }

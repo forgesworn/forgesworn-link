@@ -1,10 +1,18 @@
 //! The `link-relay` binary: WebSocket datagram relay plus UDP reflector.
 
+use std::io;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use anyhow::{Context, Result, ensure};
 use clap::Parser;
-use link_relay::{RelayConfig, TlsMaterial};
+use link_core::RelayAdmissionKey;
+use link_core::admission::RELAY_ADMISSION_KEY_BYTES;
+use link_relay::{MAX_ADMISSION_KEYS, RelayAdmission, RelayConfig, TlsMaterial};
+use tokio::io::AsyncReadExt;
 use tracing_subscriber::{filter::filter_fn, prelude::*};
+use zeroize::Zeroizing;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -24,6 +32,9 @@ struct Args {
     /// Serve plain ws:// instead of wss://.  Only acceptable on loopback.
     #[arg(long)]
     insecure_ws: bool,
+    /// Require an operator key. Reload this private allowlist while running.
+    #[arg(long, value_name = "FILE")]
+    admission_keys_file: Option<PathBuf>,
     /// Per-session outbound byte budget.  Zero means no budget.
     #[arg(long, default_value_t = 0)]
     bytes_per_second: u64,
@@ -70,7 +81,18 @@ async fn main() -> anyhow::Result<()> {
         reflector_per_second: args.reflector_per_second,
     };
 
-    let handle = link_relay::start(config).await?;
+    let admission = match args.admission_keys_file {
+        Some(path) => {
+            let policy = RelayAdmission::default();
+            reload_keys(&path, &policy).await?;
+            Some((path, policy))
+        }
+        None => None,
+    };
+    let handle = match &admission {
+        Some((_, policy)) => link_relay::start_with_admission(config, policy.clone()).await?,
+        None => link_relay::start(config).await?,
+    };
     let host = args
         .hosts
         .first()
@@ -83,7 +105,77 @@ async fn main() -> anyhow::Result<()> {
         None => println!("tls none (plain ws, loopback only)"),
     }
 
-    link_relay::wait_for_ctrl_c().await?;
+    let stopped = match admission {
+        Some((path, policy)) => watch_admission_file(&path, &policy).await,
+        None => link_relay::wait_for_ctrl_c().await,
+    };
     handle.shutdown();
+    stopped?;
     Ok(())
+}
+
+async fn reload_keys(path: &Path, policy: &RelayAdmission) -> Result<()> {
+    const MAX_BYTES: u64 = (MAX_ADMISSION_KEYS * (2 * RELAY_ADMISSION_KEY_BYTES + 2)) as u64;
+    let metadata = tokio::fs::symlink_metadata(path)
+        .await
+        .context("opening the admission allowlist")?;
+    ensure!(
+        metadata.is_file(),
+        "the admission allowlist must be a regular file"
+    );
+    let file = tokio::fs::File::open(path).await?;
+    let metadata = file.metadata().await?;
+    ensure!(
+        metadata.is_file(),
+        "the opened allowlist must be a regular file"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        ensure!(
+            metadata.permissions().mode() & 0o077 == 0,
+            "the admission allowlist must be owner-only"
+        );
+    }
+    let mut bytes = Zeroizing::new(Vec::new());
+    file.take(MAX_BYTES + 1).read_to_end(&mut bytes).await?;
+    ensure!(
+        bytes.len() as u64 <= MAX_BYTES,
+        "the admission allowlist is too large"
+    );
+    let keys = std::str::from_utf8(&bytes)?
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            RelayAdmissionKey::from_hex(line).context("invalid hex key in admission allowlist")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    policy.replace_keys(keys)
+}
+
+async fn watch_admission_file(path: &Path, policy: &RelayAdmission) -> io::Result<()> {
+    let shutdown = link_relay::wait_for_ctrl_c();
+    tokio::pin!(shutdown);
+    let mut ticks = tokio::time::interval(Duration::from_secs(1));
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut closed = false;
+    loop {
+        tokio::select! {
+            result = &mut shutdown => return result,
+            _ = ticks.tick() => {}
+        }
+        if reload_keys(path, policy).await.is_err() {
+            if !closed {
+                policy
+                    .replace_keys(Vec::new())
+                    .expect("empty admission allowlist");
+                tracing::warn!(target: link_relay::LOG_TARGET, "admission allowlist unavailable; relay access closed");
+                closed = true;
+            }
+        } else if closed {
+            tracing::info!(target: link_relay::LOG_TARGET, "admission allowlist restored");
+            closed = false;
+        }
+    }
 }

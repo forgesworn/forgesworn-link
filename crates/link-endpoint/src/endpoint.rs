@@ -360,6 +360,18 @@ impl Endpoint {
             config.serial_seed != Some(u64::MAX),
             "card serial seed is exhausted"
         );
+        let tag_mode = config.rendezvous.is_some() || config.paired_routes.is_some();
+        anyhow::ensure!(
+            !config.allow_unconfigured_relays
+                || !config
+                    .relays
+                    .iter()
+                    .any(|relay| relay.admission_key.is_some()),
+            "relay admission requires owner-approved destinations"
+        );
+        for relay in &config.relays {
+            relay.validate_admission(tag_mode)?;
+        }
         #[cfg(not(wasm_browser))]
         let relay_route = config.relay_route()?;
         #[cfg(wasm_browser)]
@@ -367,7 +379,7 @@ impl Endpoint {
             browser_config_check(&config)?;
             RelayRoute::Tcp
         };
-        let book = (config.rendezvous.is_some() || config.paired_routes.is_some()).then(|| {
+        let book = tag_mode.then(|| {
             Arc::new(TagBook::with_paired(
                 config.rendezvous.take().unwrap_or_default(),
                 config.paired_routes.take().unwrap_or_default(),

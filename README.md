@@ -58,6 +58,11 @@ configured scheme, host, effective port and path. Link uses the matching
 owner-supplied relay specs, including their TLS settings and failover order.
 A card without relay hints uses the configured home relays.
 
+Operators can require a grant at a tag-mode relay. Rust clients bind the
+grant to the approved relay using `RelaySpec::with_admission_key`. The paired
+files starter reads a key file supplied by the operator.
+[Private relay setup](docs/relay-admission.md)
+
 The Android and browser engines receive these approved destinations through
 `LinkConfig.relay_urls` and `relayUrls` respectively. An integration that
 previously relied on signed card hints must pass the user's approved relay

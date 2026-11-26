@@ -98,6 +98,7 @@ impl RelayArgs {
                 url: url.clone(),
                 cert_sha256: self.relay_certs.get(index).cloned(),
                 insecure_tls: self.relay_insecure_tls,
+                admission_key: None,
             })
             .collect()
     }

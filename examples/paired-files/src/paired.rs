@@ -25,7 +25,7 @@ use zeroize::Zeroizing;
 #[path = "state.rs"]
 mod state;
 
-use state::{SavedCard, SavedPair, StagedPair};
+use state::{SavedCard, SavedPair, StagedPair, read_admission_key};
 
 const INVITE_PREFIX: &str = "fsl-file-1.";
 const INVITE_LIFETIME: Duration = Duration::from_secs(300);
@@ -64,6 +64,10 @@ struct RelayArgs {
     /// SHA-256 of the relay certificate for a self-signed relay.
     #[arg(long)]
     relay_cert_sha256: Option<String>,
+    /// Operator-issued key file when the approved relay requires admission.
+    #[arg(long, value_name = "FILE")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    relay_admission_key_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -83,24 +87,37 @@ pub(super) struct SavedArgs {
     /// The pairing record created by this peer.
     #[arg(long, value_name = "PAIR_FILE")]
     state: PathBuf,
+    /// Use a different operator key file for this transfer.
+    #[arg(long, value_name = "FILE")]
+    relay_admission_key_file: Option<PathBuf>,
     /// The input or output file, chosen locally.
     #[arg(value_name = "FILE")]
     file: PathBuf,
 }
 
 impl RelayArgs {
-    fn config(&self, key: TransportKey) -> Result<EndpointConfig> {
+    fn config(&self, key: TransportKey, key_file: Option<&Path>) -> Result<EndpointConfig> {
         ensure!(
             self.relay.starts_with("wss://"),
             "the relay must use wss://"
         );
-        let relay = match &self.relay_cert_sha256 {
+        let mut relay = match &self.relay_cert_sha256 {
             Some(pin) => RelaySpec::pinned(&self.relay, pin),
             None => RelaySpec::plain(&self.relay),
         };
+        if let Some(path) = key_file.or(self.relay_admission_key_file.as_deref()) {
+            relay = relay.with_admission_key(read_admission_key(path)?);
+        }
         let mut config = EndpointConfig::new(key);
         config.relays = vec![relay];
         Ok(config)
+    }
+
+    async fn open_for_pairing(&mut self, key: TransportKey) -> Result<Endpoint> {
+        if let Some(path) = &mut self.relay_admission_key_file {
+            *path = std::path::absolute(&*path)?;
+        }
+        Endpoint::open(self.config(key, None)?).await
     }
 }
 
@@ -166,11 +183,11 @@ async fn wait_for_relay(endpoint: &Endpoint) -> Result<()> {
     Ok(())
 }
 
-async fn receive(args: TransferArgs) -> Result<()> {
+async fn receive(mut args: TransferArgs) -> Result<()> {
     let staged = stage_output(&args.file)?;
     let state = args.state.map(StagedPair::new).transpose()?;
     let key = TransportKey::generate();
-    let endpoint = Endpoint::open(args.relay.config(key.clone())?).await?;
+    let endpoint = args.relay.open_for_pairing(key.clone()).await?;
     let mut secret = Zeroizing::new([0; PAIRING_SECRET_BYTES]);
     OsRng.fill_bytes(secret.as_mut());
     let registration = endpoint.register_pairing_secret(*secret, INVITE_LIFETIME)?;
@@ -256,14 +273,14 @@ async fn open_input(path: &Path) -> Result<(File, u64)> {
     Ok((file, meta.len()))
 }
 
-async fn send(args: TransferArgs) -> Result<()> {
+async fn send(mut args: TransferArgs) -> Result<()> {
     let (file, size) = open_input(&args.file).await?;
     let state = args.state.map(StagedPair::new).transpose()?;
     let (card, verified_at, secret) = read_invite()?;
     let remaining = card.expires_at.saturating_sub(unix_now());
     ensure!(remaining != 0, "invite expired");
     let key = TransportKey::generate();
-    let endpoint = Endpoint::open(args.relay.config(key.clone())?).await?;
+    let endpoint = args.relay.open_for_pairing(key.clone()).await?;
     let registration = endpoint
         .register_pairing_secret(*secret, INVITE_LIFETIME.min(Duration::from_secs(remaining)))?;
     let pair = endpoint.connect_pairing(&card, &registration).await?;
@@ -326,7 +343,7 @@ async fn saved_receive(args: SavedArgs) -> Result<()> {
     let pair = SavedPair::load(&args.state)?;
     let peer = pair.receive_peer()?;
     let staged = stage_output(&args.file)?;
-    let endpoint = pair.open().await?;
+    let endpoint = pair.open(args.relay_admission_key_file.as_deref()).await?;
     wait_for_relay(&endpoint).await?;
     println!("ready for paired transfer");
     let session = endpoint.accept().await?;
@@ -343,7 +360,7 @@ async fn saved_send(args: SavedArgs) -> Result<()> {
     let pair = SavedPair::load(&args.state)?;
     let card = pair.send_card()?;
     let (file, size) = open_input(&args.file).await?;
-    let endpoint = pair.open().await?;
+    let endpoint = pair.open(args.relay_admission_key_file.as_deref()).await?;
     let session = endpoint.connect(&card).await?;
     send_file(&session, file, size).await?;
     endpoint.close().await;

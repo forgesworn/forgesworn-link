@@ -26,9 +26,12 @@ working exploit or a step-by-step extraction path.
   the same session earns at most one pong a second and a candidate that
   lapses in ten seconds.
 - **Relay admission.** In identity mode the relay verifies the connecting
-  node's signature. In tag mode a nonempty registration opens a routing
-  session within the relay's global and per-source limits. A private relay
-  needs an operator-controlled ingress boundary.
+  node's signature. Ordinary tag mode admits nonempty registrations within
+  global and per-source limits. The optional private listener requires a
+  challenge-bound proof of an operator-issued key before registration.
+  Removing the key closes its active relay connections and refuses it on
+  reconnect. The relay can correlate connections using the same grant.
+  [Private relay setup and wire format](docs/relay-admission.md)
 - **Pairing.** Rendezvous tags grant reachability and are visible to the
   relay. Pinned TLS authenticates the transport peer. A provisional pairing
   session authenticates the listener's pinned key and verifies the dialler's

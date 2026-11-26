@@ -1,5 +1,7 @@
 //! Exercise both demo processes and inspect their WSS frames at a local relay.
 
+use std::collections::HashSet;
+use std::io::Write;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -7,9 +9,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use futures_util::{SinkExt, StreamExt};
+use link_core::RelayAdmissionKey;
 use link_core::wire::Frame;
-use link_relay::{RelayConfig, TlsMaterial};
+use link_relay::{RelayAdmission, RelayConfig, TlsMaterial};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use tempfile::NamedTempFile;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::process::{Child, ChildStdout, Command};
@@ -17,6 +21,8 @@ use tokio::task::JoinSet;
 use tokio_tungstenite::tungstenite::{Error, Message};
 
 const MARKER: &[u8] = b"Link quickstart synthetic file marker";
+const SENDER_KEY: [u8; 32] = [0x98; 32];
+const RECEIVER_KEY: [u8; 32] = [0xa3; 32];
 
 #[derive(Default)]
 struct Frames {
@@ -24,6 +30,9 @@ struct Frames {
     routed: usize,
     identity: usize,
     fixture_in_clear: bool,
+    key_in_clear: bool,
+    proofs: HashSet<[u8; 32]>,
+    repeat_proof: bool,
 }
 
 impl Frames {
@@ -32,8 +41,14 @@ impl Frames {
             return Ok(());
         };
         self.fixture_in_clear |= bytes.windows(MARKER.len()).any(|bytes| bytes == MARKER);
+        self.key_in_clear |= bytes
+            .windows(32)
+            .any(|bytes| bytes == SENDER_KEY || bytes == RECEIVER_KEY);
         match Frame::decode(bytes).context("invalid relay frame")? {
             Frame::Register { .. } => self.register += 1,
+            Frame::RegisterAdmitted { proof, .. } => {
+                self.repeat_proof |= !self.proofs.insert(proof);
+            }
             Frame::SendTag { .. } | Frame::RecvTag { .. } => self.routed += 1,
             Frame::Auth { .. } | Frame::Send { .. } | Frame::Recv { .. } => self.identity += 1,
             _ => {}
@@ -88,9 +103,25 @@ async fn inspect_endpoint(
     }
 }
 
-async fn transfer(save_pair: bool) -> Result<()> {
+fn key_file(dir: &Path, key: &[u8; 32]) -> Result<NamedTempFile> {
+    let mut file = NamedTempFile::new_in(dir)?;
+    writeln!(file, "{}", hex::encode(key))?;
+    Ok(file)
+}
+
+async fn transfer(save_pair: bool, private: bool) -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let relay = link_relay::start(RelayConfig::default()).await?;
+    let config = RelayConfig::default();
+    let relay = if private {
+        let policy = RelayAdmission::default();
+        policy.replace_keys(vec![
+            RelayAdmissionKey::from_bytes(SENDER_KEY),
+            RelayAdmissionKey::from_bytes(RECEIVER_KEY),
+        ])?;
+        link_relay::start_with_admission(config, policy).await?
+    } else {
+        link_relay::start(config).await?
+    };
     let material = TlsMaterial::self_signed(&["127.0.0.1".into()])?;
     let pin = material.fingerprint();
     let cert = CertificateDer::from(material.cert_der);
@@ -113,6 +144,14 @@ async fn transfer(save_pair: bool) -> Result<()> {
     let output = dir.path().join("output.txt");
     let receiver_state = dir.path().join("receiver.pair");
     let sender_state = dir.path().join("sender.pair");
+    let credentials = if private {
+        Some((
+            key_file(dir.path(), &RECEIVER_KEY)?,
+            key_file(dir.path(), &SENDER_KEY)?,
+        ))
+    } else {
+        None
+    };
     let bytes = MARKER.repeat(8192);
     std::fs::write(&input, &bytes)?;
     let cli = env!("CARGO_BIN_EXE_link-spike");
@@ -121,6 +160,11 @@ async fn transfer(save_pair: bool) -> Result<()> {
     receive.arg("pair-receive").args(flags);
     if save_pair {
         receive.arg("--state").arg(&receiver_state);
+    }
+    if let Some((receiver_key, _)) = &credentials {
+        receive
+            .arg("--relay-admission-key-file")
+            .arg(receiver_key.path());
     }
     let mut receiver = receive
         .arg(&output)
@@ -138,6 +182,10 @@ async fn transfer(save_pair: bool) -> Result<()> {
     send.arg("pair-send").args(flags);
     if save_pair {
         send.arg("--state").arg(&sender_state);
+    }
+    if let Some((_, sender_key)) = &credentials {
+        send.arg("--relay-admission-key-file")
+            .arg(sender_key.path());
     }
     let mut sender = send
         .arg(&input)
@@ -208,9 +256,21 @@ async fn transfer(save_pair: bool) -> Result<()> {
     assert!(frames.register > 0 && frames.routed > 0);
     assert_eq!(frames.identity, 0);
     assert!(!frames.fixture_in_clear);
+    assert!(!frames.key_in_clear);
+    assert!(!frames.repeat_proof);
+    if private {
+        assert!(
+            frames.proofs.len() >= 4,
+            "each first and restored connection proves its grant"
+        );
+    } else {
+        assert!(frames.proofs.is_empty());
+    }
     println!(
-        "Relay decoded {} tag registrations and {} tagged data frames. Zero identity frames or clear file markers.",
-        frames.register, frames.routed
+        "Relay decoded {} registrations, {} fresh admission proofs and {} tagged data frames. Zero identity frames, raw keys or clear file markers.",
+        frames.register,
+        frames.proofs.len(),
+        frames.routed
     );
     Ok(())
 }
@@ -249,14 +309,21 @@ async fn check_transfer(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn paired_cli_uses_tag_routing_for_a_verified_file() -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(25), transfer(false))
+    tokio::time::timeout(Duration::from_secs(25), transfer(false, false))
         .await
         .context("paired transfer timed out")?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn paired_cli_transfers_again_after_both_peers_restart() -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(25), transfer(true))
+    tokio::time::timeout(Duration::from_secs(25), transfer(true, false))
         .await
         .context("saved pairing transfer timed out")?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn paired_cli_reproves_admission_after_both_peers_restart() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(25), transfer(true, true))
+        .await
+        .context("admitted pairing transfer timed out")?
 }

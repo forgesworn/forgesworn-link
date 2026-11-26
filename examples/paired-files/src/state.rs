@@ -6,6 +6,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
+use link_core::RelayAdmissionKey;
+use link_core::admission::RELAY_ADMISSION_KEY_BYTES;
 use link_core::card::{Card, VerifyContext};
 use link_core::id::{NodeId, TransportKey};
 use link_endpoint::Endpoint;
@@ -17,6 +19,36 @@ use super::{RelayArgs, parent_directory};
 
 const STATE_VERSION: u8 = 1;
 const MAX_STATE_BYTES: u64 = 24 * 1024;
+
+pub(super) fn read_admission_key(path: &Path) -> Result<RelayAdmissionKey> {
+    let limit = (2 * RELAY_ADMISSION_KEY_BYTES + 2) as u64;
+    let bytes = read_private_file(path, limit, "relay admission key file")?;
+    RelayAdmissionKey::from_hex(std::str::from_utf8(&bytes)?.trim())
+        .context("the admission key file must contain one 64-character hex key")
+}
+
+fn read_private_file(path: &Path, limit: u64, name: &str) -> Result<Zeroizing<Vec<u8>>> {
+    let metadata = fs::symlink_metadata(path).with_context(|| format!("opening the {name}"))?;
+    ensure!(metadata.is_file(), "the {name} must be a regular file");
+    let file = File::open(path)?;
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file(),
+        "the opened {name} must be a regular file"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        ensure!(
+            metadata.permissions().mode() & 0o077 == 0,
+            "the {name} must have owner-only permissions"
+        );
+    }
+    let mut contents = Zeroizing::new(Vec::new());
+    file.take(limit + 1).read_to_end(&mut contents)?;
+    ensure!(contents.len() as u64 <= limit, "the {name} is too large");
+    Ok(contents)
+}
 
 #[derive(Deserialize, Serialize)]
 pub(super) struct SavedCard {
@@ -71,27 +103,7 @@ impl SavedPair {
     }
 
     pub(super) fn load(path: &Path) -> Result<Self> {
-        let metadata = fs::symlink_metadata(path).context("opening the saved pairing")?;
-        ensure!(
-            metadata.is_file(),
-            "the pairing record must be a regular file"
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            ensure!(
-                metadata.permissions().mode() & 0o077 == 0,
-                "the pairing file must have owner-only permissions"
-            );
-        }
-        let mut contents = Zeroizing::new(Vec::new());
-        File::open(path)?
-            .take(MAX_STATE_BYTES + 1)
-            .read_to_end(&mut contents)?;
-        ensure!(
-            contents.len() as u64 <= MAX_STATE_BYTES,
-            "pairing record is too large"
-        );
+        let contents = read_private_file(path, MAX_STATE_BYTES, "pairing file")?;
         let pair: Self = serde_json::from_slice(&contents)
             .map_err(|_| anyhow::anyhow!("invalid saved pairing record"))?;
         ensure!(
@@ -122,9 +134,9 @@ impl SavedPair {
         )?)
     }
 
-    pub(super) async fn open(&self) -> Result<Endpoint> {
+    pub(super) async fn open(&self, key_file: Option<&Path>) -> Result<Endpoint> {
         let key = TransportKey::from_seed(self.transport_seed);
-        let mut config = self.relay.config(key)?;
+        let mut config = self.relay.config(key, key_file)?;
         config.paired_routes = Some(HashMap::from([(
             NodeId(self.peer),
             Zeroizing::new(self.route_secret),
@@ -176,6 +188,7 @@ mod tests {
             RelayArgs {
                 relay: "wss://relay.example/link".into(),
                 relay_cert_sha256: None,
+                relay_admission_key_file: None,
             },
             &TransportKey::generate(),
             receiver.node_id(),
