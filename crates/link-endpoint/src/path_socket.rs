@@ -850,6 +850,8 @@ pub async fn build(
             let _ = socket.set_recv_buffer_size(RECEIVE_BUFFER);
         }
     }
+    #[cfg(target_os = "linux")]
+    let udp_state = quinn::udp::UdpSocketState::new(udp.as_ref().into())?;
     let udp_local = udp.local_addr()?;
     let (socket, paths) = assemble(
         key,
@@ -862,7 +864,12 @@ pub async fn build(
         RelayRoute::Tcp,
         allow_overlay_candidates,
     );
-    spawn_direct_inbound(paths.clone(), udp);
+    spawn_direct_inbound(
+        paths.clone(),
+        udp,
+        #[cfg(target_os = "linux")]
+        udp_state,
+    );
     Ok((socket, paths))
 }
 
@@ -958,67 +965,112 @@ fn assemble(
     (socket, paths)
 }
 
-/// Direct inbound: probes, reflector replies, and datagrams from proven addresses.
 #[cfg(not(wasm_browser))]
+const DIRECT_READ_BUFFER: usize = 2048;
+
+#[cfg(all(not(wasm_browser), not(target_os = "linux")))]
 fn spawn_direct_inbound(paths: Arc<Paths>, udp: Arc<DirectSocket>) {
     rt::spawn(async move {
-        let mut buf = vec![0u8; 2048];
+        let mut buf = vec![0u8; DIRECT_READ_BUFFER];
         loop {
-            let (len, from) = match udp.recv_from(&mut buf).await {
-                Ok(pair) => pair,
-                Err(e) => {
-                    debug!(error = %e, "direct socket receive failed");
-                    continue;
-                }
-            };
-            let from = unmap_ipv6(from);
-            let data = &buf[..len];
-            if let Some(key_id) = Probe::peek_key_id(data) {
-                // A probe names a session by key id; one that opens under
-                // that session's key is handled, anything else is silence.
-                if let Some((peer, key)) = paths.probe_session(&key_id)
-                    && let Some(probe) = Probe::open(data, &key)
-                {
-                    paths.handle_probe(peer, key, probe, from);
-                }
-                continue;
-            }
-            if len == REFLECT_REPLY_BYTES && data[..4] == REFLECT_MAGIC {
-                if let Some((nonce, observed)) = parse_reflect_reply(data) {
-                    // Only the reply to this node's own outstanding request
-                    // counts; anything else could plant a false reflexive
-                    // candidate.
-                    let matched = paths
-                        .reflector_nonce
-                        .lock()
-                        .expect("reflector nonce")
-                        .take_if(|expected| *expected == nonce)
-                        .is_some();
-                    if matched {
-                        let observed = unmap_ipv6(observed);
-                        let permitted = paths.allow_overlay_candidates
-                            || if_addrs::get_if_addrs().is_ok_and(|interfaces| {
-                                !is_tunnel_address(&interfaces, observed.ip())
-                            });
-                        *paths.reflexive.lock().expect("reflexive") = permitted.then_some(observed);
-                    }
-                }
-                continue;
-            }
-            // A datagram from an unproven address is dropped, spec 4.1.
-            let peer = paths
-                .inner
-                .lock()
-                .expect("paths")
-                .by_direct
-                .get(&from)
-                .copied();
-            match peer {
-                Some(peer) => paths.deliver(peer.synthetic_addr(), data),
-                None => trace!(%from, "dropped datagram from an unproven address"),
+            match udp.recv_from(&mut buf).await {
+                Ok((len, from)) => handle_direct_datagram(&paths, from, &buf[..len]),
+                Err(e) => debug!(error = %e, "direct socket receive failed"),
             }
         }
     });
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_direct_inbound(
+    paths: Arc<Paths>,
+    udp: Arc<DirectSocket>,
+    state: quinn::udp::UdpSocketState,
+) {
+    use tokio::io::Interest;
+
+    // Bound the amount of receive work per read and allocate space for GRO.
+    const BATCH: usize = 8;
+    rt::spawn(async move {
+        let buffer_size = DIRECT_READ_BUFFER * state.gro_segments();
+        let mut storage = vec![0u8; BATCH * buffer_size];
+        let mut buffers: Vec<_> = storage
+            .chunks_exact_mut(buffer_size)
+            .map(IoSliceMut::new)
+            .collect();
+        let mut meta = [RecvMeta::default(); BATCH];
+        loop {
+            match udp
+                .async_io(Interest::READABLE, || {
+                    state.recv(udp.as_ref().into(), &mut buffers, &mut meta)
+                })
+                .await
+            {
+                Ok(count) => {
+                    for (buf, meta) in buffers[..count].iter().zip(&meta) {
+                        // One GRO buffer can hold several complete datagrams.
+                        if let Some(data) = buf.get(..meta.len)
+                            && (1..=DIRECT_READ_BUFFER).contains(&meta.stride)
+                        {
+                            for datagram in data.chunks(meta.stride) {
+                                handle_direct_datagram(&paths, meta.addr, datagram);
+                            }
+                        }
+                    }
+                }
+                Err(e) => debug!(error = %e, "direct socket receive failed"),
+            }
+        }
+    });
+}
+
+/// Direct inbound: probes, reflector replies, and datagrams from proven addresses.
+#[cfg(not(wasm_browser))]
+fn handle_direct_datagram(paths: &Paths, from: SocketAddr, data: &[u8]) {
+    let from = unmap_ipv6(from);
+    if let Some(key_id) = Probe::peek_key_id(data) {
+        // A probe names a session by key id; one that opens under
+        // that session's key is handled, anything else is silence.
+        if let Some((peer, key)) = paths.probe_session(&key_id)
+            && let Some(probe) = Probe::open(data, &key)
+        {
+            paths.handle_probe(peer, key, probe, from);
+        }
+        return;
+    }
+    if data.len() == REFLECT_REPLY_BYTES && data[..4] == REFLECT_MAGIC {
+        if let Some((nonce, observed)) = parse_reflect_reply(data) {
+            // Only the reply to this node's own outstanding request
+            // counts; anything else could plant a false reflexive
+            // candidate.
+            let matched = paths
+                .reflector_nonce
+                .lock()
+                .expect("reflector nonce")
+                .take_if(|expected| *expected == nonce)
+                .is_some();
+            if matched {
+                let observed = unmap_ipv6(observed);
+                let permitted = paths.allow_overlay_candidates
+                    || if_addrs::get_if_addrs()
+                        .is_ok_and(|interfaces| !is_tunnel_address(&interfaces, observed.ip()));
+                *paths.reflexive.lock().expect("reflexive") = permitted.then_some(observed);
+            }
+        }
+        return;
+    }
+    // A datagram from an unproven address is dropped, spec 4.1.
+    let peer = paths
+        .inner
+        .lock()
+        .expect("paths")
+        .by_direct
+        .get(&from)
+        .copied();
+    match peer {
+        Some(peer) => paths.deliver(peer.synthetic_addr(), data),
+        None => trace!(%from, "dropped datagram from an unproven address"),
+    }
 }
 
 /// Write-readiness across both paths: the real UDP socket for direct sends and
@@ -1306,9 +1358,9 @@ mod probes {
     use link_core::wire::{PROBE_ID_BYTES, PROBE_KEY_BYTES};
     use tokio::net::UdpSocket;
 
-    async fn paths() -> Arc<Paths> {
+    async fn direct_socket() -> (Arc<PathSocket>, Arc<Paths>) {
         let net = NetMonitor::spawn(Duration::ZERO, Vec::new);
-        let (_socket, paths) = build(
+        build(
             TransportKey::generate(),
             "127.0.0.1:0".parse().unwrap(),
             Vec::new(),
@@ -1318,8 +1370,7 @@ mod probes {
             false,
         )
         .await
-        .expect("path socket binds");
-        paths
+        .expect("path socket binds")
     }
 
     async fn received_within(socket: &UdpSocket, window: Duration) -> Vec<Vec<u8>> {
@@ -1347,7 +1398,7 @@ mod probes {
     /// without a proof.
     #[tokio::test]
     async fn a_replayed_ping_earns_one_pong_a_second_and_a_candidate_that_expires() {
-        let paths = paths().await;
+        let (_, paths) = direct_socket().await;
         let peer = NodeId([9u8; 32]);
         let key = [0x42u8; PROBE_KEY_BYTES];
         let key_id = [0x24u8; PROBE_ID_BYTES];
@@ -1393,7 +1444,7 @@ mod probes {
     /// session has, earns nothing: no pong, no counter-probe, no candidate.
     #[tokio::test]
     async fn a_probe_under_an_unknown_or_wrong_key_is_ignored() {
-        let paths = paths().await;
+        let (_, paths) = direct_socket().await;
         let peer = NodeId([9u8; 32]);
         paths.register_peer(peer);
         paths.register_probe_key(peer, [1u8; PROBE_ID_BYTES], [2u8; PROBE_KEY_BYTES]);
@@ -1434,6 +1485,85 @@ mod probes {
         );
     }
 
+    /// Prove an address over the socket before delivering its data. An
+    /// unproven sender in the same burst gets no credit for that proof.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn batched_receive_keeps_the_source_and_boundaries_of_each_datagram() {
+        use std::future::poll_fn;
+        use tokio::io::Interest;
+        use tokio::time::timeout;
+
+        let (socket, paths) = direct_socket().await;
+        let peer = NodeId([9; 32]);
+        let key = [2; PROBE_KEY_BYTES];
+        paths.register_peer(peer);
+        paths.register_probe_key(peer, [1; PROBE_ID_BYTES], key);
+
+        let proven = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let unproven = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let destination = paths.udp_local();
+        paths.udp.as_ref().unwrap().writable().await.unwrap();
+        assert!(paths.send_ping(peer, proven.local_addr().unwrap()));
+        let wait = Duration::from_secs(2);
+        let mut buf = [0; DIRECT_READ_BUFFER];
+        let (len, _) = timeout(wait, proven.recv_from(&mut buf))
+            .await
+            .expect("probe arrives")
+            .unwrap();
+        let ping = Probe::open(&buf[..len], &key).unwrap();
+        let pong = Probe {
+            kind: PROBE_PONG,
+            ..ping
+        }
+        .seal(&key);
+
+        let state = quinn::udp::UdpSocketState::new((&proven).into()).unwrap();
+        proven.writable().await.unwrap();
+        unproven.writable().await.unwrap();
+        proven.try_send_to(&pong, destination).unwrap();
+        unproven.try_send_to(b"unexpected", destination).unwrap();
+
+        // Exercise a short final GRO segment on kernels supporting GSO.
+        if state.max_gso_segments() > 1 {
+            let transmit = Transmit {
+                destination,
+                ecn: None,
+                contents: b"firstend",
+                segment_size: Some(5),
+                src_ip: None,
+            };
+            proven
+                .async_io(Interest::WRITABLE, || {
+                    state.try_send((&proven).into(), &transmit)
+                })
+                .await
+                .unwrap();
+        } else {
+            proven.try_send_to(b"first", destination).unwrap();
+            proven.try_send_to(b"end", destination).unwrap();
+        }
+
+        let receive = async || {
+            let mut data = [0; 32];
+            let mut bufs = [IoSliceMut::new(&mut data)];
+            let mut meta = [RecvMeta::default()];
+            assert_eq!(
+                poll_fn(|cx| socket.poll_recv(cx, &mut bufs, &mut meta))
+                    .await
+                    .unwrap(),
+                1
+            );
+            (meta[0].addr, data[..meta[0].len].to_vec())
+        };
+        for expected in [b"first".as_slice(), b"end"] {
+            let (source, data) = timeout(wait, receive()).await.unwrap();
+            assert_eq!(source, peer.synthetic_addr());
+            assert_eq!(data, expected);
+        }
+        assert!(timeout(Duration::from_millis(50), receive()).await.is_err());
+    }
+
     /// The relay-only rule: a path socket with no UDP socket, the only kind
     /// a browser build has, never goes direct.  It offers no candidate,
     /// keeps none a peer sends, sends no probe or reflector query, answers
@@ -1465,7 +1595,7 @@ mod probes {
                 .insert(nonce, (addr, Instant::now()));
         };
 
-        let direct = paths().await;
+        let (_, direct) = direct_socket().await;
         assert!(!direct.is_relay_only());
         direct.register_peer(peer);
         direct.register_probe_key(peer, key_id, key);
