@@ -17,9 +17,20 @@ anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true
 hex.workspace = true
+rand.workspace = true
 rustls.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-tokio.workspace = true
+subtle = "2.6"
+tempfile = "3"
+tokio = { workspace = true, features = ["fs"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+futures-util.workspace = true
+link-relay = { path = "../link-relay" }
+tokio = { workspace = true, features = ["process"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-tungstenite.workspace = true

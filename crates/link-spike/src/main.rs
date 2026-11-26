@@ -17,6 +17,8 @@ use link_core::path::PathStatus;
 use link_endpoint::{Endpoint, EndpointConfig, RelaySpec, Session};
 use sha2::{Digest, Sha256};
 
+mod paired;
+
 const CHUNK: usize = 64 * 1024;
 
 #[derive(Parser, Debug)]
@@ -36,6 +38,10 @@ enum Command {
     Serve(ServeArgs),
     /// Connect to a peer card and stream deterministic bytes over one stream.
     Send(SendArgs),
+    /// Make a one-use invite and receive a file through the chosen WSS relay.
+    PairReceive(paired::TransferArgs),
+    /// Read an invite from stdin and send a file through the chosen WSS relay.
+    PairSend(paired::TransferArgs),
 }
 
 #[derive(Args, Debug)]
@@ -210,6 +216,8 @@ async fn main() -> anyhow::Result<()> {
         Command::Card(args) => card(args),
         Command::Serve(args) => serve(args).await,
         Command::Send(args) => send(args).await,
+        Command::PairReceive(args) => paired::receive(args).await,
+        Command::PairSend(args) => paired::send(args).await,
     }
 }
 

@@ -80,9 +80,19 @@ same shaped direct-path outage against Link and Iroh.
 | `link-relay` | The `link-relay` binary: bounded WebSocket datagram relay plus the stateless UDP reflector |
 | `link-endpoint` | `Endpoint`, `Session`, `Stream`, the path socket implementing quinn's `AsyncUdpSocket`, candidate exchange on the control stream, session-keyed UDP probing, and the state machine with its recorded transition history |
 | `link-blossom` | The hash-addressed blob-fetch protocol over a `Session` stream, a transport-neutral `BlobSource` serving trait, and an optional `LinkFetcher` (behind the `shelter-kit` feature) implementing `shelter_kit::BlobFetcher` for mirror and repair |
-| `link-spike` | The `link-spike` binary: `keygen`, `card`, `serve`, `send` |
+| `link-spike` | Paired file-transfer demo and Phase 0 diagnostic commands |
+
+## Try a paired file transfer
+
+The [paired quickstart](docs/paired-quickstart.md) connects two machines
+through a relay you choose. Run the receiver, share its one-use invite and
+send a file. Both endpoints report the verified SHA-256, and the guide
+includes a local check of what the relay can see.
 
 ## Running the loopback demo
+
+This Phase 0 example uses legacy identity routing. Use the paired
+quickstart above for pair-scoped relay tags.
 
 Build first:
 
