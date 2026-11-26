@@ -1,14 +1,10 @@
 //! Run the native Link probe's silent UDP loss case with Iroh.
 
-use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use iroh::endpoint::{Connection, Endpoint, RelayMode, presets};
-use iroh::{EndpointAddr, RelayMap, RelayUrl, TransportAddr};
-use iroh_relay::server::{CertConfig, RelayConfig, Server, ServerConfig, TlsConfig};
-use iroh_relay::tls::CaTlsConfig;
-use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+use iroh::{EndpointAddr, RelayMap, TransportAddr};
 use sha2::{Digest, Sha256};
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
@@ -16,28 +12,11 @@ use tokio::time::{sleep, timeout};
 #[path = "../../../crates/link-endpoint/examples/support/gateway.rs"]
 mod gateway;
 use gateway::{Gateway, IPV4, IPV6};
+mod relay;
+use relay::start_relay;
 
 const ALPN: &[u8] = b"link-iroh-recovery/0";
 const PAYLOAD: [u8; 1024] = [0xa5; 1024];
-
-async fn start_relay() -> Result<(Server, RelayUrl, CaTlsConfig)> {
-    let bind: SocketAddr = IPV4.parse()?;
-    let rcgen::CertifiedKey { cert, key_pair } =
-        rcgen::generate_simple_self_signed(vec![bind.ip().to_string()])?;
-    let cert = cert.der().clone();
-    let ca_tls = CaTlsConfig::custom_roots([cert.clone()]);
-    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
-    let server_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert], key)?;
-    let mut relay_config = RelayConfig::new(bind);
-    relay_config.tls = Some(TlsConfig::new(bind, CertConfig::Manual { server_config }));
-    let mut config = ServerConfig::default();
-    config.relay = Some(relay_config);
-    let relay = Server::spawn(config).await?;
-    let addr = relay.https_addr().context("missing Iroh relay address")?;
-    Ok((relay, format!("https://{addr}").parse()?, ca_tls))
-}
 
 fn selected(conn: &Connection, addr: &TransportAddr) -> bool {
     conn.paths()
@@ -92,7 +71,7 @@ async fn transfer(conn: &Connection) -> Result<()> {
 }
 
 async fn recover() -> Result<(Duration, Duration)> {
-    let (_relay, url, ca_tls) = start_relay().await?;
+    let (_relay, url, ca_tls) = start_relay(IPV4.parse()?).await?;
     let relay_mode = RelayMode::Custom(RelayMap::from_iter([url.clone()]));
     let builder = |bind| {
         Endpoint::builder(presets::Minimal)
