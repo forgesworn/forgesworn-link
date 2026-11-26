@@ -287,7 +287,7 @@ async fn recover(handover: bool) -> Result<(Duration, Duration)> {
         let start = Instant::now();
         original.blackhole();
         let (status, addrs) = if let Some(gateway) = &new_gateway {
-            pair.advertise(&gateway);
+            pair.advertise(gateway);
             (PathStatus::Direct, Some(gateway.addrs))
         } else {
             (PathStatus::Relayed, None)
