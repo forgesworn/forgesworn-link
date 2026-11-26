@@ -1,0 +1,17 @@
+[package]
+name = "link-paired-echo"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.1"
+license = "MIT"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+link-endpoint = { git = "https://github.com/forgesworn/forgesworn-link.git", rev = "3e0c0e3f5f6faab53b3c5bebddb11f5bfa847a4a" }
+link-relay = { git = "https://github.com/forgesworn/forgesworn-link.git", rev = "3e0c0e3f5f6faab53b3c5bebddb11f5bfa847a4a" }
+rand = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "time"] }
+zeroize = "1"
