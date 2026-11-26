@@ -837,6 +837,19 @@ pub async fn build(
     allow_overlay_candidates: bool,
 ) -> io::Result<(Arc<PathSocket>, Arc<Paths>)> {
     let udp = Arc::new(DirectSocket::bind(bind).await?);
+    #[cfg(target_os = "linux")]
+    {
+        // Give bursts room in the kernel while the receive task catches up.
+        // Linux doubles this request for bookkeeping and applies the host cap.
+        const RECEIVE_BUFFER: usize = 256 * 1024;
+        let socket = socket2::SockRef::from(udp.as_ref());
+        if socket
+            .recv_buffer_size()
+            .is_ok_and(|size| size < RECEIVE_BUFFER)
+        {
+            let _ = socket.set_recv_buffer_size(RECEIVE_BUFFER);
+        }
+    }
     let udp_local = udp.local_addr()?;
     let (socket, paths) = assemble(
         key,
