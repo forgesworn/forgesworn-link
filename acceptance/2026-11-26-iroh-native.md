@@ -36,7 +36,7 @@ both selections and the receiver's byte count on the selected path.
 CPU seconds per GiB include both endpoints, the relay, hashing, setup and
 teardown. The denominator includes the two verified warm-up responses.
 
-## Results
+## macOS results
 
 Six alternating blocks per case gave 120 cold trials and 48 measured
 bulk transfers per path per implementation. Cold p95 uses the nearest
@@ -67,7 +67,33 @@ per implementation. Cold startup p95 was 4.071 ms for Link and
 CPU per GiB again favoured Iroh on direct UDP (11.74 vs 13.47 s/GiB)
 and Link on the relay (15.76 vs 18.40 s/GiB).
 
-These measurements cover native IPv4 loopback and one pair at a time.
+## Linux VM results
+
+The same locked probe ran on Debian 12 arm64 with glibc 2.36 in a
+Docker VM on the same Apple M4 Max. Rust 1.94.1 and GCC 15.2 built the
+Linux executable. The container had loopback connectivity only. Six
+alternating blocks again gave 120 cold trials and 48 measured bulk
+transfers per path per implementation. Bash process timing supplied
+user plus system CPU. The transfer counts and calculations matched
+the macOS run.
+
+| Cold relay timing | Link p50 | Link p95 | Iroh p50 | Iroh p95 |
+| --- | ---: | ---: | ---: | ---: |
+| Endpoint startup to verified response | 3.620 ms | 4.750 ms | 260.054 ms | 268.506 ms |
+| Endpoint startup through relay readiness | 1.596 ms | 2.197 ms | 255.801 ms | 263.938 ms |
+| QUIC dial after readiness to verified response | 1.971 ms | 2.739 ms | 3.273 ms | 6.198 ms |
+
+| Warm path | Link MiB/s median (range) | Iroh MiB/s median (range) | Link CPU s/GiB | Iroh CPU s/GiB |
+| --- | ---: | ---: | ---: | ---: |
+| Direct UDP | 260.6 (134.9–284.6) | 341.4 (318.5–362.9) | 7.92 | 5.32 |
+| TLS relay | 333.1 (298.5–345.3) | 286.5 (264.1–297.3) | 12.95 | 15.02 |
+
+Link's median relayed goodput was 16% higher and process CPU per GiB
+was 14% lower. On direct UDP Link delivered 24% lower median goodput
+and used 49% more CPU per GiB. All six block medians followed the
+same goodput ordering for each path.
+
+Both environments use IPv4 loopback and one pair at a time.
 Cross-network relay behaviour, handset handover and venue audio
 latency require field measurements.
 
