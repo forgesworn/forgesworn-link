@@ -547,3 +547,9 @@ The paired-route case `0x04` is separately ratified for implementation in
 tag-mode reachability from a completed, pinned provisional TLS session without
 requiring a product to export a Nostr ECDH secret. It cannot admit a new
 provisional session and does not grant product authority.
+
+An operator MAY require an additional relay-use grant on a tag-mode listener.
+The optional [operator admission extension version 1](docs/relay-admission.md#wire-extension-version-1)
+defines distinct first frames and the lifetime of an admitted connection.
+The rendezvous derivation and the ordinary tag and identity relay frames
+retain their existing encodings.

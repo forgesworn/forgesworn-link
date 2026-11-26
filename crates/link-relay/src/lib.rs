@@ -5,8 +5,8 @@
 //! A session speaks one of two modes, chosen by its first frame.  An identity
 //! session authenticates a node ID and routes by it (spec 3.1, the deployed
 //! behaviour).  A tag session registers pair-scoped rendezvous tags and routes
-//! by them (spec 9): no node ID, no Nostr key and no signature ever reach the
-//! relay on that path, and the relay never logs a tag.
+//! by them (spec 9). Private relays can also require proof of an operator
+//! grant. The relay routes by tags and keeps identity frames off that path.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -20,12 +20,13 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
+use link_core::admission::ADMISSION_PROOF_BYTES;
 use link_core::id::NodeId;
 use link_core::rendezvous::{TAG_BYTES, Tag};
 use link_core::wire::{
-    CLOSE_REASON_MALFORMED, CLOSE_REASON_SUPERSEDED, Frame, IDLE_CLOSE_SECONDS, MAX_QUEUED_FRAMES,
-    MAX_TAGS_PER_REGISTER, REFLECT_REQUEST_BYTES, parse_reflect_request, reflect_reply,
-    verify_relay_auth,
+    CLOSE_REASON_ADMISSION, CLOSE_REASON_MALFORMED, CLOSE_REASON_SUPERSEDED, Frame,
+    IDLE_CLOSE_SECONDS, MAX_QUEUED_FRAMES, MAX_TAGS_PER_REGISTER, REFLECT_REQUEST_BYTES,
+    parse_reflect_request, reflect_reply, verify_relay_auth,
 };
 use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -34,6 +35,9 @@ use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message, protocol::WebSocketConfig};
 use tracing::{info, warn};
+
+mod admission;
+pub use admission::{MAX_ADMISSION_KEYS, RelayAdmission};
 
 /// The relay's process-level diagnostics. Embedding applications can enable
 /// this target without enabling the WebSocket dependency's frame logging.
@@ -247,8 +251,28 @@ fn report_activity(registry: &Shared) {
     );
 }
 
-/// Start both services.  Returns once the sockets are bound.
-pub async fn start(mut config: RelayConfig) -> anyhow::Result<RelayHandle> {
+/// Start both services. Returns once the sockets are bound.
+pub async fn start(config: RelayConfig) -> anyhow::Result<RelayHandle> {
+    start_inner(config, None).await
+}
+
+/// Start a relay that admits only tag connections proving an operator-issued key.
+/// A loopback listener can sit behind the operator's TLS reverse proxy.
+pub async fn start_with_admission(
+    config: RelayConfig,
+    admission: RelayAdmission,
+) -> anyhow::Result<RelayHandle> {
+    anyhow::ensure!(
+        config.tls.is_some() || config.ws_bind.ip().is_loopback(),
+        "an admission-controlled listener needs TLS or a loopback bind"
+    );
+    start_inner(config, Some(admission)).await
+}
+
+async fn start_inner(
+    mut config: RelayConfig,
+    admission: Option<RelayAdmission>,
+) -> anyhow::Result<RelayHandle> {
     let listener = TcpListener::bind(config.ws_bind).await?;
     let ws_addr = listener.local_addr()?;
     let udp = Arc::new(UdpSocket::bind(config.udp_bind).await?);
@@ -317,6 +341,7 @@ pub async fn start(mut config: RelayConfig) -> anyhow::Result<RelayHandle> {
                 let registry = registry.clone();
                 let config = config.clone();
                 let acceptor = acceptor.clone();
+                let admission = admission.clone();
                 let stop_rx = session_stop.clone();
                 tokio::spawn(async move {
                     let result = serve_session(
@@ -326,6 +351,7 @@ pub async fn start(mut config: RelayConfig) -> anyhow::Result<RelayHandle> {
                         registry.clone(),
                         stop_rx,
                         upgrade_deadline,
+                        admission,
                     )
                     .await;
                     let mut guard = registry.lock().expect("registry");
@@ -492,15 +518,17 @@ const TAG_ENDS: usize = 2;
 async fn open_websocket(
     stream: TcpStream,
     acceptor: Option<tokio_rustls::TlsAcceptor>,
+    private: bool,
 ) -> anyhow::Result<RelayWebSocket> {
     stream.set_nodelay(true).ok();
     let transport: Box<dyn Duplex> = match acceptor {
         Some(acceptor) => Box::new(acceptor.accept(stream).await?),
         None => Box::new(stream),
     };
+    let limit = MAX_MESSAGE_BYTES + if private { ADMISSION_PROOF_BYTES } else { 0 };
     let config = WebSocketConfig {
-        max_frame_size: Some(MAX_MESSAGE_BYTES),
-        max_message_size: Some(MAX_MESSAGE_BYTES),
+        max_frame_size: Some(limit),
+        max_message_size: Some(limit),
         ..WebSocketConfig::default()
     };
     Ok(tokio_tungstenite::accept_async_with_config(transport, Some(config)).await?)
@@ -537,16 +565,25 @@ async fn serve_session(
     registry: Shared,
     mut stop_rx: watch::Receiver<bool>,
     upgrade_deadline: tokio::time::Instant,
+    admission: Option<RelayAdmission>,
 ) -> anyhow::Result<()> {
     let handshake = async {
-        let mut ws =
-            tokio::time::timeout_at(upgrade_deadline, open_websocket(stream, acceptor)).await??;
-        // An identity session signs this challenge. A tag session registers
-        // its tags instead, so no identity reaches the tag path.
+        let mut ws = tokio::time::timeout_at(
+            upgrade_deadline,
+            open_websocket(stream, acceptor, admission.is_some()),
+        )
+        .await??;
+        // An identity session signs the challenge. An admitted tag session
+        // uses it to prove an operator-issued key.
         let mut challenge = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut challenge);
+        let challenge_frame = if admission.is_some() {
+            Frame::AdmissionChallenge(challenge)
+        } else {
+            Frame::Challenge(challenge)
+        };
         let first = tokio::time::timeout(FIRST_FRAME_TIMEOUT, async {
-            ws.send(binary(Frame::Challenge(challenge))).await?;
+            ws.send(binary(challenge_frame)).await?;
             match ws.next().await {
                 Some(Ok(message)) => Ok(message),
                 Some(Err(error)) => {
@@ -564,7 +601,7 @@ async fn serve_session(
         _ = stop_rx.changed() => return Ok(()),
         result = handshake => result?,
     };
-    serve_registration(ws, challenge, first, config, registry, stop_rx).await
+    serve_registration(ws, challenge, first, config, registry, stop_rx, admission).await
 }
 
 async fn serve_registration(
@@ -574,13 +611,14 @@ async fn serve_registration(
     config: Arc<RelayConfig>,
     registry: Shared,
     mut stop_rx: watch::Receiver<bool>,
+    admission: Option<RelayAdmission>,
 ) -> anyhow::Result<()> {
     let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
     // Bounded outbound queue, spec 3.1: at most 64 queued frames per session.
     let (tx, mut rx) = mpsc::channel::<Frame>(MAX_QUEUED_FRAMES);
 
-    let mut mode = match decode_binary(&first) {
-        Some(Frame::Auth { node_id, signature }) => {
+    let (mut mode, mut active_grant) = match (decode_binary(&first), admission) {
+        (Some(Frame::Auth { node_id, signature }), None) => {
             let ok = config
                 .hosts
                 .iter()
@@ -601,13 +639,26 @@ async fn serve_registration(
                 // back off rather than fight for the slot.
                 let _ = previous.try_send(Frame::Close(CLOSE_REASON_SUPERSEDED));
             }
-            Mode::Identity(node_id)
+            (Mode::Identity(node_id), None)
         }
-        Some(Frame::Register { tags }) if !tags.is_empty() => {
+        (Some(Frame::Register { tags }), None) if !tags.is_empty() => {
             register_tags(&registry, session_id, &tx, &[], &tags);
-            Mode::Tags(tags)
+            (Mode::Tags(tags), None)
         }
-        _ => {
+        (Some(Frame::RegisterAdmitted { proof, tags }), Some(admission)) if !tags.is_empty() => {
+            let Some(active) = admission.admit(&challenge, &tags, &proof, || {
+                register_tags(&registry, session_id, &tx, &[], &tags);
+            }) else {
+                close_link(&mut ws, CLOSE_REASON_ADMISSION).await;
+                anyhow::bail!("relay admission refused");
+            };
+            (Mode::Tags(tags), Some(active))
+        }
+        (_, Some(_)) => {
+            close_link(&mut ws, CLOSE_REASON_ADMISSION).await;
+            anyhow::bail!("relay admission required");
+        }
+        (_, None) => {
             close_link(&mut ws, CLOSE_REASON_MALFORMED).await;
             anyhow::bail!("first frame was not an auth or a register");
         }
@@ -777,11 +828,16 @@ async fn serve_registration(
             }
         }
     };
-    // Observe shutdown even while a WebSocket write is awaiting capacity.
+    // Observe shutdown and grant removal even while a write awaits capacity.
+    let mut revoked = false;
     let result: anyhow::Result<()> = tokio::select! {
         biased;
         _ = stop_rx.changed() => {
             close_link(&mut ws, 0).await;
+            Ok(())
+        }
+        _ = admission::revoked(&mut active_grant) => {
+            revoked = true;
             Ok(())
         }
         result = registered => result,
@@ -802,6 +858,9 @@ async fn serve_registration(
         }
     }
     traffic.flush(&registry);
+    if revoked {
+        close_link(&mut ws, CLOSE_REASON_ADMISSION).await;
+    }
     result
 }
 
@@ -882,6 +941,7 @@ mod tests {
                 Arc::new(RelayConfig::default()),
                 registry.clone(),
                 stop_rx,
+                None,
             ));
             let welcome = peer.next().await.unwrap().unwrap();
             assert!(matches!(decode_binary(&welcome), Some(Frame::Welcome(_))));

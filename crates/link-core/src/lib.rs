@@ -4,6 +4,7 @@
 //! formats, the single TLS identity rule, and the path status types.  Nothing
 //! here opens a socket.
 
+pub mod admission;
 pub mod card;
 pub mod id;
 pub mod path;
@@ -11,6 +12,7 @@ pub mod rendezvous;
 pub mod tls;
 pub mod wire;
 
+pub use admission::RelayAdmissionKey;
 pub use card::{Card, Hint, RuleViolation, VerifyContext};
 pub use id::{NodeId, TransportKey};
 pub use path::{FailReason, PathReport, PathStatus};

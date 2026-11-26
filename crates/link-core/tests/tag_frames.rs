@@ -3,7 +3,7 @@
 //! pin the codec until then.
 
 use link_core::rendezvous::Tag;
-use link_core::wire::{Frame, MAX_DATAGRAM, MAX_TAGS_PER_REGISTER};
+use link_core::wire::{FRAME_REGISTER_ADMITTED, Frame, MAX_DATAGRAM, MAX_TAGS_PER_REGISTER};
 
 fn tag(byte: u8) -> Tag {
     Tag([byte; 16])
@@ -33,6 +33,27 @@ fn register_round_trips_and_bounds_hold() {
     let mut lying = Frame::Register { tags: vec![tag(9)] }.encode();
     lying[2] = 2; // claims two tags, carries one
     assert_eq!(Frame::decode(&lying), None);
+}
+
+#[test]
+fn admitted_registration_adds_a_fixed_length_proof_to_the_bounded_roster() {
+    let proof = [0xb7; 32];
+    let tags = vec![tag(9); MAX_TAGS_PER_REGISTER];
+    let frame = Frame::RegisterAdmitted {
+        proof,
+        tags: tags.clone(),
+    };
+    let bytes = frame.encode();
+    assert_eq!(bytes[0], FRAME_REGISTER_ADMITTED);
+    assert_eq!(&bytes[1..33], &proof);
+    assert_eq!(&bytes[33..35], &256u16.to_be_bytes());
+    assert_eq!(Frame::decode(&bytes), Some(frame));
+    assert_eq!(Frame::decode(&bytes[..bytes.len() - 1]), None);
+    let over = Frame::RegisterAdmitted {
+        proof,
+        tags: vec![tag(9); MAX_TAGS_PER_REGISTER + 1],
+    };
+    assert_eq!(Frame::decode(&over.encode()), None);
 }
 
 #[test]

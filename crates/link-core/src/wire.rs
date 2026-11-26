@@ -6,6 +6,7 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
+use crate::admission::ADMISSION_PROOF_BYTES;
 use crate::card::to_ipv6;
 use crate::id::{NodeId, TransportKey};
 use crate::rendezvous::{TAG_BYTES, Tag};
@@ -24,6 +25,8 @@ pub const CLOSE_REASON_MALFORMED: u16 = 1;
 /// mode) or a third session registered a tag (tag mode) and this one, the
 /// oldest, was evicted, spec 3.1.  A client backs off before reconnecting.
 pub const CLOSE_REASON_SUPERSEDED: u16 = 2;
+/// The relay refused or revoked the operator-issued grant.
+pub const CLOSE_REASON_ADMISSION: u16 = 3;
 
 // ---------------------------------------------------------------------------
 // Relay auth, spec 3.1
@@ -72,6 +75,8 @@ pub const FRAME_CLOSE: u8 = 0x7f;
 // change lands behind its version bump; until then the deployed relay speaks
 // the identity frames above.
 pub const FRAME_REGISTER: u8 = 0x04;
+pub const FRAME_ADMISSION_CHALLENGE: u8 = 0x05;
+pub const FRAME_REGISTER_ADMITTED: u8 = 0x06;
 pub const FRAME_SEND_TAG: u8 = 0x12;
 pub const FRAME_RECV_TAG: u8 = 0x13;
 /// A `Register` carries at most this many tags (a pair needs at most twelve
@@ -81,6 +86,7 @@ pub const MAX_TAGS_PER_REGISTER: usize = 256;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Frame {
     Challenge([u8; 32]),
+    AdmissionChallenge([u8; 32]),
     Auth {
         node_id: NodeId,
         signature: [u8; 64],
@@ -97,6 +103,11 @@ pub enum Frame {
     /// Register the session under pair-scoped rendezvous tags, spec section 9.
     /// No identity and no signature: a tag is an unguessable capability.
     Register {
+        tags: Vec<Tag>,
+    },
+    /// Initial tag registration on a relay that requires operator admission.
+    RegisterAdmitted {
+        proof: [u8; ADMISSION_PROOF_BYTES],
         tags: Vec<Tag>,
     },
     /// Route a datagram to whoever else registered this tag, spec section 9.
@@ -119,6 +130,7 @@ impl Frame {
     pub fn encode(&self) -> Vec<u8> {
         match self {
             Frame::Challenge(bytes) => one(FRAME_CHALLENGE, bytes),
+            Frame::AdmissionChallenge(bytes) => one(FRAME_ADMISSION_CHALLENGE, bytes),
             Frame::Auth { node_id, signature } => {
                 let mut out = Vec::with_capacity(1 + 32 + 64);
                 out.push(FRAME_AUTH);
@@ -132,14 +144,9 @@ impl Frame {
                 datagram,
             } => routed(FRAME_SEND, destination, datagram),
             Frame::Recv { source, datagram } => routed(FRAME_RECV, source, datagram),
-            Frame::Register { tags } => {
-                let mut out = Vec::with_capacity(1 + 2 + tags.len() * TAG_BYTES);
-                out.push(FRAME_REGISTER);
-                out.extend_from_slice(&(tags.len() as u16).to_be_bytes());
-                for tag in tags {
-                    out.extend_from_slice(&tag.0);
-                }
-                out
+            Frame::Register { tags } => register(FRAME_REGISTER, &[], tags),
+            Frame::RegisterAdmitted { proof, tags } => {
+                register(FRAME_REGISTER_ADMITTED, proof, tags)
             }
             Frame::SendTag { tag, datagram } => routed_tag(FRAME_SEND_TAG, tag, datagram),
             Frame::RecvTag { tag, datagram } => routed_tag(FRAME_RECV_TAG, tag, datagram),
@@ -155,6 +162,7 @@ impl Frame {
         let (&tag, body) = bytes.split_first()?;
         match tag {
             FRAME_CHALLENGE => Some(Frame::Challenge(fixed(body)?)),
+            FRAME_ADMISSION_CHALLENGE => Some(Frame::AdmissionChallenge(fixed(body)?)),
             FRAME_AUTH => {
                 if body.len() != 96 {
                     return None;
@@ -178,19 +186,14 @@ impl Frame {
                     datagram,
                 })
             }
-            FRAME_REGISTER => {
-                if body.len() < 2 {
-                    return None;
-                }
-                let count = u16::from_be_bytes([body[0], body[1]]) as usize;
-                let rest = &body[2..];
-                if count > MAX_TAGS_PER_REGISTER || rest.len() != count * TAG_BYTES {
-                    return None;
-                }
-                // Length was checked above, so every 16-byte tag is whole.
-                let (chunks, _remainder) = rest.as_chunks::<TAG_BYTES>();
-                Some(Frame::Register {
-                    tags: chunks.iter().map(|chunk| Tag(*chunk)).collect(),
+            FRAME_REGISTER => Some(Frame::Register {
+                tags: split_tags(body)?,
+            }),
+            FRAME_REGISTER_ADMITTED => {
+                let (proof, tags) = body.split_first_chunk::<ADMISSION_PROOF_BYTES>()?;
+                Some(Frame::RegisterAdmitted {
+                    proof: *proof,
+                    tags: split_tags(tags)?,
                 })
             }
             FRAME_SEND_TAG => {
@@ -226,6 +229,27 @@ fn routed(tag: u8, node_id: &NodeId, datagram: &[u8]) -> Vec<u8> {
 
 fn fixed<const N: usize>(body: &[u8]) -> Option<[u8; N]> {
     body.try_into().ok()
+}
+
+fn register(frame: u8, proof: &[u8], tags: &[Tag]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + proof.len() + 2 + tags.len() * TAG_BYTES);
+    out.push(frame);
+    out.extend_from_slice(proof);
+    out.extend_from_slice(&(tags.len() as u16).to_be_bytes());
+    for tag in tags {
+        out.extend_from_slice(&tag.0);
+    }
+    out
+}
+
+fn split_tags(body: &[u8]) -> Option<Vec<Tag>> {
+    let (count, rest) = body.split_first_chunk::<2>()?;
+    let count = usize::from(u16::from_be_bytes(*count));
+    if count > MAX_TAGS_PER_REGISTER || rest.len() != count * TAG_BYTES {
+        return None;
+    }
+    let (chunks, _) = rest.as_chunks::<TAG_BYTES>();
+    Some(chunks.iter().map(|chunk| Tag(*chunk)).collect())
 }
 
 fn split_routed(body: &[u8]) -> Option<(NodeId, Vec<u8>)> {

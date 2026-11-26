@@ -12,9 +12,9 @@ to check against a list, and a secret path would not stay secret because
 each node's relay hint is on its signed card. Open to anyone, it would be a
 public service run by ForgeSworn, which the owner has decided not to run.
 
-Bringing it back closed needs an operator admission key in the tag-mode
-`Register` frame, with the matching client change, before it is deployed
-again. Reopening it is the owner's decision.
+Source builds support [operator-controlled tag relay admission](../../docs/relay-admission.md).
+A private reopening requires the owner's approval and validation of the
+selected relay and clients with that policy.
 
 The rest of this file records how the deployment was set up.
 
