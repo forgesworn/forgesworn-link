@@ -107,6 +107,8 @@ The [Iroh recovery comparison](acceptance/iroh-recovery/README.md) runs the
 same shaped direct-path outage against Link and Iroh.
 The [native Link and Iroh comparison](acceptance/2026-11-26-iroh-native.md)
 measures fresh relay connections, direct and relayed goodput, and CPU per GiB.
+The [direct UDP profile and Pi 5 results](acceptance/2026-11-26-direct-udp.md)
+measure Linux receive-buffer drops and direct performance on physical hardware.
 The [private relay LAN trial](acceptance/2026-11-26-private-relay-lan.md)
 covers saved pairing, live revocation and relay shutdown between a Mac and
 a Raspberry Pi.
