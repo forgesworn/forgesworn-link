@@ -70,7 +70,10 @@ the hostname relay in the native Rust `relays` list. Verify a self-signed relay
 with the owner's certificate fingerprint using `RelaySpec::pinned`. Both peers
 must approve the same backup, and their signed cards must include it if the
 cards list relays. Fresh sessions start through a relay even with direct UDP
-enabled. [DNS outage drill](acceptance/2026-11-27-dns-failover.md)
+enabled. A peer with a live primary socket can stay on that relay during a
+DNS outage. Put the same IP relay first on both peers when either must be
+able to restart independently of DNS.
+[DNS outage drill](acceptance/2026-11-27-dns-failover.md)
 
 Operators can require a grant at a tag-mode relay. Rust clients bind the
 grant to the approved relay using `RelaySpec::with_admission_key`. The paired
